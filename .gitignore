@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+htmlcov/
+.coverage
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Data (market bars, filings, caches) — never commit raw data
+data/
+*.parquet
+*.duckdb
+*.sqlite
+*.db
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
