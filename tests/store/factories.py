@@ -19,6 +19,10 @@ from asof.store.models import (
 # Simulated moment used throughout: 2024-07-15 09:30 New York = 13:30 UTC.
 T0 = datetime(2024, 7, 15, 13, 30, tzinfo=UTC)
 APPLE_CIK = 320193
+# All Select Sector SPDR funds file under this one CIK and differ only by series id.
+SECTOR_SPDR_CIK = 1064641
+XLK_SERIES = "S000006415"
+XLE_SERIES = "S000006410"
 
 _seq = itertools.count()
 
@@ -39,8 +43,17 @@ def new_source(session: Session, name: str = "sec_edgar") -> Source:
     return add(session, Source(name=name, base_url="https://www.sec.gov"))
 
 
-def new_entity(session: Session, cik: int = APPLE_CIK, ticker: str = "AAPL") -> Entity:
-    return add(session, Entity(cik=cik, ticker=ticker, name="Apple Inc."))
+def new_entity(
+    session: Session,
+    cik: int | None = APPLE_CIK,
+    ticker: str = "AAPL",
+    kind: str = "company",
+    *,
+    name: str = "Apple Inc.",
+    series_id: str | None = None,
+) -> Entity:
+    entity = Entity(kind=kind, ticker=ticker, name=name, cik=cik, series_id=series_id)
+    return add(session, entity)
 
 
 def new_document(
@@ -48,7 +61,7 @@ def new_document(
     *,
     source_id: int,
     available_at: datetime,
-    entity_id: int | None = APPLE_CIK,
+    entity_id: int | None = None,
     source_time: datetime | None = None,
     supersedes_id: int | None = None,
     doc_type: str = "10-Q",
@@ -104,14 +117,26 @@ def new_decision(session: Session, *, run_id: int, **fields: Any) -> Decision:
     return add(session, Decision(run_id=run_id, as_of=T0, **fields))
 
 
-def new_trade_decision(session: Session, *, run_id: int) -> Decision:
+def new_trade_decision(session: Session, *, run_id: int, entity_id: int) -> Decision:
     return new_decision(
         session,
         run_id=run_id,
         kind="trade",
         strategy_id="momentum",
-        entity_id=APPLE_CIK,
+        entity_id=entity_id,
         direction="long",
+    )
+
+
+def new_observation(session: Session, *, run_id: int, **fields: Any) -> Decision:
+    return new_decision(
+        session,
+        run_id=run_id,
+        kind="observation",
+        topic="energy flows",
+        statement="Money is flowing into energy names.",
+        check="In two weeks, XLE relative to SPY is higher than today.",
+        **fields,
     )
 
 

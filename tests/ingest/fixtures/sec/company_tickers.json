@@ -1,0 +1,7 @@
+{
+  "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+  "1": {"cik_str": 723125, "ticker": "MU", "title": "MICRON TECHNOLOGY INC"},
+  "2": {"cik_str": 1326801, "ticker": "META", "title": "Meta Platforms, Inc."},
+  "3": {"cik_str": 884394, "ticker": "SPY", "title": "SPDR S&P 500 ETF TRUST"},
+  "4": {"cik_str": 1067839, "ticker": "QQQ", "title": "INVESCO QQQ TRUST, SERIES 1"}
+}

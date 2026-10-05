@@ -20,7 +20,10 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] CI: lint, format, type check and tests on every push and pull request
 - [x] Metadata store: SQLite schema with integrity constraints; all reads go
       through `visible_*(session, as_of)`
-- [ ] Historical backfill: Alpaca bars, SEC EDGAR filings and XBRL facts, FRED
+- [x] Instrument table: companies, funds and coins under one key; a reviewed watchlist of
+      about 300 instruments resolved against the SEC ticker tables
+- [ ] Historical backfill: market-wide daily and minute bars, SEC EDGAR filings and XBRL
+      facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
 
@@ -48,13 +51,25 @@ uv run asof db init --path ./meta.db    # any other location
 The command is safe to run more than once. If `/data` is not writable on your
 machine, set `ASOF_DATA_DIR` or pass `--path`.
 
+Load the watchlist into the instrument table:
+
+```bash
+export ASOF_SEC_USER_AGENT="your-project you@example.com"   # the SEC requires a contact
+uv run asof entities sync --download    # fetch the SEC ticker tables, then sync
+uv run asof entities sync               # later runs reuse the saved tables
+```
+
+Each ticker in `configs/watchlist.yaml` is matched to its SEC identifier. The command writes
+every instrument or none: it stops if a company is not listed or a ticker belongs to more than
+one registrant, and it never moves a stored instrument to a different registrant.
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.
 
 ```
 src/asof/
-  ingest/     pull raw data from Alpaca, SEC EDGAR, FRED
+  ingest/     pull raw data from Alpaca, SEC EDGAR, FRED; watchlist and SEC ticker tables
   store/      SQLite + SQLModel metadata and the as_of read path
   features/   shared feature registry: technical, fundamental, macro, event   (planned)
   scan/       pure-code daily scanner
@@ -67,7 +82,7 @@ src/asof/
 strategies/<name>/   one strategy per directory (scan, rules, judge, execute,
                      attribution configs), versioned as a whole            (planned)
 tests/               mirrors src/asof
-configs/                                                                   (planned)
+configs/             watchlist.yaml: instruments that get filings and fundamentals
 docs/                public documentation                                  (planned)
 ```
 

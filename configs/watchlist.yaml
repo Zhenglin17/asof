@@ -1,0 +1,491 @@
+# Long-term watchlist: instruments that get deep data (filings, fundamentals) on top of the
+# market-wide bars every listed symbol receives. Upper groups are market, sector and cross-asset
+# funds; lower groups are representative stocks per theme.
+#
+# `added` is the date an entry joined the list. Entries were chosen with hindsight, so replays of
+# market-wide scans must not restrict themselves to this list for dates before `added`.
+# `kind` and `added` set on a group apply to every item; an item may override either.
+# Quote tickers YAML would read as something else, e.g. "ON" (a boolean when unquoted).
+
+groups:
+  - id: broad_market
+    label: Broad market, size and style
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: SPY, note: "S&P 500"}
+      - {ticker: QQQ, note: "Nasdaq-100"}
+      - {ticker: IWM, note: "Russell 2000 small caps"}
+      - {ticker: DIA, note: "Dow Jones Industrial Average"}
+      - {ticker: RSP, note: "S&P 500 equal weight, breadth check against SPY"}
+      - {ticker: MDY, note: "S&P MidCap 400"}
+      - {ticker: IWF, note: "Russell 1000 growth"}
+      - {ticker: IWD, note: "Russell 1000 value"}
+      - {ticker: MTUM, note: "US momentum factor"}
+      - {ticker: MAGS, note: "Magnificent Seven basket"}
+      - {ticker: VIXY, note: "VIX short-term futures"}
+
+  - id: sectors
+    label: The eleven GICS sectors, for rotation
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: XLK, note: "Technology"}
+      - {ticker: XLF, note: "Financials"}
+      - {ticker: XLE, note: "Energy"}
+      - {ticker: XLV, note: "Health care"}
+      - {ticker: XLY, note: "Consumer discretionary"}
+      - {ticker: XLP, note: "Consumer staples"}
+      - {ticker: XLI, note: "Industrials"}
+      - {ticker: XLB, note: "Materials"}
+      - {ticker: XLU, note: "Utilities"}
+      - {ticker: XLRE, note: "Real estate"}
+      - {ticker: XLC, note: "Communication services"}
+
+  - id: industries
+    label: Industry and theme baskets
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: KRE, note: "Regional banks"}
+      - {ticker: SMH, note: "Semiconductors"}
+      - {ticker: DRAM, note: "Memory chips"}
+      - {ticker: IGV, note: "Software"}
+      - {ticker: CIBR, note: "Cybersecurity"}
+      - {ticker: XBI, note: "Biotech, equal weight"}
+      - {ticker: ARKG, note: "Genomics"}
+      - {ticker: IHI, note: "Medical devices"}
+      - {ticker: XPH, note: "Pharmaceuticals"}
+      - {ticker: ITA, note: "Aerospace and defense"}
+      - {ticker: UFO, note: "Space"}
+      - {ticker: BOTZ, note: "Robotics and AI"}
+      - {ticker: QTUM, note: "Quantum computing"}
+      - {ticker: URA, note: "Uranium"}
+      - {ticker: XOP, note: "Oil and gas exploration"}
+      - {ticker: OIH, note: "Oil services"}
+      - {ticker: XME, note: "Metals and mining"}
+      - {ticker: GDX, note: "Gold miners"}
+      - {ticker: COPX, note: "Copper miners"}
+      - {ticker: LIT, note: "Lithium and batteries"}
+      - {ticker: REMX, note: "Rare earths and strategic metals"}
+      - {ticker: TAN, note: "Solar"}
+      - {ticker: GRID, note: "Power grid infrastructure"}
+      - {ticker: PAVE, note: "US infrastructure"}
+      - {ticker: ITB, note: "Home construction"}
+      - {ticker: XRT, note: "Retail"}
+      - {ticker: IYT, note: "Transportation"}
+      - {ticker: JETS, note: "Airlines"}
+      - {ticker: WGMI, note: "Bitcoin miners"}
+      - {ticker: ARKK, note: "Speculative growth"}
+      - {ticker: IPO, note: "Recent IPOs"}
+
+  - id: bonds
+    label: Rates and credit
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: SHY, note: "1-3 year Treasuries"}
+      - {ticker: IEF, note: "7-10 year Treasuries"}
+      - {ticker: TLT, note: "20+ year Treasuries"}
+      - {ticker: TIP, note: "Inflation-protected Treasuries"}
+      - {ticker: AGG, note: "US aggregate bond market"}
+      - {ticker: LQD, note: "Investment-grade corporates"}
+      - {ticker: HYG, note: "High-yield corporates"}
+      - {ticker: EMB, note: "Emerging-market dollar sovereigns"}
+
+  - id: currencies
+    label: Dollar and major currencies
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: UUP, note: "US dollar index"}
+      - {ticker: FXE, note: "Euro"}
+      - {ticker: FXY, note: "Japanese yen"}
+
+  - id: commodities
+    label: Metals, energy and agriculture
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: GLD, note: "Gold"}
+      - {ticker: SLV, note: "Silver"}
+      - {ticker: PPLT, note: "Platinum"}
+      - {ticker: CPER, note: "Copper"}
+      - {ticker: USO, note: "Crude oil"}
+      - {ticker: UNG, note: "Natural gas"}
+      - {ticker: DBA, note: "Agriculture"}
+      - {ticker: DBC, note: "Broad commodities"}
+
+  - id: crypto_funds
+    label: Spot crypto funds
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: IBIT, note: "Spot bitcoin"}
+      - {ticker: ETHA, note: "Spot ether"}
+
+  - id: international
+    label: Markets outside the US
+    kind: etf
+    added: 2026-10-05
+    items:
+      - {ticker: EFA, note: "Developed markets ex-US"}
+      - {ticker: EEM, note: "Emerging markets"}
+      - {ticker: EWJ, note: "Japan"}
+      - {ticker: EWY, note: "South Korea"}
+      - {ticker: EWT, note: "Taiwan"}
+      - {ticker: FXI, note: "China large caps"}
+      - {ticker: KWEB, note: "China internet"}
+      - {ticker: INDA, note: "India"}
+      - {ticker: EWZ, note: "Brazil"}
+      - {ticker: EWG, note: "Germany"}
+
+  - id: mega_cap_tech
+    label: Mega-cap technology
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: AAPL}
+      - {ticker: MSFT}
+      - {ticker: GOOGL}
+      - {ticker: AMZN}
+      - {ticker: META}
+      - {ticker: NVDA}
+      - {ticker: TSLA}
+      - {ticker: AVGO}
+      - {ticker: ORCL}
+      - {ticker: NFLX}
+
+  - id: semiconductors
+    label: Chip design, memory and storage
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: AMD}
+      - {ticker: INTC}
+      - {ticker: QCOM}
+      - {ticker: MRVL}
+      - {ticker: TXN}
+      - {ticker: ADI}
+      - {ticker: "ON"}
+      - {ticker: NXPI}
+      - {ticker: MU}
+      - {ticker: SNDK}
+      - {ticker: WDC}
+      - {ticker: STX}
+      - {ticker: ARM}
+      - {ticker: MPWR}
+      - {ticker: NVTS}
+      - {ticker: RMBS}
+      - {ticker: MXL}
+      - {ticker: SMTC}
+      - {ticker: AMBA}
+      - {ticker: ALAB}
+      - {ticker: CRDO}
+      - {ticker: LSCC}
+      - {ticker: SITM}
+
+  - id: semi_equipment_foundry
+    label: Chip equipment, test, packaging and foundries
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: AMAT}
+      - {ticker: LRCX}
+      - {ticker: KLAC}
+      - {ticker: ASML}
+      - {ticker: TER}
+      - {ticker: ONTO}
+      - {ticker: ACLS}
+      - {ticker: CAMT}
+      - {ticker: AMKR}
+      - {ticker: TSM}
+      - {ticker: TSEM}
+      - {ticker: GFS}
+
+  - id: ai_hardware
+    label: AI servers, networking, optics and data-center gear
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: SMCI}
+      - {ticker: DELL}
+      - {ticker: VRT}
+      - {ticker: ANET}
+      - {ticker: CIEN}
+      - {ticker: COHR}
+      - {ticker: LITE}
+      - {ticker: AAOI}
+      - {ticker: FN}
+      - {ticker: GLW}
+      - {ticker: APH}
+      - {ticker: CLS}
+      - {ticker: NOK}
+      - {ticker: CBRS}
+
+  - id: ai_cloud
+    label: AI compute providers
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: CRWV}
+      - {ticker: NBIS}
+      - {ticker: IREN}
+      - {ticker: APLD}
+      - {ticker: CIFR}
+
+  - id: software
+    label: Software, security, data and AI applications
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: PLTR}
+      - {ticker: CRWD}
+      - {ticker: PANW}
+      - {ticker: ZS}
+      - {ticker: NET}
+      - {ticker: DDOG}
+      - {ticker: SNOW}
+      - {ticker: NOW}
+      - {ticker: CRM}
+      - {ticker: MDB}
+      - {ticker: ADBE}
+      - {ticker: DOCN}
+      - {ticker: APP}
+      - {ticker: TTD}
+      - {ticker: INOD}
+      - {ticker: SOUN}
+      - {ticker: BBAI}
+      - {ticker: FIG}
+
+  - id: consumer_internet
+    label: Consumer internet platforms
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: UBER}
+      - {ticker: SHOP}
+      - {ticker: SPOT}
+      - {ticker: RBLX}
+      - {ticker: RDDT}
+      - {ticker: DUOL}
+
+  - id: china
+    label: US-listed China large caps
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: BABA}
+      - {ticker: PDD}
+      - {ticker: BIDU}
+
+  - id: financials
+    label: Banks, asset managers, brokers and card networks
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: JPM}
+      - {ticker: BAC}
+      - {ticker: GS}
+      - {ticker: MS}
+      - {ticker: C}
+      - {ticker: WFC}
+      - {ticker: BX}
+      - {ticker: KKR}
+      - {ticker: IBKR}
+      - {ticker: AXP}
+      - {ticker: V}
+      - {ticker: MA}
+
+  - id: fintech
+    label: Fintech and neobanks
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: HOOD}
+      - {ticker: SOFI}
+      - {ticker: AFRM}
+      - {ticker: UPST}
+      - {ticker: XYZ}
+      - {ticker: NU}
+
+  - id: crypto_equities
+    label: Crypto exchanges, treasuries and miners
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: COIN}
+      - {ticker: MSTR}
+      - {ticker: CRCL}
+      - {ticker: GLXY}
+      - {ticker: BLSH}
+      - {ticker: BMNR}
+      - {ticker: MARA}
+      - {ticker: RIOT}
+      - {ticker: CLSK}
+
+  - id: power
+    label: Power generation and electrical equipment
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: GEV}
+      - {ticker: BE}
+      - {ticker: CEG}
+      - {ticker: VST}
+      - {ticker: TLN}
+      - {ticker: NRG}
+      - {ticker: ETN}
+      - {ticker: PWR}
+      - {ticker: POWL}
+      - {ticker: NVT}
+      - {ticker: MOD}
+      - {ticker: FSLR}
+      - {ticker: SEDG}
+
+  - id: nuclear_and_minerals
+    label: Nuclear fuel, reactors and critical minerals
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: LEU}
+      - {ticker: SMR}
+      - {ticker: OKLO}
+      - {ticker: NNE}
+      - {ticker: BWXT}
+      - {ticker: CCJ}
+      - {ticker: UEC}
+      - {ticker: UUUU}
+      - {ticker: MP}
+      - {ticker: USAR}
+      - {ticker: ALB}
+
+  - id: energy
+    label: Oil, gas and LNG
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: XOM}
+      - {ticker: CVX}
+      - {ticker: COP}
+      - {ticker: SLB}
+      - {ticker: LNG}
+
+  - id: space_and_defense
+    label: Space, defense and drones
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: SPCX}
+      - {ticker: RKLB}
+      - {ticker: ASTS}
+      - {ticker: RDW}
+      - {ticker: LUNR}
+      - {ticker: PL}
+      - {ticker: FLY}
+      - {ticker: VOYG}
+      - {ticker: LMT}
+      - {ticker: RTX}
+      - {ticker: KTOS}
+      - {ticker: AVAV}
+      - {ticker: RCAT}
+      - {ticker: ONDS}
+
+  - id: robotics_and_air_mobility
+    label: Robotics and electric aircraft
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: SYM}
+      - {ticker: SERV}
+      - {ticker: ACHR}
+      - {ticker: JOBY}
+
+  - id: quantum
+    label: Quantum computing
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: IONQ}
+      - {ticker: RGTI}
+      - {ticker: QBTS}
+      - {ticker: QUBT}
+
+  - id: industrials_and_autos
+    label: Machinery, aerospace, transport, mining and autos
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: CAT}
+      - {ticker: DE}
+      - {ticker: BA}
+      - {ticker: GE}
+      - {ticker: FDX}
+      - {ticker: DAL}
+      - {ticker: FCX}
+      - {ticker: GM}
+      - {ticker: RIVN}
+
+  - id: health_and_biotech
+    label: Pharma, biotech, diagnostics and health tech
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: LLY}
+      - {ticker: NVO}
+      - {ticker: UNH}
+      - {ticker: JNJ}
+      - {ticker: MRK}
+      - {ticker: PFE}
+      - {ticker: ABBV}
+      - {ticker: AMGN}
+      - {ticker: VRTX}
+      - {ticker: REGN}
+      - {ticker: ISRG}
+      - {ticker: MRNA}
+      - {ticker: VKTX}
+      - {ticker: CRSP}
+      - {ticker: BEAM}
+      - {ticker: NTLA}
+      - {ticker: TWST}
+      - {ticker: ILMN}
+      - {ticker: TEM}
+      - {ticker: RXRX}
+      - {ticker: NTRA}
+      - {ticker: GH}
+      - {ticker: HIMS}
+      - {ticker: DOCS}
+
+  - id: consumer
+    label: Retail, restaurants, brands and media
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: WMT}
+      - {ticker: COST}
+      - {ticker: HD}
+      - {ticker: MCD}
+      - {ticker: CMG}
+      - {ticker: NKE}
+      - {ticker: LULU}
+      - {ticker: KO}
+      - {ticker: PG}
+      - {ticker: DIS}
+      - {ticker: CVNA}
+
+  - id: housing_and_real_estate
+    label: Homebuilders, mortgages and data-center REITs
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: DHI}
+      - {ticker: RKT}
+      - {ticker: EQIX}
+      - {ticker: DLR}
+
+  - id: telecom
+    label: Wireless carriers
+    kind: company
+    added: 2026-10-05
+    items:
+      - {ticker: TMUS}

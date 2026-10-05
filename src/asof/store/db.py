@@ -13,8 +13,12 @@ from asof.store import models  # noqa: F401  (registers every table on SQLModel.
 DEFAULT_DATA_DIR = Path("/data/asof")
 
 
+def default_data_dir() -> Path:
+    return Path(os.environ.get("ASOF_DATA_DIR", DEFAULT_DATA_DIR))
+
+
 def default_db_path() -> Path:
-    return Path(os.environ.get("ASOF_DATA_DIR", DEFAULT_DATA_DIR)) / "meta.db"
+    return default_data_dir() / "meta.db"
 
 
 def _enable_foreign_keys(dbapi_connection: sqlite3.Connection, _: ConnectionPoolEntry) -> None:

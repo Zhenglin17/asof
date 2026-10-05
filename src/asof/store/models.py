@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import JSON, CheckConstraint, DateTime, Dialect, UniqueConstraint
+from sqlalchemy import JSON, CheckConstraint, DateTime, Dialect, Index, UniqueConstraint, text
 from sqlalchemy.orm import declared_attr
 from sqlalchemy.types import TypeDecorator
 from sqlmodel import Field, SQLModel
@@ -54,6 +54,12 @@ def _one_of(column: str, enum: type[StrEnum]) -> CheckConstraint:
     # NULL passes any CHECK in SQL, so whether NULL is allowed is decided by the column itself.
     values = ", ".join(f"'{member.value}'" for member in enum)
     return CheckConstraint(f'"{column}" IN ({values})', name=f"ck_{column}_enum")
+
+
+class EntityKind(StrEnum):
+    COMPANY = "company"
+    ETF = "etf"
+    CRYPTO = "crypto"
 
 
 class DecisionKind(StrEnum):
@@ -127,11 +133,55 @@ class Source(_Table, table=True):
 
 
 class Entity(_Table, table=True):
-    # SEC Central Index Key. An int, so "0000320193" and "320193" cannot become two rows.
-    # Tickers change and get reused; the CIK does not.
-    cik: int = Field(primary_key=True, sa_column_kwargs={"autoincrement": False})
-    ticker: str | None = Field(default=None, index=True)
+    """Anything a decision can point at: a company, a fund, a coin.
+
+    The key is a generated id because no outside identifier covers every kind. A CIK identifies
+    a company, but one fund trust files under a single CIK for all its funds (the eleven sector
+    SPDRs share one) and a coin has none. Tickers change and get reused, so they never identify
+    a row on their own when something better exists.
+    """
+
+    __table_args__ = (
+        _one_of("kind", EntityKind),
+        CheckConstraint(
+            f"kind != '{EntityKind.COMPANY}' OR cik IS NOT NULL", name="ck_company_has_cik"
+        ),
+        CheckConstraint(
+            f"kind = '{EntityKind.ETF}' OR series_id IS NULL", name="ck_series_only_for_funds"
+        ),
+        CheckConstraint(
+            f"kind != '{EntityKind.CRYPTO}' OR cik IS NULL", name="ck_crypto_has_no_cik"
+        ),
+        # One row per company, per fund series, and per ticker for whatever has neither.
+        Index(
+            "uq_entity_company_cik",
+            "cik",
+            unique=True,
+            sqlite_where=text(f"kind = '{EntityKind.COMPANY}'"),
+        ),
+        Index(
+            "uq_entity_series_id",
+            "series_id",
+            unique=True,
+            sqlite_where=text("series_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_entity_kind_ticker",
+            "kind",
+            "ticker",
+            unique=True,
+            sqlite_where=text(f"kind != '{EntityKind.COMPANY}' AND series_id IS NULL"),
+        ),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str
+    ticker: str = Field(index=True)
     name: str
+    # SEC Central Index Key. An int, so "0000320193" and "320193" cannot become two rows.
+    cik: int | None = Field(default=None, index=True)
+    # SEC fund series id, e.g. "S000006415". Tells apart funds that share a CIK.
+    series_id: str | None = None
 
 
 class Document(_Table, table=True):
@@ -139,7 +189,7 @@ class Document(_Table, table=True):
 
     id: int | None = Field(default=None, primary_key=True)
     source_id: int = Field(foreign_key="source.id", index=True)
-    entity_id: int | None = Field(default=None, foreign_key="entity.cik", index=True)
+    entity_id: int | None = Field(default=None, foreign_key="entity.id", index=True)
     doc_type: str
     external_id: str
     title: str | None = None
@@ -172,7 +222,7 @@ class Chunk(_Table, table=True):
 
 class Event(_Table, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    entity_id: int | None = Field(default=None, foreign_key="entity.cik", index=True)
+    entity_id: int | None = Field(default=None, foreign_key="entity.id", index=True)
     event_type: str
     event_time: datetime = Field(sa_type=UTCDateTime)
     available_at: datetime = Field(sa_type=UTCDateTime, index=True)
@@ -212,6 +262,10 @@ class Decision(_Table, table=True):
             '(statement IS NOT NULL AND "check" IS NOT NULL)',
             name="ck_observation_fields",
         ),
+        CheckConstraint(
+            "conviction IS NULL OR (conviction >= 0 AND conviction <= 1)",
+            name="ck_conviction_range",
+        ),
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -219,8 +273,10 @@ class Decision(_Table, table=True):
     kind: str
     as_of: datetime = Field(sa_type=UTCDateTime, index=True)
     strategy_id: str | None = Field(default=None, index=True)
-    entity_id: int | None = Field(default=None, foreign_key="entity.cik", index=True)
+    entity_id: int | None = Field(default=None, foreign_key="entity.id", index=True)
     direction: str | None = None
+    # How sure the judge was, 0 to 1. Kept as a column so calibration and sizing can query it.
+    conviction: float | None = None
     topic: str | None = None
     statement: str | None = None
     implication: str | None = None
