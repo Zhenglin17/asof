@@ -1,8 +1,12 @@
 """Command-line entry point. Subcommands are added as each pipeline stage lands."""
 
+from pathlib import Path
+from typing import Annotated
+
 import typer
 
 from asof import __version__
+from asof.store.db import default_db_path, init_db, make_engine
 
 app = typer.Typer(
     name="asof",
@@ -10,6 +14,8 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+db_app = typer.Typer(help="Metadata database commands.", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 
 
 def _version_callback(value: bool) -> None:
@@ -29,3 +35,19 @@ def main(
     ),
 ) -> None:
     """asof command-line interface."""
+
+
+@db_app.command("init")
+def db_init(
+    path: Annotated[
+        Path | None,
+        typer.Option(
+            "--path",
+            help="SQLite file to create. Defaults to $ASOF_DATA_DIR/meta.db (/data/asof/meta.db).",
+        ),
+    ] = None,
+) -> None:
+    """Create the metadata database and every table. Safe to run twice."""
+    db_path = path or default_db_path()
+    init_db(make_engine(db_path))
+    typer.echo(f"Initialized {db_path}")
