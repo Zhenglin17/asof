@@ -22,8 +22,9 @@ Any violation is look-ahead leakage and is treated as a bug.
       through `visible_*(session, as_of)`
 - [x] Instrument table: companies, funds and coins under one key; a reviewed watchlist of
       about 300 instruments resolved against the SEC ticker tables
-- [ ] Historical backfill: market-wide daily and minute bars, SEC EDGAR filings and XBRL
-      facts, FRED
+- [x] Market-wide daily bars: every exchange-listed symbol since 2020, including delisted
+      ones, stored as Parquet with the instant each bar became knowable
+- [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
 
@@ -62,6 +63,23 @@ uv run asof entities sync               # later runs reuse the saved tables
 Each ticker in `configs/watchlist.yaml` is matched to its SEC identifier. The command writes
 every instrument or none: it stops if a company is not listed or a ticker belongs to more than
 one registrant, and it never moves a stored instrument to a different registrant.
+
+Backfill market data from Alpaca (a free paper-trading account is enough for history):
+
+```bash
+export ALPACA_API_KEY=... ALPACA_SECRET_KEY=...
+uv run asof market universe              # Alpaca asset list + historical SEC ticker tables
+uv run asof market backfill              # daily bars since 2020-10-01 into $ASOF_DATA_DIR/market
+uv run asof market status                # rows, symbols and date range per year
+```
+
+The universe is the union of every symbol Alpaca lists and every ticker that appeared in an
+SEC ticker table since 2019 (archived copies), so delisted companies are included. Bars are
+stored unadjusted, one Parquet file per year and first letter, each row stamped with
+`available_at`: the moment the bar was final (20:00 New York for a daily bar, since its volume
+includes after-hours trades). `visible_bars(con, root, timeframe, as_of)` is the only read path
+and returns nothing that was not knowable at `as_of`. Reruns skip files fetched after their
+period ended and refetch the rest, so the command is safe to run daily.
 
 ## Layout
 

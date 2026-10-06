@@ -1,20 +1,49 @@
 """Command-line entry point. Subcommands are added as each pipeline stage lands."""
 
 import os
+import time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
+import duckdb
+import httpx
 import typer
 from sqlmodel import Session
 
 from asof import __version__
+from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
+from asof.ingest.bars import ET, Partition, backfill
+from asof.ingest.http import make_fetch
+from asof.ingest.sec_ticker_history import (
+    EXCHANGE_TARGET,
+    SNAPSHOT_TARGET,
+    build_history,
+    download_snapshot,
+    list_snapshots,
+    symbol_windows,
+    write_history,
+)
 from asof.ingest.sec_tickers import download_sec_listings, load_sec_listings
+from asof.ingest.tickers import is_valid_symbol, normalize_ticker
+from asof.ingest.universe import (
+    EXCHANGE_DIR,
+    HISTORY_PATH,
+    active_symbols,
+    load_assets,
+    load_history,
+    load_universe,
+    save_assets_snapshot,
+)
 from asof.ingest.watchlist import load_watchlist, resolve_watchlist
 from asof.store.db import default_data_dir, default_db_path, init_db, make_engine
 from asof.store.entities import EntityConflict, upsert_entities
+from asof.store.market import bars_status, market_root
 from asof.store.models import EntityKind
 
 SEC_USER_AGENT_ENV = "ASOF_SEC_USER_AGENT"
+ALPACA_KEY_ENV = "ALPACA_API_KEY"
+ALPACA_SECRET_ENV = "ALPACA_SECRET_KEY"
 
 app = typer.Typer(
     name="asof",
@@ -26,6 +55,10 @@ db_app = typer.Typer(help="Metadata database commands.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 entities_app = typer.Typer(help="Tracked instruments.", no_args_is_help=True)
 app.add_typer(entities_app, name="entities")
+market_app = typer.Typer(
+    help="Market data: symbol universe and bar backfill.", no_args_is_help=True
+)
+app.add_typer(market_app, name="market")
 
 
 def _fail(message: str) -> NoReturn:
@@ -154,3 +187,176 @@ def entities_sync(
             f"{', '.join(from_company_table)}"
         )
     typer.echo(f"{result.inserted} inserted, {result.updated} updated")
+
+
+def _alpaca_client() -> AlpacaClient:
+    key, secret = os.environ.get(ALPACA_KEY_ENV), os.environ.get(ALPACA_SECRET_ENV)
+    if not key or not secret:
+        _fail(f"Set {ALPACA_KEY_ENV} and {ALPACA_SECRET_ENV} (Alpaca paper-trading keys).")
+    return AlpacaClient(key, secret)
+
+
+def _market_root(data_dir: Path | None) -> Path:
+    return market_root(data_dir or default_data_dir())
+
+
+def _timeframe(value: str) -> Timeframe:
+    if value == "1Day":
+        return "1Day"
+    if value == "1Min":
+        return "1Min"
+    _fail("--timeframe must be 1Day or 1Min")
+
+
+def _parse_symbols(value: str) -> list[str]:
+    symbols: list[str] = []
+    for raw in value.split(","):
+        try:
+            symbol = normalize_ticker(raw)
+        except ValueError:
+            _fail(f"Bad symbol: {raw!r}")
+        if not is_valid_symbol(symbol):
+            _fail(f"Bad symbol: {raw!r}")
+        symbols.append(symbol)
+    return sorted(set(symbols))
+
+
+@market_app.command("universe")
+def market_universe(
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    history: Annotated[
+        bool,
+        typer.Option(
+            "--history/--no-history",
+            help="Also pull historical SEC ticker snapshots from the Wayback Machine.",
+        ),
+    ] = True,
+    since_year: Annotated[int, typer.Option(help="First year of SEC snapshots to fetch.")] = 2018,
+) -> None:
+    """Snapshot Alpaca's asset list and refresh the SEC ticker history table."""
+    root = _market_root(data_dir)
+    client = _alpaca_client()
+    try:
+        assets = client.assets("active") + client.assets("inactive")
+    except AlpacaError as error:
+        _fail(f"Alpaca asset listing failed: {error}")
+    path = save_assets_snapshot(assets, root, datetime.now(ET).date())
+    typer.echo(f"{len(assets)} assets -> {path}")
+
+    base = data_dir or default_data_dir()
+    if history:
+        user_agent = os.environ.get(SEC_USER_AGENT_ENV, "asof")
+        fetch = make_fetch(
+            {"User-Agent": f"asof ({user_agent})"}, timeout=120.0, follow_redirects=True
+        )
+        targets = [
+            (SNAPSHOT_TARGET, base / "raw" / "sec" / "company_tickers"),
+            (EXCHANGE_TARGET, base / EXCHANGE_DIR),
+        ]
+        for target, snapshots_dir in targets:
+            try:
+                timestamps = list_snapshots(fetch, since_year=since_year, target=target)
+            except (ValueError, httpx.HTTPError) as error:
+                _fail(f"Could not list Wayback snapshots of {target}: {error}")
+            failed = 0
+            for ts in timestamps:
+                for attempt in range(3):
+                    try:
+                        download_snapshot(ts, snapshots_dir, fetch, target=target)
+                        break
+                    except (ValueError, OSError, httpx.HTTPError) as error:
+                        if attempt == 2:
+                            failed += 1
+                            typer.echo(f"  {ts}: giving up ({error})")
+                        else:
+                            time.sleep(5.0 * (attempt + 1))
+            typer.echo(f"{len(timestamps) - failed} snapshots of {target} -> {snapshots_dir}")
+        table = build_history(targets[0][1])
+        write_history(table, root / HISTORY_PATH)
+        typer.echo(f"{table.num_rows} ticker-history rows -> {root / HISTORY_PATH}")
+    typer.echo(f"Universe: {len(load_universe(root, base))} symbols")
+
+
+@market_app.command("backfill")
+def market_backfill(
+    timeframe: Annotated[str, typer.Option(help="1Day or 1Min.")] = "1Day",
+    start: Annotated[str, typer.Option(help="First session date, YYYY-MM-DD.")] = "2020-10-01",
+    end: Annotated[str | None, typer.Option(help="Last session date. Defaults to today.")] = None,
+    symbols: Annotated[
+        str | None, typer.Option(help="Comma-separated symbols instead of the stored universe.")
+    ] = None,
+    force: Annotated[bool, typer.Option("--force", help="Refetch complete partitions.")] = False,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Download bars into partitioned Parquet; reruns only fetch what is missing or open."""
+    tf = _timeframe(timeframe)
+    root = _market_root(data_dir)
+    universe = (
+        _parse_symbols(symbols) if symbols else load_universe(root, data_dir or default_data_dir())
+    )
+    windows = symbol_windows(load_history(root))
+    active = active_symbols(load_assets(root))
+    if not universe:
+        _fail("Universe is empty. Run `asof market universe` first or pass --symbols.")
+    try:
+        start_date = date.fromisoformat(start)
+        end_date = date.fromisoformat(end) if end else datetime.now(ET).date()
+    except ValueError as error:
+        _fail(f"Bad date: {error}")
+    client = _alpaca_client()
+    started = time.monotonic()
+
+    def progress(partition: Partition, outcome: str, rows: int) -> None:
+        period = f"{partition.year}" + (f"-{partition.month:02d}" if partition.month else "")
+        typer.echo(f"  {period} {partition.bucket}: {outcome} {rows:>9,} rows")
+
+    typer.echo(f"{len(universe)} symbols, {tf}, {start_date} .. {end_date}")
+    try:
+        report = backfill(
+            client,
+            root,
+            tf,
+            start_date,
+            end_date,
+            universe,
+            force=force,
+            on_partition=progress,
+            windows=windows,
+            active=active,
+        )
+    except AlpacaError as error:
+        _fail(f"Stopped: {error}. Completed partitions are kept; rerun to continue.")
+    typer.echo(
+        f"{len(report.written)} partitions written, {len(report.skipped)} skipped, "
+        f"{report.rows:,} rows, {time.monotonic() - started:,.0f}s"
+    )
+
+
+@market_app.command("status")
+def market_status(
+    timeframe: Annotated[str, typer.Option(help="1Day or 1Min.")] = "1Day",
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Rows, symbols and time range stored per year."""
+    tf = _timeframe(timeframe)
+    con = duckdb.connect()
+    try:
+        rows = bars_status(con, _market_root(data_dir), tf)
+    finally:
+        con.close()
+    if not rows:
+        typer.echo("Nothing stored yet.")
+        return
+    for row in rows:
+        first = row["first"].date() if row["first"] else "-"
+        last = row["last"].date() if row["last"] else "-"
+        typer.echo(
+            f"{row['year']}  {row['rows']:>12,} rows  {row['symbols']:>6,} symbols  "
+            f"{first} .. {last}"
+        )
