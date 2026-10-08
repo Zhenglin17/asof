@@ -1,0 +1,8 @@
+# Human decisions the security master applies last. Each entry needs a reason and a date.
+#
+#   - merge: [CYCN, KRSA]          # these labels are one security
+#     reason: "..."
+#     date: 2026-10-12
+#
+# Nothing here yet: conflicts the code cannot settle are listed by `asof market identity`.
+[]

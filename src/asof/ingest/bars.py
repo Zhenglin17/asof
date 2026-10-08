@@ -14,10 +14,14 @@ Every row carries ``available_at``, the first instant the bar could have been kn
 the only column ``visible_bars`` filters on.
 
 Ticker chains: Alpaca stores a security's whole history under its newest name and, when an old
-and a new name share one request, answers only for the new one. Three measures keep each bar
-under the name in use at the time: active and inactive symbols are requested separately, bars
-outside a symbol's SEC validity window are dropped, and a symbol that came back empty although
-its window overlaps the period is requested again on its own.
+and a new name share one request, answers only for the new one. Two measures get every name's
+history out of it: active and inactive symbols are requested separately, and a symbol that came
+back empty although its SEC validity window overlaps the period is requested again on its own.
+The windows also skip requests that cannot return anything. They never decide what is kept:
+everything Alpaca returns is written under the symbol it came back as. Attributing a bar to a
+security, and hiding history that was filed under a name not yet in use, is the security
+master's job at read time (``store.market.visible_bars``). Dropping at write time is
+irreversible and once cost BRK.B five months of 2020.
 """
 
 import os
@@ -155,14 +159,6 @@ def plan_partitions(
 Window = tuple[date, date | None]
 
 
-def in_window(windows: Mapping[str, Window] | None, symbol: str, day: date) -> bool:
-    """True unless ``symbol`` has a window and ``day`` falls outside it."""
-    if not windows or symbol not in windows:
-        return True
-    start, end = windows[symbol]
-    return start <= day and (end is None or day < end)
-
-
 def _overlaps(windows: Mapping[str, Window] | None, symbol: str, partition: "Partition") -> bool:
     if not windows or symbol not in windows:
         return True
@@ -172,21 +168,14 @@ def _overlaps(windows: Mapping[str, Window] | None, symbol: str, partition: "Par
     return start < p_end and (end is None or end > p_start)
 
 
-def _to_table(
-    bars: Iterable[Bar],
-    timeframe: Timeframe,
-    fetched_at: datetime,
-    windows: Mapping[str, Window] | None,
-) -> pa.Table:
+def _to_table(bars: Iterable[Bar], timeframe: Timeframe, fetched_at: datetime) -> pa.Table:
     fetched = fetched_at.astimezone(UTC)
     latest: dict[tuple[str, datetime], Bar] = {}
     for bar in bars:
         # A bar that was not final when we fetched it (today's daily bar during the session)
-        # would be stored as if complete; leave it for a later run. A bar outside the symbol's
-        # SEC window belongs to another name of the same security.
-        if available_at(bar.t, timeframe) <= fetched and in_window(
-            windows, bar.symbol, session_date(bar.t)
-        ):
+        # would be stored as if complete; leave it for a later run. That is the only reason to
+        # leave a returned bar out.
+        if available_at(bar.t, timeframe) <= fetched:
             latest[(bar.symbol, bar.t)] = bar  # a duplicate (symbol, t) keeps the last one seen
     ordered = [latest[key] for key in sorted(latest)]
     columns: dict[str, list[object]] = {
@@ -210,12 +199,7 @@ def _to_table(
 
 
 def write_partition(
-    path: Path,
-    bars: Iterable[Bar],
-    timeframe: Timeframe,
-    fetched_at: datetime,
-    *,
-    windows: Mapping[str, Window] | None = None,
+    path: Path, bars: Iterable[Bar], timeframe: Timeframe, fetched_at: datetime
 ) -> int:
     """Write one partition file atomically; returns the row count. Nothing is left on failure.
 
@@ -223,7 +207,7 @@ def write_partition(
     metadata so a later run can tell whether the file was written after its period ended.
     """
     _require_aware(fetched_at, "fetched_at")
-    table = _to_table(bars, timeframe, fetched_at, windows)  # consume fully before writing
+    table = _to_table(bars, timeframe, fetched_at)  # consume fully before writing
     table = table.replace_schema_metadata({FETCHED_AT_KEY: fetched_at.astimezone(UTC).isoformat()})
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -325,7 +309,8 @@ def backfill(
 
     ``now`` supplies ``fetched_at`` (taken once per partition); it decides which bars are final
     and how far the request may reach. ``windows`` (SEC validity per symbol) and ``active``
-    (Alpaca's currently listed symbols) drive the ticker-chain handling described above.
+    (Alpaca's currently listed symbols) only shape the requests, as described above; nothing
+    Alpaca returns for a requested symbol is left out of the file.
     """
     clock = now or (lambda: datetime.now(UTC))
     _require_aware(clock(), "now()")
@@ -346,7 +331,7 @@ def backfill(
         bars = _fetch_partition(
             client, partition, by_bucket[partition.bucket], batch_size, fetched_at, windows, active
         )
-        rows = write_partition(path, bars, timeframe, fetched_at, windows=windows)
+        rows = write_partition(path, bars, timeframe, fetched_at)
         report.written.append(partition)
         report.rows += rows
         if on_partition:

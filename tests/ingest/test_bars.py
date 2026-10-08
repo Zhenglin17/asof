@@ -929,22 +929,9 @@ WINDOWS = {"MMC": (date(2018, 1, 22), date(2026, 3, 29)), "MRSH": (date(2026, 2,
 NOW_2027 = datetime(2027, 1, 15, tzinfo=UTC)
 
 
-def test_bars_outside_a_symbols_sec_window_are_dropped_at_write_time(tmp_path: Path) -> None:
-    path = tmp_path / "bucket=M.parquet"
-    relabelled = [b.model_copy(update={"symbol": "MRSH"}) for b in MMC_BARS] + MRSH_BARS
-
-    count = write_partition(path, relabelled, "1Day", NOW_2027, windows=WINDOWS)
-
-    assert count == 1
-    rows = pq.read_table(path).to_pylist()
-    assert [(r["symbol"], r["session_date"]) for r in rows] == [("MRSH", date(2026, 4, 1))]
-
-
 def test_symbols_without_a_window_are_kept_whole(tmp_path: Path) -> None:
     path = tmp_path / "bucket=S.parquet"
-    count = write_partition(
-        path, [daily("SPY", date(2026, 1, 5))], "1Day", NOW_2027, windows=WINDOWS
-    )
+    count = write_partition(path, [daily("SPY", date(2026, 1, 5))], "1Day", NOW_2027)
     assert count == 1
 
 
@@ -966,10 +953,14 @@ def test_active_and_inactive_symbols_are_requested_in_separate_batches(tmp_path:
     first_pass = [set(c.symbols) for c in client.calls[:2]]
     assert {"MRSH", "MSFT"} in first_pass
     assert {"MMC"} in first_pass
+    # MRSH's request brings MMC's history back relabelled MRSH; since 4b-2b it is written as
+    # returned (the security master hides it at read time).
     rows = pq.read_table(tmp_path / "bars_1d" / "year=2026" / "bucket=M.parquet").to_pylist()
     assert [(r["symbol"], r["session_date"]) for r in rows] == [
         ("MMC", date(2026, 1, 5)),
         ("MMC", date(2026, 2, 3)),
+        ("MRSH", date(2026, 1, 5)),
+        ("MRSH", date(2026, 2, 3)),
         ("MRSH", date(2026, 4, 1)),
     ]
 
@@ -1006,12 +997,16 @@ def test_symbol_merged_away_in_a_batch_is_refetched_alone(tmp_path: Path) -> Non
     )
 
     assert [c.symbols for c in client.calls] == [("SIVB", "SIVBQ"), ("SIVB",)]
+    # The batch answer (SIVB's bars labelled SIVBQ) is kept as returned; the solo request adds
+    # the same bars under SIVB. Which label was in use when is the security master's call.
     rows = pq.read_table(tmp_path / "bars_1d" / "year=2023" / "bucket=S.parquet").to_pylist()
     assert [(r["symbol"], r["session_date"]) for r in rows] == [
         ("SIVB", date(2023, 1, 5)),
         ("SIVB", date(2023, 2, 3)),
+        ("SIVBQ", date(2023, 1, 5)),
+        ("SIVBQ", date(2023, 2, 3)),
     ]
-    assert report.rows == 2
+    assert report.rows == 4
 
 
 def test_symbols_whose_window_misses_the_period_are_not_requested(tmp_path: Path) -> None:

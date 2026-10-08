@@ -14,6 +14,7 @@ from sqlmodel import Session
 from asof import __version__
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
 from asof.ingest.bars import ET, Partition, backfill
+from asof.ingest.corporate_actions import build_tables, download_all
 from asof.ingest.http import make_fetch
 from asof.ingest.sec_ticker_history import (
     EXCHANGE_TARGET,
@@ -25,6 +26,7 @@ from asof.ingest.sec_ticker_history import (
     write_history,
 )
 from asof.ingest.sec_tickers import download_sec_listings, load_sec_listings
+from asof.ingest.security_master import build_from_store, load_overrides, write_master
 from asof.ingest.tickers import is_valid_symbol, normalize_ticker
 from asof.ingest.universe import (
     EXCHANGE_DIR,
@@ -360,3 +362,72 @@ def market_status(
             f"{row['year']}  {row['rows']:>12,} rows  {row['symbols']:>6,} symbols  "
             f"{first} .. {last}"
         )
+
+
+@market_app.command("actions")
+def market_actions(
+    start: Annotated[str, typer.Option(help="First effective date, YYYY-MM-DD.")] = "2020-01-01",
+    end: Annotated[str | None, typer.Option(help="Last effective date. Defaults to today.")] = None,
+    download: Annotated[
+        bool, typer.Option("--download/--no-download", help="Fetch from Alpaca before parsing.")
+    ] = True,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Download Alpaca corporate actions (splits, renames, mergers, dividends) and parse them."""
+    data_root = data_dir or default_data_dir()
+    root = _market_root(data_dir)
+    if download:
+        try:
+            start_date = date.fromisoformat(start)
+            end_date = date.fromisoformat(end) if end else datetime.now(ET).date()
+        except ValueError as error:
+            _fail(f"Bad date: {error}")
+        started = time.monotonic()
+        try:
+            counts = download_all(_alpaca_client(), data_root, start_date, end_date)
+        except AlpacaError as error:
+            _fail(f"Stopped: {error}")
+        for type_, n in counts.items():
+            typer.echo(f"  {type_:<24} {n:>8,} records")
+        typer.echo(f"downloaded in {time.monotonic() - started:,.0f}s")
+    counts = build_tables(data_root, root)
+    for name, n in counts.items():
+        typer.echo(f"  {name:<12} {n:>8,} rows")
+
+
+@market_app.command("identity")
+def market_identity(
+    overrides: Annotated[Path, typer.Option(help="Human decisions applied last.")] = Path(
+        "configs/security_overrides.yaml"
+    ),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Build the security master (which security each symbol was on each day) and list the
+    conflicts the code could not settle."""
+    root = _market_root(data_dir)
+    started = time.monotonic()
+    if not overrides.exists():
+        _fail(f"{overrides}: overrides file not found (run from the repo root or pass --overrides)")
+    try:
+        decisions = load_overrides(overrides)
+    except ValueError as error:
+        _fail(str(error))
+    master, conflicts = build_from_store(root, decisions)
+    write_master(master, conflicts, root)
+    symbols = len(set(master.column("symbol").to_pylist()))
+    securities = len(set(master.column("security_id").to_pylist()))
+    typer.echo(
+        f"{master.num_rows:,} segments, {symbols:,} symbols, {securities:,} securities, "
+        f"{time.monotonic() - started:,.0f}s"
+    )
+    by_kind: dict[str, int] = {}
+    for row in conflicts.to_pylist():
+        by_kind[row["kind"]] = by_kind.get(row["kind"], 0) + 1
+    for kind, n in sorted(by_kind.items()):
+        typer.echo(f"  conflicts {kind:<28} {n:>6,}")
+    if not by_kind:
+        typer.echo("  no conflicts")

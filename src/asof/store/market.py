@@ -16,6 +16,7 @@ import pyarrow as pa
 
 from asof.ingest.alpaca import Timeframe
 from asof.ingest.bars import _DIRS, BAR_SCHEMA
+from asof.ingest.corporate_actions import SPLIT_SCHEMA
 
 _YEAR_DIR = re.compile(r"^year=(\d{4})$")
 
@@ -66,6 +67,10 @@ def visible_bars(
     end: datetime | None = None,
 ) -> pa.Table:
     """Bars known at ``as_of``, ordered by symbol then time. ``[start, end)`` filters on ``t``.
+
+    Raw store rows, NOT yet resolved against the security master: a symbol may carry another
+    security's relabelled history (BK's 2020 bars under BNY) and volume-0 filler bars. Until the
+    ``resolve`` step lands, do not feed this into features or counts of "symbols with data".
 
     Sets the connection's ``TimeZone`` to UTC: DuckDB labels exported timestamps with the
     session zone, and callers must get UTC back.
@@ -118,3 +123,34 @@ def bars_status(con: duckdb.DuckDBPyConnection, root: Path, timeframe: Timeframe
         )
         status.append({"year": year, **summary})
     return status
+
+
+def _actions_file(root: Path, name: str) -> Path | None:
+    path = root / "corporate_actions" / f"{name}.parquet"
+    return path if path.exists() else None
+
+
+def visible_splits(
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    as_of: datetime,
+    symbols: Sequence[str] | None = None,
+) -> pa.Table:
+    """Split records known at ``as_of``: ``available_at`` (00:00 New York of the ex-date) must
+    not lie after it. Ordered by symbol then ex_date."""
+    as_of_utc = _aware_utc(as_of, "as_of")
+    path = _actions_file(root, "splits")
+    if path is None:
+        return SPLIT_SCHEMA.empty_table()
+    clauses = ["available_at <= $as_of"]
+    params: dict[str, Any] = {"as_of": as_of_utc}
+    if symbols is not None:
+        clauses.append("symbol IN (SELECT UNNEST($symbols))")
+        params["symbols"] = list(symbols)
+    con.execute("SET TimeZone = 'UTC'")
+    columns = ", ".join(SPLIT_SCHEMA.names)
+    query = (
+        f"SELECT {columns} FROM {_source([path])} WHERE {' AND '.join(clauses)} "
+        "ORDER BY symbol, ex_date"
+    )
+    return con.execute(query, params).to_arrow_table()
