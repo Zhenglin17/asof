@@ -16,6 +16,12 @@ from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
 from asof.ingest.bars import ET, Partition, backfill
 from asof.ingest.corporate_actions import build_tables, download_all
 from asof.ingest.http import make_fetch
+from asof.ingest.instrument_class import (
+    CLASSES,
+    load_rules,
+    write_instrument_class,
+)
+from asof.ingest.instrument_class import build_from_store as build_classes_from_store
 from asof.ingest.sec_ticker_history import (
     EXCHANGE_TARGET,
     SNAPSHOT_TARGET,
@@ -25,8 +31,18 @@ from asof.ingest.sec_ticker_history import (
     symbol_windows,
     write_history,
 )
-from asof.ingest.sec_tickers import download_sec_listings, load_sec_listings
-from asof.ingest.security_master import build_from_store, load_overrides, write_master
+from asof.ingest.sec_tickers import (
+    COMPANY_FILE,
+    FUND_FILE,
+    download_sec_listings,
+    load_sec_listings,
+)
+from asof.ingest.security_master import (
+    MASTER_FILE,
+    build_from_store,
+    load_overrides,
+    write_master,
+)
 from asof.ingest.tickers import is_valid_symbol, normalize_ticker
 from asof.ingest.universe import (
     EXCHANGE_DIR,
@@ -431,3 +447,60 @@ def market_identity(
         typer.echo(f"  conflicts {kind:<28} {n:>6,}")
     if not by_kind:
         typer.echo("  no conflicts")
+
+
+@market_app.command("instruments")
+def market_instruments(
+    rules: Annotated[Path, typer.Option(help="Ordered class rules.")] = Path(
+        "configs/instrument_class_rules.yaml"
+    ),
+    sec_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--sec-dir",
+            help="Directory holding the SEC ticker tables. Defaults to $ASOF_DATA_DIR/raw/sec.",
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Tag every security-master segment with its instrument class (common, etf, warrant...)
+    and list how many segments each class and each rule got. Re-run after `market identity`:
+    the table is keyed by the master's segments."""
+    root = _market_root(data_dir)
+    tables_dir = sec_dir or (data_dir or default_data_dir()) / "raw" / "sec"
+    if not rules.exists():
+        _fail(f"{rules}: rules file not found (run from the repo root or pass --rules)")
+    if not (root / MASTER_FILE).exists():
+        _fail(f"{root / MASTER_FILE}: no security master; run `asof market identity` first")
+    for name in (COMPANY_FILE, FUND_FILE):
+        if not (tables_dir / name).exists():
+            _fail(f"{tables_dir / name}: SEC table missing; run `asof entities sync --download`")
+    try:
+        loaded = load_rules(rules)
+    except ValueError as error:
+        _fail(str(error))
+    started = time.monotonic()
+    table = build_classes_from_store(root, tables_dir, loaded)
+    path = write_instrument_class(table, root)
+    typer.echo(f"{table.num_rows:,} segments -> {path} ({time.monotonic() - started:,.0f}s)")
+    by_class: dict[str, int] = {}
+    by_rule: dict[str, int] = {}
+    for cls, rule in zip(
+        table.column("class").to_pylist(), table.column("rule").to_pylist(), strict=True
+    ):
+        by_class[cls] = by_class.get(cls, 0) + 1
+        by_rule[rule] = by_rule.get(rule, 0) + 1
+    for cls in CLASSES:
+        if cls in by_class:
+            typer.echo(f"  {cls:<14} {by_class[cls]:>7,}")
+    for rule, n in sorted(by_rule.items(), key=lambda kv: -kv[1]):
+        typer.echo(f"    rule {rule:<24} {n:>7,}")
+    unknown = [
+        (row["symbol"], row["name"]) for row in table.to_pylist() if row["class"] == "unknown"
+    ]
+    for symbol, name in unknown[:20]:
+        typer.echo(f"  unknown {symbol:<8} {name}")
+    if len(unknown) > 20:
+        typer.echo(f"  ... {len(unknown) - 20:,} more unknown")

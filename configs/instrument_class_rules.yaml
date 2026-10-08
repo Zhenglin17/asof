@@ -1,0 +1,86 @@
+# Instrument class rules: first match wins.
+#
+# Each rule has an `id`, a `class`, and exactly one matcher:
+#   symbol: regular expression matched against the whole symbol (Alpaca spelling, e.g. BAC.PRB)
+#   name:   regular expression searched in the lower-cased segment name
+#   lookup: sec_funds      -> symbol listed in the SEC fund table (company_tickers_mf.json)
+#           nasdaq_suffix  -> 5-letter symbol ending in W/R/U/P whose issuer (same CIK in SEC
+#                             history) also lists a sibling ticker: a prefix of at least 3 letters
+#                             (ADILW <- ADIL, EXEEW <- EXE) or a 5-letter share class on the same
+#                             4-letter stem (LBRDP <- LBRDA); the class comes from the last letter
+#           sec_shelf      -> the name is an SEC issuer name (no Alpaca row) and that CIK lists 20
+#                             or more tickers: a bank's ETN shelf (Barclays 78, UBS 65, Credit
+#                             Suisse 28: TVIX, DGAZ, UGAZ) or a fund trust (ProShares Trust II 20).
+#                             The issuer name says nothing about the product, so leave it unknown.
+#           sec_companies  -> the segment has a CIK, or the symbol ever appeared in SEC history
+# Classes: common, etf, leveraged_etf, warrant, unit, preferred, right, note, crypto, unknown.
+# Anything no rule matches is `unknown`; the audit reports those and requires zero in the liquid tier.
+#
+# Order matters. Calibrated on the 2026-10-05 Alpaca asset table and SEC history (21,815 segments):
+# - `depositary` alone is NOT preferred: 1,262 ADRs say "American Depositary Shares" (SKHY, HLN);
+#   `preferred` alone is NOT preferred either: "Preferred Bank Common Stock" (PFBC), "PREFERRED
+#   APARTMENT COMMUNITIES INC" (APTS). `warrant` must be a whole word: "WARRANTEE INC." (WRNT).
+# - "Common Stock" / "Ordinary Shares" in the name beats every fund signal: SPCX "Space Exploration
+#   Technologies Corp. Class A Common Stock" sits on a stale SEC fund-table row; FBRT "Franklin BSP
+#   Realty Trust, Inc." is a REIT, BXSL / MSDL "... Lending Fund" are BDCs with 10-Ks. Closed-end
+#   funds whose Alpaca name ends in "Common Stock" (Calamos, RiverNorth, about 10) land in common
+#   too; accepted.
+# - `bond|note` alone is NOT a note: "iShares 3-7 Year Treasury Bond ETF" (IEI).
+# - `ultra|bull|bear` alone is NOT leveraged: "Innovator Ultra Buffer ETF" (UJUL), "Simplify Bond
+#   Bull ETF" (RFIX); Direxion always writes the multiplier ("Bull 3X").
+# - Being in the SEC company table does NOT mean common: SPY is "SPDR S&P 500 ETF TRUST" there,
+#   so the ETF name rules run first.
+# - 6,281 segments only have an SEC name, which is the issuer's name ("ADIAL PHARMACEUTICALS,
+#   INC." for the warrant ADILW); the nasdaq_suffix lookup covers those before the common rule.
+
+- id: sym_warrant
+  class: warrant
+  symbol: '.*\.(WS|WT)$'
+- id: sym_unit
+  class: unit
+  symbol: '.*\.U$'
+- id: sym_right
+  class: right
+  symbol: '.*\.RT$'
+- id: sym_preferred
+  class: preferred
+  symbol: '.*\.PR[A-Z]?$'
+- id: name_warrant
+  class: warrant
+  name: '\bwarrants?\b'
+- id: name_unit
+  class: unit
+  name: '\bunits?\b.*(acquisition|consisting|merger|capital corp|spac)|(acquisition|capital corp|spac).*\bunits?\b'
+- id: name_right
+  class: right
+  name: '\brights?\b.*(acquisition|entitl|expir|underlying)|(acquisition|capital corp).*\brights?\b|\brights?\.?$'
+- id: name_preferred
+  class: preferred
+  name: 'preferred (stock|shares?|securit|units?|interests?|series|equity)|(cumulative|convertible|perpetual|redeemable|\bseries [a-z]\b|\d(\.\d+)?%).*preferred|\bpfd\b|preference (shares?|stock)'
+- id: name_note
+  class: note
+  name: 'notes? due|debenture|bonds? due|subordinated notes|senior notes|\bnotes\b.*\d{4}'
+- id: name_leveraged
+  class: leveraged_etf
+  name: '^(?=.*(\betfs?\b|\betns?\b|\bfund\b|\bshares\b|\btrust\b|proshares|direxion)).*(\b-?\d(\.\d+)?x\b|ultrapro|ultrashort|proshares (ultra|short)\b|leveraged|inverse|daily target)'
+- id: name_company_not_fund
+  class: common
+  name: 'common stock|ordinary shares|realty trust|lending fund'
+- id: name_etf
+  class: etf
+  name: '\betfs?\b|\betns?\b|exchange[- ]traded|\bfund\b|\bindex\b|\b(ishares|spdr|grayscale|sprott|abrdn|vaneck|bitwise|invesco|wisdomtree|franklin|fidelity|21shares|osprey|ark|teucrium|united states|blackrock|nuveen|pimco|gamco|eaton vance|western asset|john hancock|morgan stanley|neuberger|cohen & steers|calamos|first trust|xai|saba|tortoise|clearbridge|virtus|royce|templeton|putnam|allianzgi|mfs|dws|voya|flaherty|adams|tri-continental|general american investors)\b.*\btrust\b'
+- id: lookup_sec_funds
+  class: etf
+  lookup: sec_funds
+- id: lookup_nasdaq_suffix
+  class: unknown  # placeholder: the class is taken from the symbol's last letter
+  lookup: nasdaq_suffix
+- id: lookup_sec_shelf
+  class: unknown
+  lookup: sec_shelf
+- id: name_common
+  class: common
+  name: 'common|ordinary|\bads\b|\badr\b|depositary|class [a-c]\b|\bshares?\b|\bstock\b|\binc\b|\bcorp|\bltd\b|\bplc\b|holdings?|\bllc\b|\bl\.?p\.?\b|\bn\.?v\.?\b|\bs\.?a\.?\b|\bag\b|\bco\b|bancorp|\btrust\b'
+- id: lookup_sec_companies
+  class: common
+  lookup: sec_companies
