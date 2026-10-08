@@ -10,7 +10,7 @@ import pytest
 
 from asof.ingest.alpaca import Bar
 from asof.ingest.bars import Partition, write_partition
-from asof.store.market import bars_status, market_root, visible_bars
+from asof.store.market import bars_status, market_root, visible_bars, visible_sessions
 from tests.ingest.fakes import AVAILABLE_DAY, FETCHED_AT, T_DAY, T_MIN, daily, make_bar
 
 MINUTE = timedelta(minutes=1)
@@ -361,3 +361,50 @@ def test_symbols_are_bound_as_parameters_not_spliced_into_sql(
     )
 
     assert table.num_rows == 0
+
+
+# --- visible_sessions: the market calendar as the data shows it ----------------------------------
+
+
+def test_visible_sessions_are_distinct_ascending_and_last_keeps_the_most_recent(
+    con: duckdb.DuckDBPyConnection, root: Path
+) -> None:
+    days = [date(2026, 9, 28), date(2026, 9, 29), date(2026, 9, 30), date(2026, 10, 1)]
+    store(root, Partition("1Day", 2026, None, "A"), [daily("AAPL", d) for d in days])
+    store(root, Partition("1Day", 2026, None, "M"), [daily("MSFT", d) for d in days[1:]])
+    as_of = datetime(2026, 10, 2, tzinfo=UTC)
+
+    assert visible_sessions(con, root, "1Day", as_of) == days
+    assert visible_sessions(con, root, "1Day", as_of, last=2) == days[-2:]
+    assert visible_sessions(con, root, "1Day", as_of, last=10) == days
+
+
+def test_visible_sessions_leave_out_a_session_whose_bar_is_not_yet_available(
+    con: duckdb.DuckDBPyConnection, root: Path
+) -> None:
+    # the 2026-10-02 bar is on disk during the session; it only counts from 20:00 New York
+    store(
+        root,
+        Partition("1Day", 2026, None, "A"),
+        [daily("AAPL", date(2026, 10, 1)), daily("AAPL", date(2026, 10, 2))],
+    )
+    during = datetime(2026, 10, 2, 13, tzinfo=UTC)  # 09:00 New York
+    assert visible_sessions(con, root, "1Day", during) == [date(2026, 10, 1)]
+    assert visible_sessions(con, root, "1Day", AVAILABLE_DAY) == [
+        date(2026, 10, 1),
+        date(2026, 10, 2),
+    ]
+    assert visible_sessions(con, root, "1Day", AVAILABLE_DAY - MINUTE, last=1) == [
+        date(2026, 10, 1)
+    ]
+
+
+def test_visible_sessions_empty_store_and_bad_arguments(
+    con: duckdb.DuckDBPyConnection, root: Path
+) -> None:
+    assert visible_sessions(con, root, "1Day", datetime(2026, 10, 2, tzinfo=UTC)) == []
+    store(root, Partition("1Day", 2026, None, "A"), [daily("AAPL", date(2026, 10, 1))])
+    with pytest.raises(ValueError):
+        visible_sessions(con, root, "1Day", datetime(2026, 10, 2))  # naive
+    with pytest.raises(ValueError):
+        visible_sessions(con, root, "1Day", datetime(2026, 10, 2, tzinfo=UTC), last=0)

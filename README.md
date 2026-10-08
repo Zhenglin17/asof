@@ -28,6 +28,9 @@ Any violation is look-ahead leakage and is treated as a bug.
       security master that maps each symbol-day to a permanent security across renames and
       ticker reuse, and an instrument class (common, ETF, leveraged ETF, warrant, unit...)
       for every segment
+- [x] Liquid tier: the securities that averaged more than $50M a day over the previous 20
+      sessions, computed as of any instant from data visible then; about 1,100-2,000 a month,
+      3,964 ever between 2020 and 2026
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
@@ -78,6 +81,8 @@ uv run asof market status                # rows, symbols and date range per year
 uv run asof market actions               # corporate actions: splits, name changes, mergers...
 uv run asof market identity              # security master: which security each symbol was, per day
 uv run asof market instruments           # instrument class of every security-master segment
+uv run asof market liquid --as-of 2021-03-01            # the liquid tier that morning
+uv run asof market liquid --from 2020-01-01 --to 2026-10-01   # one tier per month start, and the union
 ```
 
 The universe is the union of every symbol Alpaca lists and every ticker that appeared in an
@@ -99,7 +104,20 @@ same-day identical OHLCV, and lists the cases it could not settle for a human to
 `configs/security_overrides.yaml`. `asof market instruments` then tags each segment with an
 instrument class from the name it carried in that era, using the ordered rules in
 `configs/instrument_class_rules.yaml`; the scanner will only look at common stocks and
-unleveraged ETFs.
+unleveraged ETFs. Names the rules cannot judge (an issuer whose SEC entry carries dozens of
+notes, such as the ETN shelves of Credit Suisse or Bank of Montreal) stay `unknown` until a
+human records the class in `configs/instrument_class_overrides.yaml`.
+
+The scanner does not look at all 20,000 symbols. `asof market liquid` computes the liquid
+tier as of an instant: securities whose dollar volume over the previous 20 sessions averaged
+more than $50M a day, common stocks and unleveraged ETFs only, with no price floor. Everything
+it uses was visible at that instant: the session calendar, the bars, and the security-master
+segments that assign bars to securities (a rename published four days after it took effect is
+not applied until then). The divisor is the number of sessions, so a listing in its first week
+or a one-day SPAC spike cannot buy its way in. Recomputed at every month start, the tier is the
+scope the identity audit must settle and the universe the minute-bar backfill pulls; a symbol
+that qualifies while still `unknown` makes the command exit non-zero so the override file gets
+a line.
 
 ## Layout
 
@@ -123,7 +141,8 @@ strategies/<name>/   one strategy per directory (scan, rules, judge, execute,
 tests/               mirrors src/asof
 configs/             watchlist.yaml (instruments that get filings and fundamentals),
                      security_overrides.yaml (human identity decisions),
-                     instrument_class_rules.yaml (ordered class rules)
+                     instrument_class_rules.yaml (ordered class rules),
+                     instrument_class_overrides.yaml (human class decisions)
 docs/                public documentation                                  (planned)
 ```
 

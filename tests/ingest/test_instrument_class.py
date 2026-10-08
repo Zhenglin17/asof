@@ -11,8 +11,11 @@ Target API (asof.ingest.instrument_class, new module):
     Lookups(fund_symbols, ciks_by_ticker, tickers_by_cik)     frozen dataclass
     classify(symbol, name, cik, lookups, rules) -> (class, rule_id)
     segment_names(master, assets, sec_history) -> [(name, name_source), ...]  (master row order)
-    build_instrument_class(master, assets, sec_history, fund_symbols, rules) -> pa.Table
+    build_instrument_class(master, assets, sec_history, fund_symbols, rules, overrides=())
     write_instrument_class(table, market_root) -> Path
+    ClassOverride(symbol, cls, reason, valid_from=None)       frozen dataclass
+    load_class_overrides(path) -> list[ClassOverride]
+    apply_overrides(table, overrides) -> pa.Table              class + rule="override" on matches
 
 No ``as_of`` here: the class of a segment is a property of its name and symbol, not of when it
 was observed, so there is no leakage case in this file. The read path filters segments on the
@@ -38,6 +41,16 @@ on real data by audit A6 (count of ``unknown`` segments, expected 3: RALS, RFUN,
   two rows; 229 active+inactive, 20 both inactive).
 - One ticker first a SPAC unit, later a common stock after reuse: ASSUMPTION; audit A6 reports
   symbols whose segments carry different classes.
+- Overrides (``configs/instrument_class_overrides.yaml``), all real: BAM -> common (Brookfield
+  Asset Management; its CIK lists 20+ note tickers so the shelf rule left it unknown), TVIX /
+  DGAZ / UGAZ -> leveraged_etf (Credit Suisse ETNs, SEC name is the bank), FNGA / FNGB / XXXX ->
+  leveraged_etf (Bank of Montreal ETNs), NYMT -> common (New York Mortgage Trust; its preferreds
+  made it a shelf). An override that matches no segment is an error: a human decision that has
+  gone stale must be noticed, not silently skipped.
+- FPE "First Trust Preferred Securities and Income ETF" (real name) was tagged preferred on
+  2026-10-08 and qualifies for the liquid tier in 4 months: ``name_preferred`` must not fire on
+  a name that contains the word ETF. PFF "iShares Preferred and Income Securities ETF" and PGX
+  "Invesco Preferred ETF" are real names that already land on etf.
 """
 
 from __future__ import annotations
@@ -59,10 +72,13 @@ from asof.ingest.instrument_class import (
     CLASSES,
     LOOKUPS,
     NASDAQ_SUFFIX,
+    ClassOverride,
     Lookups,
     Rule,
+    apply_overrides,
     build_instrument_class,
     classify,
+    load_class_overrides,
     load_rules,
     segment_names,
     write_instrument_class,
@@ -1009,3 +1025,399 @@ def test_module_does_not_touch_the_network_or_the_store() -> None:
     src = Path(ic.__file__).read_text()
     for banned in ("requests", "httpx", "urllib", "alpaca"):
         assert not re.search(rf"^\s*(import|from)\s+{banned}\b", src, re.M), banned
+
+
+# =============================================================================================
+# rule fix: "preferred" inside an ETF name is the fund's theme, not the instrument
+# =============================================================================================
+
+
+@pytest.mark.parametrize(
+    ("symbol", "name"),
+    [
+        # real: tagged preferred on 2026-10-08, in the liquid tier 4 months of 2020-2026
+        ("FPE", "First Trust Preferred Securities and Income ETF"),
+        ("PFF", "iShares Preferred and Income Securities ETF"),  # real
+        ("PGX", "Invesco Preferred ETF"),  # real
+        ("PFFD", "Global X U.S. Preferred ETF"),  # real
+    ],
+    ids=["FPE", "PFF", "PGX", "PFFD"],
+)
+def test_preferred_etf_is_an_etf(rules: list[Rule], symbol: str, name: str) -> None:
+    assert classify(symbol, name, None, EMPTY_LOOKUPS, rules) == ("etf", "name_etf")
+
+
+@pytest.mark.parametrize(
+    ("symbol", "name", "expected_rule"),
+    [
+        (
+            "BAC.PRB",
+            "Bank of America Corporation Depositary Shares, each representing a 1/1,000th "
+            "interest in a share of 6.000% Non-Cumulative Preferred Stock, Series GG",
+            "sym_preferred",
+        ),
+        # same issuer, a symbol no symbol rule catches: the name rule must still say preferred
+        ("XPRF", "Bank of America Corporation Depositary Shares Preferred Stock", "name_preferred"),
+        (
+            "SMCIP",
+            "Super Micro Computer, Inc. Depositary Shares representing Preferred Stock",
+            "name_preferred",
+        ),
+    ],
+    ids=["BAC.PRB", "XPRF", "SMCIP"],
+)
+def test_preferred_stock_names_without_etf_stay_preferred(
+    rules: list[Rule], symbol: str, name: str, expected_rule: str
+) -> None:
+    assert classify(symbol, name, None, EMPTY_LOOKUPS, rules) == ("preferred", expected_rule)
+
+
+# =============================================================================================
+# overrides: human decisions applied last
+# =============================================================================================
+
+
+Cls = tuple[str, str, date, date | None, str, str, str, str]  # CLASS_SCHEMA column order
+
+
+def class_table(rows: Sequence[Cls]) -> pa.Table:
+    return pa.table(
+        {
+            name: pa.array([r[i] for r in rows], CLASS_SCHEMA.field(name).type)
+            for i, name in enumerate(CLASS_COLUMNS)
+        },
+        schema=CLASS_SCHEMA,
+    )
+
+
+# real symbols and the rules that mis-tag them (2026-10-08 build); names shortened
+TVIX_1: Cls = (
+    "tvix",
+    "TVIX",
+    D(2016, 1, 4),
+    D(2020, 7, 2),
+    "CREDIT SUISSE AG",
+    "sec",
+    "unknown",
+    "lookup_sec_shelf",
+)
+TVIX_2: Cls = (
+    "tvix",
+    "TVIX",
+    D(2022, 1, 3),
+    None,
+    "CREDIT SUISSE AG",
+    "sec",
+    "unknown",
+    "lookup_sec_shelf",
+)
+BAM: Cls = (
+    "bam",
+    "BAM",
+    D(2016, 1, 4),
+    None,
+    "BROOKFIELD ASSET MANAGEMENT INC.",
+    "sec",
+    "unknown",
+    "lookup_sec_shelf",
+)
+NYMT: Cls = (
+    "nymt",
+    "NYMT",
+    D(2016, 1, 4),
+    None,
+    "NEW YORK MORTGAGE TRUST INC",
+    "sec",
+    "unknown",
+    "lookup_sec_shelf",
+)
+AAPL: Cls = (
+    "aapl",
+    "AAPL",
+    D(2016, 1, 4),
+    None,
+    "Apple Inc. Common Stock",
+    "alpaca_active",
+    "common",
+    "name_company_not_fund",
+)
+MIXED = [TVIX_1, AAPL, BAM, TVIX_2, NYMT]
+
+
+def write_overrides(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "instrument_class_overrides.yaml"
+    path.write_text(text)
+    return path
+
+
+REAL_OVERRIDES_YAML = """
+- symbol: BAM
+  class: common
+  reason: >-
+    Brookfield Asset Management Inc.; its CIK lists 20+ note tickers so the shelf rule
+    left it unknown
+- symbol: TVIX
+  class: leveraged_etf
+  reason: Credit Suisse ETN; the SEC name is the bank
+- symbol: NYMT
+  class: common
+  reason: New York Mortgage Trust; its preferreds made it a shelf
+  valid_from: 2016-01-04
+"""
+
+
+def test_class_override_is_a_frozen_dataclass_with_optional_valid_from() -> None:
+    o = ClassOverride(symbol="BAM", cls="common", reason="Brookfield Asset Management Inc.")
+    assert o.valid_from is None
+    assert ClassOverride("TVIX", "leveraged_etf", "ETN", D(2016, 1, 4)).valid_from == D(2016, 1, 4)
+    with pytest.raises((AttributeError, TypeError)):
+        o.cls = "etf"  # type: ignore[misc]
+
+
+def test_load_class_overrides_small_file(tmp_path: Path) -> None:
+    loaded = load_class_overrides(write_overrides(tmp_path, REAL_OVERRIDES_YAML))
+    assert loaded == [
+        ClassOverride(
+            "BAM",
+            "common",
+            "Brookfield Asset Management Inc.; its CIK lists 20+ note tickers so the shelf rule "
+            "left it unknown",
+        ),
+        ClassOverride("TVIX", "leveraged_etf", "Credit Suisse ETN; the SEC name is the bank"),
+        ClassOverride(
+            "NYMT",
+            "common",
+            "New York Mortgage Trust; its preferreds made it a shelf",
+            D(2016, 1, 4),
+        ),
+    ]
+    assert all(o.cls in CLASSES for o in loaded)
+
+
+@pytest.mark.parametrize(("label", "text"), [("empty file", ""), ("empty list", "[]\n")])
+def test_load_class_overrides_empty_is_no_overrides(tmp_path: Path, label: str, text: str) -> None:
+    assert load_class_overrides(write_overrides(tmp_path, text)) == []
+
+
+def test_load_class_overrides_missing_file(tmp_path: Path) -> None:
+    with pytest.raises((ValueError, FileNotFoundError)):
+        load_class_overrides(tmp_path / "absent.yaml")
+
+
+@pytest.mark.parametrize(
+    ("label", "text"),
+    [
+        ("not a list", "symbol: BAM\nclass: common\nreason: x\n"),
+        ("item not a mapping", "- BAM\n"),
+        ("missing symbol", "- class: common\n  reason: x\n"),
+        ("missing class", "- symbol: BAM\n  reason: x\n"),
+        ("missing reason", "- symbol: BAM\n  class: common\n"),
+        ("empty reason", "- symbol: BAM\n  class: common\n  reason: ''\n"),
+        ("empty symbol", "- symbol: ''\n  class: common\n  reason: x\n"),
+        ("class unknown", "- symbol: BAM\n  class: unknown\n  reason: x\n"),
+        ("class not in CLASSES", "- symbol: BAM\n  class: bond\n  reason: x\n"),
+        ("unknown key", "- symbol: BAM\n  class: common\n  reason: x\n  rule: override\n"),
+        ("bad valid_from", "- symbol: BAM\n  class: common\n  reason: x\n  valid_from: soon\n"),
+        (
+            "duplicate symbol without valid_from",
+            "- symbol: BAM\n  class: common\n  reason: x\n"
+            "- symbol: BAM\n  class: etf\n  reason: y\n",
+        ),
+        (
+            "duplicate (symbol, valid_from)",
+            "- symbol: TVIX\n  class: leveraged_etf\n  reason: x\n  valid_from: 2016-01-04\n"
+            "- symbol: TVIX\n  class: etf\n  reason: y\n  valid_from: 2016-01-04\n",
+        ),
+    ],
+)
+def test_load_class_overrides_rejects_bad_files(tmp_path: Path, label: str, text: str) -> None:
+    with pytest.raises(ValueError):
+        load_class_overrides(write_overrides(tmp_path, text))
+
+
+def test_load_class_overrides_same_symbol_two_dates_is_allowed(tmp_path: Path) -> None:
+    text = (
+        "- symbol: TVIX\n  class: leveraged_etf\n  reason: x\n  valid_from: 2016-01-04\n"
+        "- symbol: TVIX\n  class: leveraged_etf\n  reason: y\n  valid_from: 2022-01-03\n"
+    )
+    assert [o.valid_from for o in load_class_overrides(write_overrides(tmp_path, text))] == [
+        D(2016, 1, 4),
+        D(2022, 1, 3),
+    ]
+
+
+def test_apply_overrides_changes_class_and_rule_of_every_matching_row_only() -> None:
+    table = class_table(MIXED)
+    out = apply_overrides(
+        table,
+        [
+            ClassOverride("TVIX", "leveraged_etf", "Credit Suisse ETN"),
+            ClassOverride("BAM", "common", "Brookfield Asset Management Inc."),
+        ],
+    )
+    assert out.schema.equals(CLASS_SCHEMA)
+    assert out.num_rows == table.num_rows
+    for col in ("security_id", "symbol", "valid_from", "valid_to", "name", "name_source"):
+        assert out.column(col).to_pylist() == table.column(col).to_pylist(), col
+    assert out.column("class").to_pylist() == [
+        "leveraged_etf",
+        "common",
+        "common",
+        "leveraged_etf",
+        "unknown",
+    ]
+    assert out.column("rule").to_pylist() == [
+        "override",
+        "name_company_not_fund",
+        "override",
+        "override",
+        "lookup_sec_shelf",
+    ]
+    # the input table is untouched
+    assert table.column("class").to_pylist() == [r[6] for r in MIXED]
+
+
+def test_apply_overrides_with_valid_from_touches_one_segment() -> None:
+    out = apply_overrides(
+        class_table(MIXED), [ClassOverride("TVIX", "leveraged_etf", "ETN", D(2022, 1, 3))]
+    )
+    rows = {(r["symbol"], r["valid_from"]): r for r in out.to_pylist()}
+    first, second = rows[("TVIX", D(2016, 1, 4))], rows[("TVIX", D(2022, 1, 3))]
+    assert (first["class"], first["rule"]) == ("unknown", "lookup_sec_shelf")
+    assert (second["class"], second["rule"]) == ("leveraged_etf", "override")
+
+
+def test_apply_overrides_empty_is_identity() -> None:
+    table = class_table(MIXED)
+    assert apply_overrides(table, []).to_pylist() == table.to_pylist()
+    assert apply_overrides(class_table([]), []).num_rows == 0
+
+
+@pytest.mark.parametrize(
+    ("override", "named"),
+    [
+        (ClassOverride("DGAZ", "leveraged_etf", "no longer in the master"), "DGAZ"),
+        (ClassOverride("TVIX", "leveraged_etf", "wrong date", D(2019, 1, 2)), "TVIX"),
+        (ClassOverride("tvix", "leveraged_etf", "wrong case", None), "tvix"),
+    ],
+    ids=["unknown symbol", "wrong valid_from", "symbol is case-sensitive"],
+)
+def test_apply_overrides_unmatched_override_is_an_error_naming_the_symbol(
+    override: ClassOverride, named: str
+) -> None:
+    with pytest.raises(ValueError, match=named):
+        apply_overrides(class_table(MIXED), [override])
+
+
+# real: DGAZ (Credit Suisse ETN, delisted 2020-07) is the kind of symbol a new company reuses;
+# the reuse would be a second security under the same ticker (477 reuses measured in 4b-2)
+DGAZ_ETN: Cls = (
+    "dgaz-etn",
+    "DGAZ",
+    D(2020, 6, 1),
+    D(2020, 7, 10),
+    "CREDIT SUISSE AG",
+    "sec",
+    "unknown",
+    "lookup_sec_shelf",
+)
+DGAZ_REUSED: Cls = (
+    "dgaz-2",
+    "DGAZ",
+    D(2024, 3, 1),
+    None,
+    "Dgaz Robotics Inc. Common Stock",
+    "alpaca_active",
+    "common",
+    "name_company_not_fund",
+)
+
+
+def test_apply_overrides_undated_override_must_not_span_two_securities() -> None:
+    table = class_table([DGAZ_ETN, DGAZ_REUSED])
+    with pytest.raises(ValueError, match=r"DGAZ.*valid_from"):
+        apply_overrides(table, [ClassOverride("DGAZ", "leveraged_etf", "ETN")])
+    # dated, each era is pinned on its own
+    out = apply_overrides(table, [ClassOverride("DGAZ", "leveraged_etf", "ETN", D(2020, 6, 1))])
+    assert out.column("class").to_pylist() == ["leveraged_etf", "common"]
+
+
+def test_apply_overrides_on_empty_table_with_an_override_is_an_error() -> None:
+    with pytest.raises(ValueError, match="BAM"):
+        apply_overrides(class_table([]), [ClassOverride("BAM", "common", "x")])
+
+
+def test_apply_overrides_last_one_wins_when_two_match_the_same_row() -> None:
+    # a bare-symbol override and a dated one on the same segment: order of the file decides
+    out = apply_overrides(
+        class_table([TVIX_1, TVIX_2]),
+        [
+            ClassOverride("TVIX", "etf", "broad"),
+            ClassOverride("TVIX", "leveraged_etf", "narrow", D(2022, 1, 3)),
+        ],
+    )
+    assert out.column("class").to_pylist() == ["etf", "leveraged_etf"]
+    assert out.column("rule").to_pylist() == ["override", "override"]
+
+
+def test_build_applies_overrides_after_the_rules(world: dict[str, Any], rules: list[Rule]) -> None:
+    plain = build(world, rules)
+    out = build_instrument_class(
+        world["master"],
+        world["assets"],
+        world["sec"],
+        world["funds"],
+        rules,
+        overrides=[ClassOverride("NONAME", "etf", "ASSUMPTION: a fund with no name anywhere")],
+    )
+    assert out.schema.equals(CLASS_SCHEMA)
+    rows = {r["security_id"]: r for r in out.to_pylist()}
+    assert (rows["gld-noname"]["class"], rows["gld-noname"]["rule"]) == ("etf", "override")
+    others = [r for r in out.to_pylist() if r["security_id"] != "gld-noname"]
+    assert others == [r for r in plain.to_pylist() if r["security_id"] != "gld-noname"]
+    # the default is no overrides
+    assert build(world, rules).to_pylist() == plain.to_pylist()
+
+
+def test_build_override_lifts_a_real_shelf_etn_out_of_unknown(rules: list[Rule]) -> None:
+    # real: TVIX has no Alpaca row; its SEC name is "CREDIT SUISSE AG" under CIK 1053092, which
+    # lists 28 tickers, so the shelf rule leaves it unknown; the override says what it is
+    cik = 1053092
+    master = master_table([("tvix", "TVIX", D(2016, 1, 4), D(2020, 7, 2), cik)])
+    shelf = sec_table(
+        [
+            (D(2020, 2, 1), f"T{i:04d}", cik, "CREDIT SUISSE AG")
+            for i in range(ic.SHELF_MIN_TICKERS - 1)
+        ]
+        + [(D(2020, 2, 1), "TVIX", cik, "CREDIT SUISSE AG")]
+    )
+    before = build_instrument_class(master, assets_table([]), shelf, [], rules)
+    assert (before.column("class")[0].as_py(), before.column("rule")[0].as_py()) == (
+        "unknown",
+        "lookup_sec_shelf",
+    )
+    after = build_instrument_class(
+        master,
+        assets_table([]),
+        shelf,
+        [],
+        rules,
+        overrides=[ClassOverride("TVIX", "leveraged_etf", "Credit Suisse VelocityShares ETN")],
+    )
+    assert (after.column("class")[0].as_py(), after.column("rule")[0].as_py()) == (
+        "leveraged_etf",
+        "override",
+    )
+    assert after.column("name")[0].as_py() == "CREDIT SUISSE AG"  # the name is not rewritten
+
+
+def test_build_with_a_stale_override_fails(world: dict[str, Any], rules: list[Rule]) -> None:
+    with pytest.raises(ValueError, match="DGAZ"):
+        build_instrument_class(
+            world["master"],
+            world["assets"],
+            world["sec"],
+            world["funds"],
+            rules,
+            overrides=[ClassOverride("DGAZ", "leveraged_etf", "delisted 2020-07")],
+        )

@@ -31,7 +31,7 @@ import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -76,6 +76,100 @@ CLASS_SCHEMA = pa.schema(
     ]
 )
 NO_MATCH = ("unknown", "none")
+OVERRIDE_RULE = "override"
+OVERRIDE_KEYS = frozenset({"symbol", "class", "reason", "valid_from"})
+
+
+@dataclass(frozen=True)
+class ClassOverride:
+    """A human decision for segments the name rules cannot settle (an issuer shelf: BAM is the
+    common stock under a CIK that also lists 20+ notes, TVIX an ETN under "CREDIT SUISSE AG").
+    ``valid_from`` pins one segment of the symbol; ``None`` covers every segment of it."""
+
+    symbol: str
+    cls: str
+    reason: str
+    valid_from: date | None = None
+
+
+def load_class_overrides(path: Path) -> list[ClassOverride]:
+    """``configs/instrument_class_overrides.yaml``: a list of ``symbol`` / ``class`` / ``reason``
+    mappings, optionally dated. Every entry must name a real class (never ``unknown``) and a
+    reason; duplicates and unknown keys are errors."""
+    if not path.exists():
+        raise FileNotFoundError(f"{path}: overrides file not found")
+    raw = yaml.safe_load(path.read_text()) or []
+    if not isinstance(raw, list):
+        raise ValueError(f"{path}: expected a list of overrides")
+    loaded: list[ClassOverride] = []
+    seen: set[tuple[str, date | None]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}: every override must be a mapping: {item!r}")
+        extra = set(item) - OVERRIDE_KEYS
+        if extra:
+            raise ValueError(f"{path}: unknown keys {sorted(extra)} in {item!r}")
+        symbol, cls, reason = item.get("symbol"), item.get("class"), item.get("reason")
+        if not isinstance(symbol, str) or not symbol:
+            raise ValueError(f"{path}: override needs a symbol: {item!r}")
+        if cls not in CLASSES or cls == "unknown":
+            raise ValueError(f"{path}: {symbol}: class must be one of {CLASSES[:-1]}: {cls!r}")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"{path}: {symbol}: override needs a reason")
+        valid_from = item.get("valid_from")
+        if valid_from is not None and (
+            isinstance(valid_from, datetime) or not isinstance(valid_from, date)
+        ):
+            raise ValueError(f"{path}: {symbol}: valid_from must be a date: {valid_from!r}")
+        key = (symbol, valid_from)
+        if key in seen:
+            raise ValueError(f"{path}: duplicate override for {symbol} ({valid_from})")
+        seen.add(key)
+        loaded.append(ClassOverride(symbol, cls, reason, valid_from))
+    return loaded
+
+
+def apply_overrides(table: pa.Table, overrides: Sequence[ClassOverride]) -> pa.Table:
+    """Set ``class`` and ``rule="override"`` on every row an override matches, in file order
+    (a later override wins). An override matching no row is an error: a stale human decision
+    must be noticed, not skipped. An undated override whose rows belong to more than one
+    security is an error too: the ticker was reused and each era needs its own dated line."""
+    if not overrides:
+        return table
+    symbols = table.column("symbol").to_pylist()
+    security_ids = table.column("security_id").to_pylist()
+    valid_froms = table.column("valid_from").to_pylist()
+    classes = table.column("class").to_pylist()
+    rules = table.column("rule").to_pylist()
+    for override in overrides:
+        hits = [
+            i
+            for i, (symbol, valid_from) in enumerate(zip(symbols, valid_froms, strict=True))
+            if symbol == override.symbol
+            and (override.valid_from is None or valid_from == override.valid_from)
+        ]
+        if not hits:
+            raise ValueError(
+                f"override for {override.symbol} ({override.valid_from or 'all segments'}) "
+                "matches no security-master segment"
+            )
+        securities = {security_ids[i] for i in hits}
+        if override.valid_from is None and len(securities) > 1:
+            # A reused ticker: DGAZ the ETN and whatever company takes the symbol later are
+            # different securities, and one undated decision must not silently cover both.
+            raise ValueError(
+                f"override for {override.symbol} without valid_from spans {len(securities)} "
+                f"securities ({', '.join(sorted(securities))}); add valid_from to pin one segment"
+            )
+        for i in hits:
+            classes[i] = override.cls
+            rules[i] = OVERRIDE_RULE
+    table = table.set_column(
+        table.schema.get_field_index("class"), "class", pa.array(classes, pa.string())
+    )
+    return table.set_column(
+        table.schema.get_field_index("rule"), "rule", pa.array(rules, pa.string())
+    )
 
 
 @dataclass(frozen=True)
@@ -315,8 +409,9 @@ def build_instrument_class(
     sec_history: pa.Table,
     fund_symbols: Iterable[str],
     rules: Sequence[Rule],
+    overrides: Sequence[ClassOverride] = (),
 ) -> pa.Table:
-    """One row per master segment, in master order."""
+    """One row per master segment, in master order; ``overrides`` are applied last."""
     lookups = build_lookups(sec_history, fund_symbols)
     names = segment_names(master, assets, sec_history)
     classes: list[str] = []
@@ -327,7 +422,7 @@ def build_instrument_class(
         cls, rule_id = classify(symbol, name, cik, lookups, rules, name_source=source)
         classes.append(cls)
         hits.append(rule_id)
-    return pa.table(
+    table = pa.table(
         {
             "security_id": master.column("security_id"),
             "symbol": master.column("symbol"),
@@ -340,9 +435,15 @@ def build_instrument_class(
         },
         schema=CLASS_SCHEMA,
     )
+    return apply_overrides(table, overrides)
 
 
-def build_from_store(market_root: Path, sec_dir: Path, rules: Sequence[Rule]) -> pa.Table:
+def build_from_store(
+    market_root: Path,
+    sec_dir: Path,
+    rules: Sequence[Rule],
+    overrides: Sequence[ClassOverride] = (),
+) -> pa.Table:
     """Classify the security master on disk using the saved Alpaca and SEC tables.
 
     SEC snapshots before ``SEC_HISTORY_START`` are a frozen stale table (see
@@ -361,7 +462,7 @@ def build_from_store(market_root: Path, sec_dir: Path, rules: Sequence[Rule]) ->
         }
     )
     funds = load_sec_listings(sec_dir).funds
-    return build_instrument_class(master, assets, history, funds, rules)
+    return build_instrument_class(master, assets, history, funds, rules, overrides)
 
 
 def write_instrument_class(table: pa.Table, market_root: Path) -> Path:

@@ -20,6 +20,8 @@
 # - `depositary` alone is NOT preferred: 1,262 ADRs say "American Depositary Shares" (SKHY, HLN);
 #   `preferred` alone is NOT preferred either: "Preferred Bank Common Stock" (PFBC), "PREFERRED
 #   APARTMENT COMMUNITIES INC" (APTS). `warrant` must be a whole word: "WARRANTEE INC." (WRNT).
+#   A name with the word ETF is never preferred: "First Trust Preferred Securities and Income
+#   ETF" (FPE) is a fund that holds preferreds.
 # - "Common Stock" / "Ordinary Shares" in the name beats every fund signal: SPCX "Space Exploration
 #   Technologies Corp. Class A Common Stock" sits on a stale SEC fund-table row; FBRT "Franklin BSP
 #   Realty Trust, Inc." is a REIT, BXSL / MSDL "... Lending Fund" are BDCs with 10-Ks. Closed-end
@@ -56,7 +58,7 @@
   name: '\brights?\b.*(acquisition|entitl|expir|underlying)|(acquisition|capital corp).*\brights?\b|\brights?\.?$'
 - id: name_preferred
   class: preferred
-  name: 'preferred (stock|shares?|securit|units?|interests?|series|equity)|(cumulative|convertible|perpetual|redeemable|\bseries [a-z]\b|\d(\.\d+)?%).*preferred|\bpfd\b|preference (shares?|stock)'
+  name: '^(?!.*\betfs?\b).*(preferred (stock|shares?|securit|units?|interests?|series|equity)|(cumulative|convertible|perpetual|redeemable|\bseries [a-z]\b|\d(\.\d+)?%).*preferred|\bpfd\b|preference (shares?|stock))'
 - id: name_note
   class: note
   name: 'notes? due|debenture|bonds? due|subordinated notes|senior notes|\bnotes\b.*\d{4}'

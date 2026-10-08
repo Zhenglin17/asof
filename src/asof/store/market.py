@@ -7,7 +7,7 @@ filter that matters is ``available_at <= as_of``: a bar on disk whose availabili
 
 import re
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +100,37 @@ def visible_bars(
         f"SELECT {columns} FROM {_source(files)} WHERE {' AND '.join(clauses)} ORDER BY symbol, t"
     )
     return con.execute(query, params).to_arrow_table()
+
+
+def visible_sessions(
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    timeframe: Timeframe,
+    as_of: datetime,
+    *,
+    last: int | None = None,
+) -> list[date]:
+    """Trading sessions known at ``as_of``, ascending: the distinct ``session_date`` of bars
+    whose ``available_at`` is not after ``as_of``. ``last`` keeps only the most recent ones.
+
+    This is the market calendar as the data shows it. A session only appears once at least one
+    bar of it is visible, so a session still in progress is not listed.
+    """
+    as_of_utc = _aware_utc(as_of, "as_of")
+    if last is not None and last <= 0:
+        raise ValueError("last must be positive")
+    files = _files(root, timeframe)
+    if not files:
+        return []
+    con.execute("SET TimeZone = 'UTC'")
+    query = (
+        f"SELECT DISTINCT session_date FROM {_source(files)} WHERE available_at <= $as_of "
+        "ORDER BY session_date DESC"
+    )
+    if last is not None:
+        query += f" LIMIT {int(last)}"
+    sessions = [row[0] for row in con.execute(query, {"as_of": as_of_utc}).fetchall()]
+    return sorted(sessions)
 
 
 def bars_status(con: duckdb.DuckDBPyConnection, root: Path, timeframe: Timeframe) -> list[dict]:

@@ -1,0 +1,50 @@
+# Human decisions the instrument-class build applies after the rules. Each entry needs a
+# reason; `valid_from` (optional) pins one security-master segment of the symbol. An undated
+# entry may only cover segments of one security: a reused ticker needs one dated line per era.
+#
+# Only symbols that qualified for the liquid tier (ADV > $50M on some month start, 2020-2026)
+# while tagged `unknown` are listed; the other ~120 shelf segments never trade enough to matter.
+# `asof market liquid --from ... --to ...` lists any new qualified-but-unknown symbol.
+
+- symbol: BAM
+  class: common
+  valid_from: 2020-01-02
+  reason: >-
+    Brookfield Asset Management Inc. class A shares, the parent that became Brookfield Corp (BN)
+    in December 2022. The SEC name is the issuer's and its CIK lists 20+ note tickers, so the
+    shelf rule left it unknown. In the tier 35 months.
+- symbol: BAM
+  class: common
+  valid_from: 2022-12-12
+  reason: >-
+    Brookfield Asset Management Ltd., the asset manager spun out on 2022-12-12 under the old
+    ticker (a different security); same shelf problem until Alpaca's row names it.
+- symbol: BAM
+  class: common
+  valid_from: 2023-01-03
+  reason: The same asset manager after the SEC table switched the ticker to its new CIK.
+- symbol: NYMT
+  class: common
+  reason: >-
+    New York Mortgage Trust common stock; its preferred series (NYMTL, NYMTM, ...) make the CIK
+    look like a shelf. In the tier 2020-03 and 2020-04.
+- symbol: TVIX
+  class: leveraged_etf
+  reason: >-
+    VelocityShares Daily 2x VIX Short-Term ETN, issued by Credit Suisse AG (the SEC name);
+    delisted 2020-07. Averaged up to $3.4B a day in 2020-H1.
+- symbol: UGAZ
+  class: leveraged_etf
+  reason: VelocityShares 3x Long Natural Gas ETN (Credit Suisse AG); delisted 2020-07.
+- symbol: DGAZ
+  class: leveraged_etf
+  reason: VelocityShares 3x Inverse Natural Gas ETN (Credit Suisse AG); delisted 2020-07.
+- symbol: FNGA
+  class: leveraged_etf
+  reason: MicroSectors FANG+ 3X Leveraged ETN (Bank of Montreal), the 2025 successor of FNGU.
+- symbol: FNGB
+  class: leveraged_etf
+  reason: MicroSectors FANG+ 3X Leveraged ETN series B (Bank of Montreal).
+- symbol: XXXX
+  class: leveraged_etf
+  reason: MAX S&P 500 4X Leveraged ETN (Bank of Montreal); in the tier 2024-04 and 2024-05.

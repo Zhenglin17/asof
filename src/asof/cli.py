@@ -18,6 +18,7 @@ from asof.ingest.corporate_actions import build_tables, download_all
 from asof.ingest.http import make_fetch
 from asof.ingest.instrument_class import (
     CLASSES,
+    load_class_overrides,
     load_rules,
     write_instrument_class,
 )
@@ -58,6 +59,13 @@ from asof.store.db import default_data_dir, default_db_path, init_db, make_engin
 from asof.store.entities import EntityConflict, upsert_entities
 from asof.store.market import bars_status, market_root
 from asof.store.models import EntityKind
+from asof.store.universe import (
+    LIQUID_CLASSES,
+    MIN_ADV_USD,
+    liquid_securities,
+    month_starts,
+    tier_union,
+)
 
 SEC_USER_AGENT_ENV = "ASOF_SEC_USER_AGENT"
 ALPACA_KEY_ENV = "ALPACA_API_KEY"
@@ -454,6 +462,9 @@ def market_instruments(
     rules: Annotated[Path, typer.Option(help="Ordered class rules.")] = Path(
         "configs/instrument_class_rules.yaml"
     ),
+    overrides: Annotated[Path, typer.Option(help="Human decisions applied last.")] = Path(
+        "configs/instrument_class_overrides.yaml"
+    ),
     sec_dir: Annotated[
         Path | None,
         typer.Option(
@@ -472,6 +483,8 @@ def market_instruments(
     tables_dir = sec_dir or (data_dir or default_data_dir()) / "raw" / "sec"
     if not rules.exists():
         _fail(f"{rules}: rules file not found (run from the repo root or pass --rules)")
+    if not overrides.exists():
+        _fail(f"{overrides}: overrides file not found (run from the repo root or pass --overrides)")
     if not (root / MASTER_FILE).exists():
         _fail(f"{root / MASTER_FILE}: no security master; run `asof market identity` first")
     for name in (COMPANY_FILE, FUND_FILE):
@@ -479,10 +492,14 @@ def market_instruments(
             _fail(f"{tables_dir / name}: SEC table missing; run `asof entities sync --download`")
     try:
         loaded = load_rules(rules)
+        decisions = load_class_overrides(overrides)
     except ValueError as error:
         _fail(str(error))
     started = time.monotonic()
-    table = build_classes_from_store(root, tables_dir, loaded)
+    try:
+        table = build_classes_from_store(root, tables_dir, loaded, decisions)
+    except ValueError as error:
+        _fail(str(error))
     path = write_instrument_class(table, root)
     typer.echo(f"{table.num_rows:,} segments -> {path} ({time.monotonic() - started:,.0f}s)")
     by_class: dict[str, int] = {}
@@ -504,3 +521,104 @@ def market_instruments(
         typer.echo(f"  unknown {symbol:<8} {name}")
     if len(unknown) > 20:
         typer.echo(f"  ... {len(unknown) - 20:,} more unknown")
+
+
+def _as_of_option(value: datetime) -> datetime:
+    """A date or datetime on the command line; naive values are New York time."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=ET)
+
+
+@market_app.command("liquid")
+def market_liquid(
+    as_of: Annotated[
+        datetime | None,
+        typer.Option("--as-of", help="One tier at this instant (date = 00:00 New York)."),
+    ] = None,
+    start: Annotated[
+        datetime | None, typer.Option("--from", help="Union mode: first month to include.")
+    ] = None,
+    end: Annotated[
+        datetime | None, typer.Option("--to", help="Union mode: last month to include.")
+    ] = None,
+    min_adv: Annotated[
+        float, typer.Option("--min-adv", min=0.0, help="Average daily dollar volume threshold.")
+    ] = MIN_ADV_USD,
+    top: Annotated[int, typer.Option(min=0, help="Rows to print in single-tier mode.")] = 20,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """The liquid tier: securities averaging more than --min-adv dollars a day over the last 20
+    sessions, common stocks and ETFs only. Either one tier (--as-of) or one per month start
+    (--from/--to) with the union and every qualified-but-unknown segment listed."""
+    root = _market_root(data_dir)
+    if (as_of is None) == (start is None or end is None):
+        _fail("pass either --as-of, or both --from and --to")
+    started = time.monotonic()
+    con = duckdb.connect()
+    try:
+        if as_of is not None:
+            table = liquid_securities(
+                con, root, _as_of_option(as_of), min_adv_usd=min_adv, classes=None
+            )
+        else:
+            assert start is not None and end is not None
+            table = tier_union(
+                con, root, start.date(), end.date(), min_adv_usd=min_adv, classes=None
+            )
+    except (FileNotFoundError, ValueError) as error:
+        _fail(str(error))
+    finally:
+        con.close()
+    rows = table.to_pylist()
+    in_tier = [r for r in rows if r["class"] in LIQUID_CLASSES]
+    elapsed = time.monotonic() - started
+
+    if as_of is not None:
+        by_class: dict[str, int] = {}
+        for r in rows:
+            by_class[r["class"]] = by_class.get(r["class"], 0) + 1
+        when = _as_of_option(as_of).astimezone(ET)
+        typer.echo(
+            f"{len(in_tier):,} securities in the liquid tier at {when:%Y-%m-%d %H:%M %Z} "
+            f"({len(rows):,} above the threshold in any class, {elapsed:,.1f}s)"
+        )
+        for cls in CLASSES:
+            if cls in by_class:
+                typer.echo(f"  {cls:<14} {by_class[cls]:>6,}")
+        for r in in_tier[:top]:
+            typer.echo(
+                f"  {r['symbol']:<8} {r['security_id']:<8} {r['class']:<8} "
+                f"{r['adv_usd'] / 1e6:>10,.0f} M  {r['sessions_traded']:>2} traded"
+            )
+    else:
+        assert start is not None and end is not None
+        months: dict[datetime, int] = dict.fromkeys(month_starts(start.date(), end.date()), 0)
+        for r in in_tier:
+            months[r["as_of"]] += 1
+        for month, n in months.items():
+            typer.echo(
+                f"  {month.astimezone(ET).date()}  {n:>6,}"
+                + ("  (no visible sessions)" if n == 0 else "")
+            )
+        union = {r["security_id"] for r in in_tier}
+        typer.echo(
+            f"{len(union):,} securities ever in the liquid tier over {len(months)} month starts "
+            f"({elapsed:,.0f}s)"
+        )
+        by_class = {}
+        for _sid, cls in {(r["security_id"], r["class"]) for r in rows}:
+            by_class[cls] = by_class.get(cls, 0) + 1
+        for cls in CLASSES:
+            if cls in by_class:
+                typer.echo(f"  {cls:<14} {by_class[cls]:>6,}")
+    unknown: dict[str, int] = {}
+    for r in rows:
+        if r["class"] == "unknown":
+            unknown[r["symbol"]] = unknown.get(r["symbol"], 0) + 1
+    if unknown:
+        typer.echo(f"{len(unknown)} qualified-but-unknown symbols (add to the class overrides):")
+        for symbol, n in sorted(unknown.items(), key=lambda kv: -kv[1]):
+            typer.echo(f"  {symbol:<8} {n} month(s)")
+        raise typer.Exit(code=2)  # 1 is "could not run"; 2 is "ran and found work for a human"
+    typer.echo("  no qualified-but-unknown symbols")
