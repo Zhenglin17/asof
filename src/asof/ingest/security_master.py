@@ -168,7 +168,7 @@ def edges_from_sec(sec_history: pa.Table) -> pa.Table:
 
     Two things that look like renames are not: the SEC file flickering between two labels of
     one filer (the old ticker is listed again later, or the new one had been listed before --
-    VIAC vanished from the 2020-07-10 snapshot while CBS reappeared; 375 of 639 such edges on
+    VIAC vanished from the 2020-07-10 snapshot while CBS reappeared; 264 of 639 such edges on
     the real file), and a filer that was absent from the table for more than
     ``SEC_GAP_MAX_SNAPSHOTS`` snapshots and came back under another ticker (a relisting:
     BULL 2023-06 ... BLSH 2025-08).
