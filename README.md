@@ -89,7 +89,7 @@ uv run asof market identity              # security master: which security each 
 uv run asof market instruments           # instrument class of every security-master segment
 uv run asof market liquid --as-of 2021-03-01            # the liquid tier that morning
 uv run asof market liquid --from 2020-01-01 --to 2026-10-01   # one tier per month start, and the union
-uv run asof market audit                 # one count per known kind of data accident
+uv run asof market audit                 # count every kind of data error found so far
 ```
 
 The universe is the union of every symbol Alpaca lists and every ticker that appeared in an
