@@ -36,6 +36,9 @@ packages = ["src/asof"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "realdata: runs against the real store under /data/asof; skipped when it is absent",
+]
 
 [tool.ruff]
 line-length = 100

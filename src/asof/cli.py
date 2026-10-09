@@ -55,6 +55,13 @@ from asof.ingest.universe import (
     save_assets_snapshot,
 )
 from asof.ingest.watchlist import load_watchlist, resolve_watchlist
+from asof.store.audit import (
+    CHECKS,
+    load_exceptions,
+    run_audit,
+    stale_exceptions,
+    write_report,
+)
 from asof.store.db import default_data_dir, default_db_path, init_db, make_engine
 from asof.store.entities import EntityConflict, upsert_entities
 from asof.store.market import bars_status, market_root
@@ -622,3 +629,99 @@ def market_liquid(
             typer.echo(f"  {symbol:<8} {n} month(s)")
         raise typer.Exit(code=2)  # 1 is "could not run"; 2 is "ran and found work for a human"
     typer.echo("  no qualified-but-unknown symbols")
+
+
+@market_app.command("audit")
+def market_audit(
+    tier: Annotated[
+        str, typer.Option(help="liquid: gated checks count rows in the liquid tier; all: anywhere.")
+    ] = "liquid",
+    as_of: Annotated[
+        datetime | None,
+        typer.Option("--as-of", help="Audit the store as known then (date = 00:00 New York)."),
+    ] = None,
+    start: Annotated[
+        datetime, typer.Option("--from", help="First month of the liquid-tier union.")
+    ] = datetime(2020, 1, 1),
+    end: Annotated[
+        datetime | None,
+        typer.Option("--to", help="Last month of the liquid-tier union. Defaults to --as-of."),
+    ] = None,
+    min_adv: Annotated[
+        float, typer.Option("--min-adv", min=0.0, help="Liquid-tier dollar volume threshold.")
+    ] = MIN_ADV_USD,
+    checks: Annotated[
+        str | None, typer.Option("--checks", help="Comma-separated check ids. Default: all.")
+    ] = None,
+    exceptions: Annotated[Path, typer.Option(help="Reviewed exceptions.")] = Path(
+        "configs/audit_exceptions.yaml"
+    ),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Count every known kind of data accident in the store. Exit 0 when the gated checks are
+    clean outside the exceptions, 2 when they are not; rows go to <market>/audit/<id>.parquet."""
+    if tier not in ("liquid", "all"):
+        _fail("--tier must be liquid or all")
+    root = _market_root(data_dir)
+    when = _as_of_option(as_of) if as_of is not None else datetime.now(ET)
+    last = end.date() if end is not None else when.astimezone(ET).date()
+    wanted = [c.strip() for c in checks.split(",") if c.strip()] if checks else None
+    try:
+        reviewed = load_exceptions(exceptions)
+    except ValueError as error:
+        _fail(str(error))
+    started = time.monotonic()
+    con = duckdb.connect()
+    try:
+        # every class above the threshold; the liquid tier is its common / etf part, and an
+        # unknown class above the threshold is what M5 must catch
+        qualified = tier_union(con, root, start.date(), last, min_adv_usd=min_adv, classes=None)
+        qualified_ids = set(qualified.column("security_id").to_pylist())
+        liquid_ids = {
+            r["security_id"] for r in qualified.to_pylist() if r["class"] in LIQUID_CLASSES
+        }
+        results = run_audit(
+            con,
+            root,
+            as_of=when,
+            liquid_ids=liquid_ids,
+            qualified_ids=qualified_ids,
+            exceptions=reviewed,
+            checks=wanted,
+        )
+    except (FileNotFoundError, ValueError) as error:
+        _fail(str(error))
+    finally:
+        con.close()
+    report = write_report(results, root)
+
+    typer.echo(
+        f"as of {when.astimezone(ET):%Y-%m-%d %H:%M %Z}; liquid tier {len(liquid_ids):,} "
+        f"securities ({start:%Y-%m}..{last:%Y-%m}, > {min_adv / 1e6:,.0f}M); "
+        f"{time.monotonic() - started:,.0f}s"
+    )
+    typer.echo(f"{'':3}{'check':<4} {'gate':<6} {'liquid':>8} {'all':>9} {'excepted':>8}  title")
+    failed = []
+    for r in results:
+        mark = "X" if r.fails(tier) else " "  # type: ignore[arg-type]
+        if r.fails(tier):  # type: ignore[arg-type]
+            failed.append(r.spec.id)
+        typer.echo(
+            f" {mark} {r.spec.id:<4} {r.spec.gate or '-':<6} {r.liquid:>8,} {r.total:>9,} "
+            f"{r.excepted:>8,}  {r.spec.title}"
+        )
+        if r.notes:
+            notes = ", ".join(
+                f"{k}={v:,.4g}" if isinstance(v, float) else f"{k}={v:,}"
+                for k, v in r.notes.items()
+            )
+            typer.echo(f"{'':13}{notes}")
+    for e in stale_exceptions(results, reviewed):
+        typer.echo(f"stale exception: {e.check} {e.key} ({e.reason})")
+    typer.echo(f"rows -> {report}/<check>.parquet")
+    if failed:
+        typer.echo(f"gated checks not clean at tier {tier}: {', '.join(failed)}")
+        raise typer.Exit(code=2)
+    typer.echo(f"all gated checks clean at tier {tier} ({len(CHECKS)} checks known)")

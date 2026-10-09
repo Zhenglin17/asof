@@ -1,0 +1,10 @@
+# Reviewed exceptions to `asof market audit`. Each entry needs every field:
+#
+#   - check: S3                  # a check id (P1..C1; `asof market audit` lists them)
+#     key: "EXEEW:2026-02-03"    # the row key exactly as the audit prints it
+#     reason: "warrant; one-day print at 0.0101 between 105 and 125"
+#     added: 2026-10-09
+#     by: greyson
+#
+# An entry that no longer matches any row is reported as stale.
+[]

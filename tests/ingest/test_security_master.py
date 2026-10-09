@@ -52,10 +52,12 @@ Fake data provenance (probe 2026-10-06, ``alpaca-corporate-actions-probe.md``, u
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from asof.ingest import security_master as sm
@@ -3144,3 +3146,226 @@ def test_h2_old_holder_ends_at_the_earliest_same_day_record_not_at_the_sec_snaps
         if row["symbol"] == "ARNC" and row["valid_to"] is not None:
             successor = segment_at(master, "ARNC", row["valid_to"])
             assert row["end_available_at"] == successor["available_at"]
+
+
+# =============================================================================================
+# check_master: file-level sanity, run before the master is written (2026-10-08 design)
+# =============================================================================================
+#
+# API these tests expect (implementation pending):
+#   check_master(master: pa.Table) -> None
+#       ValueError whose message names every violated rule and its count; an empty table
+#       passes. Rules, over the full unmasked table: available_at never null; valid_to null
+#       <=> end_available_at null; valid_to strictly after valid_from; end_available_at not
+#       before 00:00 New York of valid_to; no duplicate (security_id, symbol, valid_from);
+#       segments of one symbol never overlap; adjacent same-symbol segments (old.valid_to ==
+#       new.valid_from) agree on the instant (old.end_available_at == new.available_at).
+#   write_master(master, conflicts, market_root) calls it first and writes nothing on failure.
+#
+# Real (2026-10-08): 723 adjacent same-symbol pairs, all equal after the H2 rule; before it
+# ARNC / INBX / LAC / WBD / XPER disagreed and visible_master reported overlaps at e.g.
+# 2020-04-01. Gap pairs (FFR vacated 2022-10-03, retaken 2026-09-30) are not constrained.
+
+
+def seg_row(
+    security_id: str,
+    symbol: str,
+    valid_from: date,
+    valid_to: date | None = None,
+    *,
+    available_at: datetime | None = None,
+    end_available_at: datetime | None = None,
+    cik: int | None = None,
+) -> dict[str, Any]:
+    """A master row; instants default to midnight New York of the day (the rename rule)."""
+    if end_available_at is None and valid_to is not None:
+        end_available_at = et_midnight(valid_to)
+    return {
+        "security_id": security_id,
+        "symbol": symbol,
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+        "cik": cik,
+        "cusip": None,
+        "evidence": "bars",
+        "available_at": et_midnight(valid_from) if available_at is None else available_at,
+        "end_available_at": end_available_at,
+    }
+
+
+def master_table(rows: Sequence[dict[str, Any]]) -> pa.Table:
+    return pa.Table.from_pylist(list(rows), schema=sm.MASTER_SCHEMA)
+
+
+CM_D0 = date(2020, 1, 2)
+CM_CUT = date(2020, 6, 4)
+CM_LATER = date(2020, 6, 8)
+
+
+def cm_good_rows() -> list[dict[str, Any]]:
+    return [
+        seg_row("S1", "A", CM_D0, CM_CUT, cik=1),
+        seg_row("S2", "A", CM_CUT, cik=2),  # same label retaken on the cut day
+        seg_row("S3", "B", CM_D0, CM_CUT),
+        seg_row("S3", "C", CM_CUT),  # a rename: different labels, one security
+        seg_row("S4", "D", CM_D0),
+    ]
+
+
+def test_check_master_passes_the_built_worlds_and_an_empty_table(
+    master: pa.Table, h2_built: tuple[pa.Table, pa.Table], f9_built: tuple[pa.Table, pa.Table]
+) -> None:
+    for table in (master, h2_built[0], f9_built[0], master_table(cm_good_rows())):
+        assert table.num_rows > 0
+        assert sm.check_master(table) is None
+    assert sm.check_master(master_table([])) is None
+
+
+def cm_violation(name: str) -> list[dict[str, Any]]:
+    good = cm_good_rows()
+    if name == "null_available_at":
+        return [*good, {**seg_row("S5", "E", CM_D0), "available_at": None}]
+    if name == "closed_without_end":
+        return [*good, {**seg_row("S5", "E", CM_D0, CM_CUT), "end_available_at": None}]
+    if name == "open_with_end":
+        return [*good, seg_row("S5", "E", CM_D0, None, end_available_at=et_midnight(CM_CUT))]
+    if name == "zero_length":
+        return [*good, seg_row("S5", "E", CM_CUT, CM_CUT)]
+    if name == "ends_before_it_starts":
+        return [*good, seg_row("S5", "E", CM_CUT, CM_D0)]
+    if name == "end_known_before_its_day":
+        before_midnight = et_midnight(CM_CUT) - timedelta(microseconds=1)
+        return [*good, seg_row("S5", "E", CM_D0, CM_CUT, end_available_at=before_midnight)]
+    if name == "duplicate_key":
+        return [*good, seg_row("S4", "D", CM_D0)]
+    if name == "overlap_two_securities":
+        return [*good, seg_row("S5", "D", date(2020, 3, 2))]  # S4's D is open-ended
+    if name == "overlap_closed_pieces":
+        return [
+            *good,
+            seg_row("S5", "E", CM_D0, CM_LATER),
+            seg_row("S6", "E", CM_CUT, date(2020, 12, 31)),
+        ]
+    if name == "adjacent_instants_disagree":
+        return [
+            *good,
+            seg_row("S5", "E", CM_D0, CM_CUT, end_available_at=et_midnight(CM_LATER)),
+            seg_row("S6", "E", CM_CUT),  # known at midnight of the cut, the end only later
+        ]
+    raise AssertionError(name)
+
+
+@pytest.mark.parametrize(
+    ("name", "pattern"),
+    [
+        ("null_available_at", r"available_at"),
+        ("closed_without_end", r"end_available_at"),
+        ("open_with_end", r"end_available_at"),
+        ("zero_length", r"valid_from"),
+        ("ends_before_it_starts", r"valid_from"),
+        ("end_known_before_its_day", r"end_available_at"),
+        ("duplicate_key", r"duplicate"),
+        ("overlap_two_securities", r"overlap"),
+        ("overlap_closed_pieces", r"overlap"),
+        ("adjacent_instants_disagree", r"instant|adjacent"),
+    ],
+)
+def test_check_master_names_the_violated_rule(name: str, pattern: str) -> None:
+    with pytest.raises(ValueError, match=pattern):
+        sm.check_master(master_table(cm_violation(name)))
+
+
+def test_check_master_message_carries_the_count_and_every_violated_rule() -> None:
+    rows = cm_good_rows()
+    rows += [{**seg_row(f"S{n}", "E", CM_D0), "available_at": None} for n in (5, 6, 7)]
+    with pytest.raises(ValueError) as info:
+        sm.check_master(master_table(rows))
+    assert re.search(r"\b3\b", str(info.value)), str(info.value)
+
+    rows = [*cm_good_rows(), seg_row("S4", "D", CM_D0), seg_row("S5", "D", date(2020, 3, 2))]
+    with pytest.raises(ValueError) as info:
+        sm.check_master(master_table(rows))
+    assert re.search(r"duplicate", str(info.value)) and re.search(r"overlap", str(info.value))
+
+
+def test_check_master_adjacent_rule_on_real_shaped_pairs() -> None:
+    # BBBY (real): Bed Bath & Beyond's piece ends the day Beyond Inc's begins, both knowable at
+    # that midnight -- the common shape of a label vacated and retaken on one day
+    bbby = [
+        seg_row("S_BBBY1", "BBBY", CM_D0, date(2025, 8, 29), cik=886158),
+        seg_row("S_BBBY2", "BBBY", date(2025, 8, 29), date(2026, 8, 17), cik=1130713),
+    ]
+    assert sm.check_master(master_table(bbby)) is None
+    # GOOG (real): a CIK switch inside one security, same label, cut at the SEC snapshot
+    goog = [
+        seg_row("S_GOOG", "GOOG", date(2019, 1, 2), date(2019, 7, 1), cik=1288776),
+        seg_row("S_GOOG", "GOOG", date(2019, 7, 1), cik=1652044),
+    ]
+    assert sm.check_master(master_table(goog)) is None
+    # ARNC (real, before the H2 rule): the old holder's end dated at the 2020-06-01 snapshot
+    # while Arconic Corp's segment was knowable on 2020-04-01
+    arnc = [
+        seg_row(
+            "S_ARNC1",
+            "ARNC",
+            CM_D0,
+            date(2020, 4, 1),
+            end_available_at=et_midnight(date(2020, 6, 1)),
+        ),
+        seg_row("S_ARNC2", "ARNC", date(2020, 4, 1)),
+    ]
+    with pytest.raises(ValueError, match=r"instant|adjacent"):
+        sm.check_master(master_table(arnc))
+    # and the other direction: an end knowable before the successor
+    arnc[0]["end_available_at"] = et_midnight(date(2020, 3, 2))
+    with pytest.raises(ValueError, match=r"instant|adjacent"):
+        sm.check_master(master_table(arnc))
+
+
+def test_check_master_gap_pairs_and_cross_symbol_pairs_are_not_constrained() -> None:
+    # FFR (real): vacated 2022-10-03 (end knowable then), retaken by AIXC 2026-09-30
+    ffr = [
+        seg_row("S_FFR1", "FFR", CM_D0, date(2022, 10, 3)),
+        seg_row("S_FFR2", "FFR", date(2026, 9, 30)),
+    ]
+    assert sm.check_master(master_table(ffr)) is None
+    # BK -> BNY: two labels; the rule is per symbol, so differing instants are not its business
+    bk = [
+        seg_row("S000730", "BK", CM_D0, date(2026, 5, 21)),
+        seg_row("S000730", "BNY", date(2026, 5, 21), available_at=et_midnight(date(2026, 5, 22))),
+    ]
+    assert sm.check_master(master_table(bk)) is None
+
+
+def test_check_master_looks_at_the_full_table_not_the_visible_part() -> None:
+    # an overlap created by a segment nobody can see before 2030 is still an overlap
+    rows = [
+        *cm_good_rows(),
+        seg_row("S5", "D", date(2020, 3, 2), available_at=et_midnight(date(2030, 1, 1))),
+    ]
+    with pytest.raises(ValueError, match=r"overlap"):
+        sm.check_master(master_table(rows))
+
+
+def test_write_master_refuses_a_broken_master_and_leaves_the_old_file_alone(
+    tmp_path: Path,
+) -> None:
+    conflicts = pa.Table.from_pylist([], schema=sm.CONFLICT_SCHEMA)
+    good = master_table(cm_good_rows())
+    master_path = tmp_path / sm.MASTER_FILE
+    conflicts_path = tmp_path / sm.CONFLICTS_FILE
+
+    bad = master_table(cm_violation("adjacent_instants_disagree"))
+    with pytest.raises(ValueError, match=r"instant|adjacent"):
+        sm.write_master(bad, conflicts, tmp_path)
+    assert not master_path.exists() and not conflicts_path.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+
+    sm.write_master(good, conflicts, tmp_path)
+    assert pq.read_table(master_path).num_rows == good.num_rows
+    assert conflicts_path.exists()
+
+    with pytest.raises(ValueError):
+        sm.write_master(master_table(cm_violation("duplicate_key")), conflicts, tmp_path)
+    assert pq.read_table(master_path).equals(good)
+    assert not list(tmp_path.rglob("*.tmp"))

@@ -34,6 +34,8 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Resolved read path: every bar read carries the permanent id of the security that owned
       its symbol that day, as the security master was known at the time; relabelled copies
       and the vendor's volume-0 filler bars are gone by default
+- [x] Data audit: 29 checks over the real store with reviewed exceptions, and hand-checked
+      reference histories asserted as tests against it
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
@@ -46,7 +48,8 @@ Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned via
 ```bash
 uv sync                 # create .venv and install all dependencies
 uv run asof --help      # CLI entry point
-uv run pytest           # tests
+uv run pytest           # tests (the real-data cases skip when /data/asof is absent)
+uv run pytest -m realdata   # only the hand-checked cases against the real store
 uv run ruff check .     # lint
 uv run ruff format --check .
 uv run pyright          # type check
@@ -86,6 +89,7 @@ uv run asof market identity              # security master: which security each 
 uv run asof market instruments           # instrument class of every security-master segment
 uv run asof market liquid --as-of 2021-03-01            # the liquid tier that morning
 uv run asof market liquid --from 2020-01-01 --to 2026-10-01   # one tier per month start, and the union
+uv run asof market audit                 # one count per known kind of data accident
 ```
 
 The universe is the union of every symbol Alpaca lists and every ticker that appeared in an
@@ -134,6 +138,23 @@ scope the identity audit must settle and the universe the minute-bar backfill pu
 that qualifies while still `unknown` makes the command exit non-zero so the override file gets
 a line.
 
+Tests on fake data only show that the code does what its author imagined; they stay green when
+the imagined vendor differs from the real one. `asof market audit` therefore reads the real
+store as of an instant and counts each kind of accident met so far, 29 checks in all:
+duplicate or impossible bars, segments of one security that overlap, two securities sharing
+an identical bar (a relabelled history the master did not catch), a split record with no price
+move, a one-day thin-volume print far from the previous close with no split to explain it, a
+price jump across a rename, traded bars that no segment owns. Each finding is a row with a
+short key (`AAA:2020-01-07`, `S000730`, `AAA/BBB`) written to
+`$ASOF_DATA_DIR/market/audit/<check>.parquet`. Gated checks must be clean inside the liquid
+tier, the rest are reported for a human to read. A reviewed finding goes into
+`configs/audit_exceptions.yaml` with a reason and a date, and an exception that no longer
+matches anything is reported as stale. The command exits 2 while a gated check has rows
+outside the exceptions. Next to it, `tests/store/test_golden_cases.py` asserts about twenty
+hand-checked histories through the same read path: SIVB's last day, BBBY's two companies,
+BK in 2022, NKLA appearing only once its rename was filed, HCTI's three reverse splits
+compounding to TradingView's price.
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.
@@ -157,7 +178,8 @@ tests/               mirrors src/asof
 configs/             watchlist.yaml (instruments that get filings and fundamentals),
                      security_overrides.yaml (human identity decisions),
                      instrument_class_rules.yaml (ordered class rules),
-                     instrument_class_overrides.yaml (human class decisions)
+                     instrument_class_overrides.yaml (human class decisions),
+                     audit_exceptions.yaml (reviewed audit findings)
 docs/                public documentation                                  (planned)
 ```
 

@@ -1024,7 +1024,69 @@ def build_from_store(
     )
 
 
+_CHECK_VIEW = "_asof_check_master"
+
+# rule -> query counting its violations over the full, unmasked master (view _CHECK_VIEW)
+_MASTER_RULES: dict[str, str] = {
+    "null available_at": "SELECT count(*) FROM {v} WHERE available_at IS NULL",
+    "valid_to without end_available_at or the reverse": (
+        "SELECT count(*) FROM {v} WHERE (valid_to IS NULL) <> (end_available_at IS NULL)"
+    ),
+    "valid_to not after valid_from": "SELECT count(*) FROM {v} WHERE valid_to <= valid_from",
+    "end_available_at before 00:00 New York of valid_to": (
+        "SELECT count(*) FROM {v} "
+        "WHERE end_available_at < (valid_to::TIMESTAMP AT TIME ZONE 'America/New_York')"
+    ),
+    "duplicate segment keys": (
+        "SELECT count(*) FROM (SELECT security_id, symbol, valid_from FROM {v} "
+        "GROUP BY ALL HAVING count(*) > 1)"
+    ),
+    "overlapping segments of one symbol": (
+        "SELECT count(*) FROM {v} a JOIN {v} b ON a.symbol = b.symbol "
+        "AND (a.valid_from < b.valid_from "
+        "     OR (a.valid_from = b.valid_from AND a.security_id < b.security_id)) "
+        "AND (a.valid_to IS NULL OR b.valid_from < a.valid_to)"
+    ),
+    "adjacent segments of one symbol disagree on the instant": (
+        "SELECT count(*) FROM {v} a JOIN {v} b ON a.symbol = b.symbol "
+        "AND a.valid_to = b.valid_from "
+        "WHERE a.end_available_at IS DISTINCT FROM b.available_at"
+    ),
+}
+
+
+def check_master(master: pa.Table) -> None:
+    """Refuse a master that ``visible_master`` would trip over at some ``as_of``.
+
+    Checked over the whole table, not the part visible at one instant: an overlap among
+    segments nobody can see before 2030 is still an overlap. The last rule is the one a reader
+    would only meet at a particular instant: when a label passes from one segment to the next on
+    one day (BBBY 2025-08-29), the old end and the new start must become knowable at the same
+    moment, or between the two instants the label is owned twice or by nobody (ARNC before the
+    "earliest instant of the day" rule). Raises ``ValueError`` naming every broken rule with its
+    count.
+    """
+    if master.num_rows == 0:
+        return
+    con = duckdb.connect()
+    try:
+        con.execute("SET TimeZone = 'UTC'")
+        con.register(_CHECK_VIEW, master)
+        broken = []
+        for rule, query in _MASTER_RULES.items():
+            row = con.execute(query.format(v=_CHECK_VIEW)).fetchone()
+            n = int(row[0]) if row else 0
+            if n:
+                broken.append(f"{n} {rule}")
+    finally:
+        con.close()
+    if broken:
+        raise ValueError("security master refused: " + "; ".join(broken))
+
+
 def write_master(master: pa.Table, conflicts: pa.Table, market_root: Path) -> None:
+    """Write both files atomically, after ``check_master`` has accepted the master."""
+    check_master(master)
     for table, name in ((master, MASTER_FILE), (conflicts, CONFLICTS_FILE)):
         path = market_root / name
         path.parent.mkdir(parents=True, exist_ok=True)
