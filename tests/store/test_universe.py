@@ -32,6 +32,15 @@ Fake data provenance -- "real" means read off the store / the security master on
   close); check with the audit (count of bars with vwap IS NULL).
 - Divisor = sessions in the window even when the security traded fewer: a design decision whose
   real-data check is the standard case "a listing in its first month is not in the tier".
+- Master segments carry ``end_available_at`` (2026-10-08 design): the instant the event that
+  ended the segment became knowable; NULL iff valid_to is NULL. Bars reach the tier through
+  ``visible_master``, which masks valid_to while its end is not yet knowable. Real: BK
+  [2020-01-02, 2026-05-21) ends knowably at 2026-05-21 04:00 UTC = BNY's available_at.
+- "LAC -> LAAC" fixture: a label whose on-disk cut is filed weeks later while the successor
+  carries a new symbol. Real analogue: BBUC cut 2026-03-31, end knowable 2026-04-21 04:00 UTC,
+  14 traded bars in between (the real LAC is not this shape: Alpaca filed LAC.WI -> LAC on
+  2023-10-04 itself). Real-data check: liquid_securities at 2026-04-10 counts BBUC's 04-01 ..
+  04-09 bars under BBUC's security_id.
 - Every price is 100 (vwap) / 99 (close) so that dollar volume = 100 * volume; the sums are
   exact in float64.
 """
@@ -76,6 +85,7 @@ NYSE_HOLIDAYS = {  # real NYSE holidays inside the periods used below
     date(2020, 1, 20),
     date(2020, 2, 17),
     date(2020, 5, 25),
+    date(2023, 9, 4),
 }
 
 
@@ -152,6 +162,13 @@ class Seg:
     valid_to: date | None = None
     cls: str = "common"
     available_at: datetime = KNOWN_EARLY
+    end_available_at: datetime | None = None  # must be set iff valid_to is set
+
+
+def known(day: date) -> datetime:
+    """00:00 New York of ``day`` as UTC: when a rename-created segment (and the end of the one it
+    replaces) becomes knowable. Real: BNY's segment, 2026-05-21 04:00 UTC."""
+    return datetime.combine(day, datetime.min.time(), tzinfo=ET).astimezone(UTC)
 
 
 def write_master(root: Path, segs: Sequence[Seg]) -> Path:
@@ -166,6 +183,9 @@ def write_master(root: Path, segs: Sequence[Seg]) -> Path:
             "evidence": pa.array(["bars" for _ in segs], pa.string()),
             "available_at": pa.array(
                 [s.available_at for s in segs], MASTER_SCHEMA.field("available_at").type
+            ),
+            "end_available_at": pa.array(
+                [s.end_available_at for s in segs], pa.timestamp("us", tz="UTC")
             ),
         },
         schema=MASTER_SCHEMA,
@@ -363,7 +383,13 @@ NKLA_USD = 300 * M
 
 def rename_segments(*, vtiq_closed: bool = True) -> list[Seg]:
     return [
-        Seg("S006538", "VTIQ", valid_to=RENAME_DAY if vtiq_closed else None, cls="unit"),
+        Seg(
+            "S006538",
+            "VTIQ",
+            valid_to=RENAME_DAY if vtiq_closed else None,
+            cls="unit",
+            end_available_at=NKLA_KNOWN if vtiq_closed else None,  # one event, one instant
+        ),
         Seg("S006538", "NKLA", valid_from=RENAME_DAY, cls="common", available_at=NKLA_KNOWN),
         Seg("S_SPY", "SPY", cls="etf"),
     ]
@@ -409,8 +435,8 @@ def test_reported_symbol_and_class_come_from_the_latest_visible_segment(
     write_symbols(
         root,
         [
-            Seg("S1", "OLD", valid_to=JAN[10], cls="unit"),
-            Seg("S1", "NEW", valid_from=JAN[10], cls="common"),
+            Seg("S1", "OLD", valid_to=JAN[10], cls="unit", end_available_at=known(JAN[10])),
+            Seg("S1", "NEW", valid_from=JAN[10], cls="common", available_at=known(JAN[10])),
         ],
     )
     store_daily(root, usd_bars("OLD", JAN[:10], 100 * M) + usd_bars("NEW", JAN[10:], 100 * M))
@@ -610,14 +636,20 @@ def test_bars_outside_their_segment_dates_are_ignored(
     con: duckdb.DuckDBPyConnection, root: Path
 ) -> None:
     # valid_from inclusive, valid_to exclusive: bars on JAN[10] .. JAN[14] belong, JAN[15] not
-    write_symbols(root, [Seg("S_X", "X", valid_from=JAN[10], valid_to=JAN[15])])
+    write_symbols(
+        root,
+        [Seg("S_X", "X", valid_from=JAN[10], valid_to=JAN[15], end_available_at=known(JAN[15]))],
+    )
     store_daily(root, usd_bars("X", JAN, 400 * M))
 
     [row] = rows(liquid_securities(con, root, JAN_END))
     assert row["sessions_traded"] == 5
     assert row["adv_usd"] == pytest.approx(5 * 400 * M / 20)
 
-    write_symbols(root, [Seg("S_X", "X", valid_from=JAN[10], valid_to=JAN[16])])
+    write_symbols(
+        root,
+        [Seg("S_X", "X", valid_from=JAN[10], valid_to=JAN[16], end_available_at=known(JAN[16]))],
+    )
     [row] = rows(liquid_securities(con, root, JAN_END))
     assert row["sessions_traded"] == 6
 
@@ -698,13 +730,22 @@ def test_overlapping_segments_of_one_symbol_are_rejected(
     # X owned by two securities over JAN[5..10): each bar would be counted twice
     write_symbols(
         root,
-        [Seg("S_A", "X", valid_to=JAN[10]), Seg("S_B", "X", valid_from=JAN[5])],
+        [
+            Seg("S_A", "X", valid_to=JAN[10], end_available_at=known(JAN[10])),
+            Seg("S_B", "X", valid_from=JAN[5]),
+        ],
     )
     store_daily(root, usd_bars("X", JAN, 400 * M))
     with pytest.raises(ValueError, match="overlap"):
         liquid_securities(con, root, JAN_END)
     # back to back is fine: S_A has 5 sessions in the window (5 * 400M / 20 = 100M), S_B 15
-    write_symbols(root, [Seg("S_A", "X", valid_to=JAN[10]), Seg("S_B", "X", valid_from=JAN[10])])
+    write_symbols(
+        root,
+        [
+            Seg("S_A", "X", valid_to=JAN[10], end_available_at=known(JAN[10])),
+            Seg("S_B", "X", valid_from=JAN[10], available_at=known(JAN[10])),
+        ],
+    )
     assert [r["security_id"] for r in rows(liquid_securities(con, root, JAN_END))] == ["S_B", "S_A"]
 
 
@@ -720,6 +761,23 @@ def test_segment_without_available_at_is_rejected(
     pq.write_table(table, root / MASTER_FILE)
     store_daily(root, usd_bars("SPY", JAN, 200 * M))
     with pytest.raises(ValueError, match="available_at"):
+        liquid_securities(con, root, JAN_END)
+
+
+def test_closed_segment_without_end_available_at_is_rejected(
+    con: duckdb.DuckDBPyConnection, root: Path
+) -> None:
+    # the master invariant valid_to IS NULL <=> end_available_at IS NULL; a file violating it
+    # was built by an older version and must be rebuilt, not read half-way
+    write_symbols(root, [Seg("S_SPY", "SPY", cls="etf"), Seg("S_X", "X", valid_to=JAN[10])])
+    store_daily(root, usd_bars("SPY", JAN, 200 * M) + usd_bars("X", JAN, 400 * M))
+    with pytest.raises(ValueError, match="rebuild"):
+        liquid_securities(con, root, JAN_END)
+    # and the other direction
+    write_symbols(
+        root, [Seg("S_SPY", "SPY", cls="etf"), Seg("S_X", "X", end_available_at=known(JAN[10]))]
+    )
+    with pytest.raises(ValueError, match="rebuild"):
         liquid_securities(con, root, JAN_END)
 
 
@@ -820,6 +878,64 @@ def test_valid_to_written_later_does_not_change_the_earlier_adv(
 
     assert closed == still_open
     assert [r["symbol"] for r in closed] == ["SPY", "VTIQ"]
+
+
+# Fixture shape (module docstring: the real analogue is BBUC): the cut is on disk at 10-04 but
+# filed 11-02, and the old symbol keeps printing traded bars in between (21 sessions here).
+LAC_CUT = date(2023, 10, 4)
+LAC_KNOWN = known(date(2023, 11, 2))  # 2023-11-02 04:00 UTC
+SEP_NOV = trading_days(date(2023, 9, 5), date(2023, 11, 10))
+LAC_LAST_TRADED = date(2023, 11, 1)
+LAC_DAYS = [d for d in SEP_NOV if d <= LAC_LAST_TRADED]
+LAAC_DAYS = [d for d in SEP_NOV if d >= LAC_CUT]
+LAC_USD = 80 * M
+LAAC_USD = 120 * M
+
+
+def test_lac_fixture_sanity() -> None:
+    assert len([d for d in LAC_DAYS if d >= LAC_CUT]) == 21  # fixture: 21 traded post-cut bars
+    assert LAC_KNOWN == datetime(2023, 11, 2, 4, tzinfo=UTC)
+    assert SEP_NOV.index(date(2023, 10, 20)) == 33 and SEP_NOV.index(date(2023, 11, 3)) == 43
+
+
+def test_old_symbol_keeps_earning_adv_until_its_end_is_knowable(
+    con: duckdb.DuckDBPyConnection, root: Path
+) -> None:
+    # On disk LAC ends 10-04 and LAAC starts there, both facts knowable 11-02. A reader on 10-20
+    # knows neither: LAC is open and owns every LAC bar in the window, LAAC's bars have no owner.
+    # Once the record is knowable, LAC's bars from 10-04 on fall in no segment (the cut applies)
+    # and only LAAC's are counted -- the same days are never counted twice.
+    write_symbols(
+        root,
+        [
+            Seg("S_LAC", "LAC", valid_to=LAC_CUT, end_available_at=LAC_KNOWN),
+            Seg("S_LAC", "LAAC", valid_from=LAC_CUT, available_at=LAC_KNOWN),
+            Seg("S_SPY", "SPY", cls="etf"),
+        ],
+    )
+    store_daily(
+        root,
+        usd_bars("LAC", LAC_DAYS, LAC_USD)
+        + usd_bars("LAAC", LAAC_DAYS, LAAC_USD)
+        + usd_bars("SPY", SEP_NOV, 200 * M),
+    )
+
+    # window 09-25 .. 10-20, all 20 sessions LAC bars, 13 of them after the on-disk valid_to
+    between = avail(date(2023, 10, 20))
+    assert between < LAC_KNOWN
+    [_, lac] = rows(liquid_securities(con, root, between))
+    assert (lac["security_id"], lac["symbol"]) == ("S_LAC", "LAC")
+    assert lac["sessions_traded"] == 20
+    assert lac["adv_usd"] == pytest.approx(LAC_USD)
+
+    # window 10-09 .. 11-03: LAAC owns 20 sessions; LAC's 18 post-cut bars count for nobody
+    after = avail(date(2023, 11, 3))
+    assert after > LAC_KNOWN
+    [_, laac] = rows(liquid_securities(con, root, after))
+    assert (laac["security_id"], laac["symbol"]) == ("S_LAC", "LAAC")
+    assert laac["sessions_traded"] == 20
+    assert laac["adv_usd"] == pytest.approx(LAAC_USD)
+    assert symbols(liquid_securities(con, root, after)).count("LAC") == 0
 
 
 def test_later_bars_written_to_the_store_do_not_change_an_earlier_answer(

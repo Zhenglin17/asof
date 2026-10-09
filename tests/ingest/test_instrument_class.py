@@ -138,6 +138,10 @@ def master_table(rows: Sequence[Seg]) -> pa.Table:
             "cusip": pa.array([None for _ in rows], pa.string()),
             "evidence": pa.array(["bars" for _ in rows], pa.string()),
             "available_at": pa.array([AVAILABLE for _ in rows], TS_UTC),
+            # NULL iff valid_to is NULL (master invariant); this module never reads it either
+            "end_available_at": pa.array(
+                [None if r[3] is None else AVAILABLE for r in rows], TS_UTC
+            ),
         },
         schema=MASTER_SCHEMA,
     )

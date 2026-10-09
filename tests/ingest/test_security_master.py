@@ -19,7 +19,9 @@ implementation may regroup them as long as ``build_security_master`` keeps its c
     apply_overrides(master: pa.Table, overrides: Sequence[Mapping]) -> pa.Table
     build_security_master(*, bars, sec_history, name_changes, overrides=()) -> (master, conflicts)
         master columns: security_id, symbol, valid_from, valid_to, cik, cusip, evidence,
-        available_at (design 4b-2b §4.1). conflicts columns: kind, symbols, dates, detail.
+        available_at, end_available_at (design 4b-2b §4.1; end_available_at added 2026-10-08:
+        the instant the event that ENDED the segment became knowable, NULL iff valid_to is
+        NULL). conflicts columns: kind, symbols, dates, detail.
         bars columns: symbol, session_date, open, high, low, close, volume, available_at.
         overrides: list of mappings, e.g. {"merge": ["CYCN", "KRSA"], "reason": ..., "date": ...}
 
@@ -76,6 +78,7 @@ MASTER_COLUMNS = [
     "cusip",
     "evidence",
     "available_at",
+    "end_available_at",
 ]
 CONFLICT_COLUMNS = ["kind", "symbols", "dates", "detail"]
 
@@ -387,9 +390,10 @@ def test_pure_rename_with_both_sources_is_one_security_in_two_segments(master: p
     assert (bk["valid_from"], bk["valid_to"]) == (date(2020, 1, 2), date(2026, 5, 21))
     assert (bny["valid_from"], bny["valid_to"]) == (date(2026, 5, 21), None)
     assert bk["cik"] == bny["cik"] == 1390777
-    assert bk["cusip"] == bny["cusip"] == "064058100"
-    assert bny["evidence"] == "both"
-    assert bk["evidence"] == "both"
+    # cusip / evidence describe how a segment STARTED; the rename that ends BK is recorded on
+    # BNY only (a 2022 reader of BK's row must not see that a rename is coming)
+    assert bny["cusip"] == "064058100" and bny["evidence"] == "both"
+    assert bk["cusip"] is None and bk["evidence"] == "sec"
 
 
 def test_rename_known_only_to_alpaca_uses_the_exact_date(master: pa.Table) -> None:
@@ -586,7 +590,7 @@ def test_vacated_and_reused_ticker_ffr_is_two_securities(master: pa.Table) -> No
     assert first["security_id"] == only_sid(master, "DTRE")
     assert second["security_id"] == only_sid(master, "AIXC")
     assert first["security_id"] != second["security_id"]
-    assert first["cusip"] == "33736N101"
+    assert first["cusip"] is None  # its old CUSIP sits on the rename's new side (DTRE), not here
     assert second["cusip"] == "74754R301"
     # AIXC's history relabelled FFR (2024-01..2026-09-29) lies in neither segment.
     assert len(segments(master, "FFR")) == 2
@@ -2925,3 +2929,218 @@ def test_g3_nothing_about_the_trip_is_knowable_before_its_day(
         if seg["valid_from"] == G3_DAY:
             assert seg["available_at"] == et_midnight(G3_DAY)
     assert_nothing_known_before_its_valid_from(master)
+
+
+# =============================================================================================
+# H: end_available_at -- when a segment's END became knowable (design approved 2026-10-08)
+# =============================================================================================
+#
+# Rule these tests pin (implementation pending): MASTER_SCHEMA gains a last column
+# ``end_available_at`` (timestamp us, UTC). Per segment:
+#   * ended by a rename away (edge old = this symbol)            -> that edge's available_at
+#   * ended because another holder took the label while in use   -> the taking edge's available_at
+#   * ended by a CIK switch inside the symbol                     -> 00:00 New York of the cut day
+#   * open (valid_to NULL)                                        -> NULL
+# Invariant: valid_to IS NULL <=> end_available_at IS NULL. A reader masks valid_to to NULL while
+# end_available_at > as_of, so a 2022 reader sees BK as an open segment (real master row: BK
+# [2020-01-02, 2026-05-21), end knowable 2026-05-21 04:00 UTC = BNY's available_at).
+# Real-data check (standard case): on the real master, every row with valid_to set must have
+# end_available_at >= 00:00 New York of valid_to and end_available_at >= available_at; BK's
+# end_available_at must equal BNY's available_at; NKLA's VTIQ row must end-know at 2020-06-08
+# 04:00 UTC although its valid_to is 2020-06-04.
+
+
+def end_known(master: pa.Table, symbol: str, day: date) -> datetime | None:
+    return segment_at(master, symbol, day)["end_available_at"]
+
+
+def assert_end_knowability_invariant(master: pa.Table) -> None:
+    """Whole-table guard reused on every world: an end is known exactly when there is one, never
+    before the cut day's midnight and never before the segment itself was known."""
+    for row in master.to_pylist():
+        assert (row["valid_to"] is None) == (row["end_available_at"] is None), row
+        if row["valid_to"] is not None:
+            assert row["end_available_at"] >= et_midnight(row["valid_to"]), row
+            assert row["end_available_at"] >= row["available_at"], row
+
+
+def test_h_master_schema_ends_with_a_utc_end_available_at(master: pa.Table) -> None:
+    assert sm.MASTER_SCHEMA.names[-1] == "end_available_at"
+    assert sm.MASTER_SCHEMA.field("end_available_at").type == pa.timestamp("us", tz="UTC")
+    assert master.schema.field("end_available_at").type == pa.timestamp("us", tz="UTC")
+
+
+def test_h_segment_ended_by_a_rename_away_knows_its_end_when_the_rename_was_filed(
+    master: pa.Table,
+) -> None:
+    # BK -> BNY 2026-05-21 (real): BK's end and BNY's start are one event, knowable at the same
+    # instant, 00:00 New York of the rename day. Until then BK is open from the reader's view.
+    [bk] = segments(master, "BK")
+    [bny] = segments(master, "BNY")
+
+    assert bk["valid_to"] == date(2026, 5, 21)
+    assert bk["end_available_at"] == bny["available_at"] == et_midnight(date(2026, 5, 21))
+    assert bk["end_available_at"] == datetime(2026, 5, 21, 4, 0, tzinfo=UTC)
+    assert bk["end_available_at"] > bk["available_at"]
+    # the same event seen through the SEC alone (GMGI -> MRDN): both sides share the instant
+    [gmgi] = segments(master, "GMGI")
+    [mrdn] = segments(master, "MRDN")
+    assert gmgi["end_available_at"] == mrdn["available_at"]
+
+
+def test_h_moved_cut_knows_its_end_at_the_records_date_not_the_cut_day(
+    f9_built: tuple[pa.Table, pa.Table],
+) -> None:
+    # VTIQ -> NKLA (real shape): the cut is 2020-06-04 (NKLA's first bar) but Alpaca's record is
+    # dated 06-08. VTIQ's end is knowable on 06-08, four days after its valid_to; a reader on
+    # 06-05 must treat VTIQ as open. This is the sharp case: end_available_at is strictly later
+    # than midnight of valid_to.
+    master, _ = f9_built
+
+    [vtiq] = segments(master, "VTIQ")
+    [nkla] = segments(master, "NKLA")
+    assert vtiq["valid_to"] == F9_NKLA_FIRST_BAR
+    assert vtiq["end_available_at"] == nkla["available_at"] == et_midnight(F9_ALPACA_DAY)
+    assert vtiq["end_available_at"] > et_midnight(vtiq["valid_to"])
+    assert_end_knowability_invariant(master)
+
+
+def test_h_previous_holder_of_a_taken_label_knows_its_end_when_the_takeover_was_filed(
+    master: pa.Table,
+) -> None:
+    # BBBY (real): Bed Bath & Beyond's piece is not ended by a rename of its own; it ends because
+    # Beyond Inc took the label (BYON -> BBBY 2025-08-29). The previous holder's end is knowable
+    # when that record was, and the taker's segment at the same instant.
+    old = segment_at(master, "BBBY", date(2021, 6, 1))
+    new = segment_at(master, "BBBY", date(2026, 1, 5))
+
+    assert old["valid_to"] == new["valid_from"] == date(2025, 8, 29)
+    assert old["end_available_at"] == new["available_at"] == et_midnight(date(2025, 8, 29))
+    # FFR (real): vacated 2022-10-03, retaken by AIXC 2026-09-30. The first piece ends by its
+    # own rename away, so its end is knowable at that rename, not at the much later takeover.
+    first = segment_at(master, "FFR", date(2021, 6, 1))
+    assert first["valid_to"] == date(2022, 10, 3)
+    assert first["end_available_at"] == et_midnight(date(2022, 10, 3))
+
+
+def test_h_segment_cut_by_a_cik_switch_knows_its_end_at_midnight_of_the_cut_day(
+    master: pa.Table,
+) -> None:
+    # GOOG (Google Inc -> Alphabet, bridged) and DISC (3x jump, not bridged): both pieces are cut
+    # by the SEC snapshot that shows the new CIK, and the end is knowable at 00:00 New York of
+    # that snapshot day -- which is also when the following piece becomes knowable.
+    goog = segments(master, "GOOG")
+    assert goog[0]["valid_to"] == date(2019, 7, 1)
+    assert goog[0]["end_available_at"] == et_midnight(date(2019, 7, 1))
+    assert goog[0]["end_available_at"] == goog[1]["available_at"]
+
+    disc = segments(master, "DISC")
+    assert disc[0]["valid_to"] == date(2024, 6, 3)
+    assert disc[0]["end_available_at"] == et_midnight(date(2024, 6, 3))
+    assert disc[0]["end_available_at"] == disc[1]["available_at"]
+    assert disc[0]["security_id"] != disc[1]["security_id"]  # not bridged, still the same rule
+
+
+def test_h_open_segments_have_no_end_available_at(master: pa.Table) -> None:
+    for symbol in ("SPY", "BNY", "MRSH", "MRDN", "NXH", "BRK.A", "HCTI", "CYCN"):
+        [seg] = [s for s in segments(master, symbol) if s["valid_to"] is None]
+        assert seg["end_available_at"] is None, symbol
+    # a reused label's later piece is closed by its own rename away (BBBY -> NXH 2026-08-17 in
+    # this world, fixture row above): its end is knowable at that rename, like any other
+    assert segment_at(master, "BBBY", date(2026, 1, 5))["valid_to"] == date(2026, 8, 17)
+    assert end_known(master, "BBBY", date(2026, 1, 5)) == et_midnight(date(2026, 8, 17))
+
+
+def test_h_end_knowability_invariant_holds_on_every_world(
+    master: pa.Table,
+    f9_built: tuple[pa.Table, pa.Table],
+    f9b_built: tuple[pa.Table, pa.Table],
+    g3_built: tuple[pa.Table, pa.Table],
+) -> None:
+    for table in (master, f9_built[0], f9b_built[0], g3_built[0]):
+        assert table.num_rows > 0
+        assert_end_knowability_invariant(table)
+    # and the two columns are never confused: at least one closed and one open row exist
+    closed = [r for r in master.to_pylist() if r["valid_to"] is not None]
+    opened = [r for r in master.to_pylist() if r["valid_to"] is None]
+    assert closed and opened
+
+
+def test_h_reader_in_2022_sees_bk_open_and_learns_the_end_with_bny(master: pa.Table) -> None:
+    # Leakage, the reader's rule spelled out on the master alone: at as_of 2022-03-01 BK's row is
+    # visible (available 2020-01-03) but its end is not (knowable 2026-05-21 04:00 UTC), so the
+    # reader must present valid_to as NULL; BNY's row is invisible. At 2026-05-21 04:00 UTC both
+    # facts appear together -- there is no instant at which BK is closed and BNY unknown.
+    as_of = datetime(2022, 3, 1, tzinfo=UTC)
+    [bk] = segments(master, "BK")
+    [bny] = segments(master, "BNY")
+
+    assert bk["available_at"] <= as_of < bk["end_available_at"]
+    assert bny["available_at"] > as_of
+    assert bk["end_available_at"] == bny["available_at"]
+    both_known = bk["end_available_at"]
+    assert {r["symbol"] for r in visible_at(master, both_known)} >= {"BK", "BNY"}
+    assert {r["symbol"] for r in visible_at(master, both_known - timedelta(microseconds=1))} & {
+        "BNY"
+    } == set()
+
+
+# --- H2: several events on one day: the earliest instant ends the piece -------------------------
+# Real shape (ARNC, 2020-04-01): Arconic Inc vacated the label for HWM -- an event the SEC
+# history only shows at a later snapshot (edge evidence 'sec', available_at = that snapshot's
+# midnight) -- while Alpaca recorded the spin-off ARNC.WI -> ARNC on 04-01 itself. The Alpaca
+# record alone tells a reader on 04-01 that the label changed hands, so the old piece's end is
+# knowable then, not at the snapshot. Real data before this rule: 5 of 723 back-to-back pairs
+# (ARNC, INBX, LAC, WBD, XPER) had the old end knowable AFTER the new start, i.e. a window in
+# which visible_master would have shown both as owners of one label. The world below shortens
+# the SEC lag the way F2 does so the SEC edge is re-dated to the Alpaca day.
+
+H2_SNAPSHOTS = [date(2020, 1, 13), date(2020, 6, 1), date(2020, 7, 10), date(2021, 1, 4)]
+H2_DAY = date(2020, 4, 1)  # real: both Alpaca records' process_date
+H2_SEC_DATE = date(2020, 6, 1)  # the SEC edge ARNC -> HWM is first visible in this snapshot
+H2_LIVES: list[Life] = [
+    ("ARNC", 4281, date(2020, 1, 13), date(2020, 1, 13)),  # Arconic Inc (lag shortened, as F2)
+    ("HWM", 4281, H2_SEC_DATE, None),  # real CIK
+    ("ARNC", 1790982, date(2020, 7, 10), None),  # real: Arconic Corp
+]
+H2_RENAMES: list[Rename] = [
+    ("HWM.WI", "HWM", H2_DAY, "443201108", "443201108"),  # real record
+    ("ARNC.WI", "ARNC", H2_DAY, "03966V107", "03966V107"),  # real record
+]
+
+
+def h2_bars() -> list[dict[str, Any]]:
+    return [
+        *bar_rows("ARNC", date(2020, 1, 2), date(2020, 3, 31), 25.0),  # Arconic Inc
+        *bar_rows("ARNC", H2_DAY, date(2020, 12, 31), 75.0),  # Arconic Corp (3x: no continuity)
+        *bar_rows("HWM", H2_DAY, date(2020, 12, 31), 18.0),
+    ]
+
+
+@pytest.fixture(scope="module")
+def h2_built() -> tuple[pa.Table, pa.Table]:
+    return build_security_master(
+        bars=bars_table(h2_bars()),
+        sec_history=sec_table(H2_SNAPSHOTS, H2_LIVES),
+        name_changes=name_changes_table(H2_RENAMES),
+    )
+
+
+def test_h2_old_holder_ends_at_the_earliest_same_day_record_not_at_the_sec_snapshot(
+    h2_built: tuple[pa.Table, pa.Table],
+) -> None:
+    master, _ = h2_built
+    old = segment_at(master, "ARNC", date(2020, 2, 3))
+    new = segment_at(master, "ARNC", date(2020, 5, 1))
+
+    assert (old["valid_to"], old["evidence"]) == (H2_DAY, "sec")  # ended by the SEC-seen vacate
+    assert new["valid_from"] == H2_DAY and new["security_id"] != old["security_id"]
+    # the SEC edge alone would say 06-01; the takeover record says 04-01, and that is the instant
+    assert old["end_available_at"] == new["available_at"] == et_midnight(H2_DAY)
+    assert old["end_available_at"] < et_midnight(H2_SEC_DATE)
+    assert_end_knowability_invariant(master)
+    # no instant exists at which both are knowable owners of ARNC, nor at which neither is
+    for row in master.to_pylist():
+        if row["symbol"] == "ARNC" and row["valid_to"] is not None:
+            successor = segment_at(master, "ARNC", row["valid_to"])
+            assert row["end_available_at"] == successor["available_at"]

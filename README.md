@@ -31,6 +31,9 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Liquid tier: the securities that averaged more than $50M a day over the previous 20
       sessions, computed as of any instant from data visible then; about 1,100-2,000 a month,
       3,964 ever between 2020 and 2026
+- [x] Resolved read path: every bar read carries the permanent id of the security that owned
+      its symbol that day, as the security master was known at the time; relabelled copies
+      and the vendor's volume-0 filler bars are gone by default
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
@@ -107,6 +110,18 @@ instrument class from the name it carried in that era, using the ordered rules i
 unleveraged ETFs. Names the rules cannot judge (an issuer whose SEC entry carries dozens of
 notes, such as the ETN shelves of Credit Suisse or Bank of Montreal) stay `unknown` until a
 human records the class in `configs/instrument_class_overrides.yaml`.
+
+Reading applies all of this by default. `visible_bars` matches each bar to the segment that
+owned its symbol on that session date and returns it with the segment's `security_id`; a bar
+owned by no segment (BNY's copy of BK's 2022 history) is not returned, and the two names of a
+renamed security come back as one timeline. The master itself is read as of the same instant,
+and a segment's end is a fact with its own date: the file says BK ends on 2026-05-21, but a
+reader in 2022 sees BK as an open segment, and a reader between a rename's effective day and
+the day the vendor filed it keeps attributing the old symbol's bars to the old segment. Each
+bar also carries `traded`; the vendor keeps writing a volume-0 bar a day under an old symbol
+for years after a rename (1.18M such bars, 6.5% of the store), and these are dropped unless
+asked for. `split_day` marks the ex-date bar of a split known at the time, so a return across
+it is not mistaken for a move. `resolve=False` returns the raw store for audits.
 
 The scanner does not look at all 20,000 symbols. `asof market liquid` computes the liquid
 tier as of an instant: securities whose dollar volume over the previous 20 sessions averaged

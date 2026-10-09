@@ -257,8 +257,15 @@ def test_out_of_window_bar_is_invisible_before_its_post_market_close(tmp_path: P
     )
     con = duckdb.connect()
     try:
-        before = visible_bars(con, root, "1Day", as_of=datetime(2020, 1, 2, 19, 59, tzinfo=ET))
-        after = visible_bars(con, root, "1Day", as_of=datetime(2020, 1, 2, 20, 0, tzinfo=ET))
+        # raw-store view: no security master is written here, and the question is only
+        # whether the bar's available_at is honoured (the fake bars have volume 100, so the
+        # default include_untraded=False keeps them)
+        before = visible_bars(
+            con, root, "1Day", as_of=datetime(2020, 1, 2, 19, 59, tzinfo=ET), resolve=False
+        )
+        after = visible_bars(
+            con, root, "1Day", as_of=datetime(2020, 1, 2, 20, 0, tzinfo=ET), resolve=False
+        )
     finally:
         con.close()
 

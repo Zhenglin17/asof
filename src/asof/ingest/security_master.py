@@ -35,7 +35,11 @@ Three things the first real build (2026-10-07) taught, now rules:
 Every segment carries ``available_at``: the moment the event that created it became knowable
 (00:00 New York of the rename's effective day, of the SEC snapshot, or the first bar's
 availability for a symbol's opening segment). A reader at ``as_of`` filters on it like on any
-other table.
+other table. A segment's end is a fact of its own with its own instant, ``end_available_at``
+(the rename, takeover or CIK switch that closed it; null while the segment is open): a reader in
+2022 must see BK as open although the file says it ends 2026-05-21, so ``visible_master`` masks
+``valid_to`` until that instant. A closed segment and the one that replaces it become knowable
+together, at the same instant, because they are two sides of one event.
 """
 
 import os
@@ -78,6 +82,7 @@ MASTER_SCHEMA = pa.schema(
         ("cusip", pa.string()),
         ("evidence", pa.string()),
         ("available_at", TS_UTC),
+        ("end_available_at", TS_UTC),  # when the end became knowable; null while open
     ]
 )
 CONFLICT_SCHEMA = pa.schema(
@@ -303,6 +308,7 @@ class _Segment:
     cusip: str | None = None
     evidence: str = "bars_only"
     available_at: datetime | None = None
+    end_available_at: datetime | None = None  # set exactly when valid_to is
     n_bars: int = 0
     chain: int = -1
     key: int = field(default=-1)
@@ -336,7 +342,7 @@ def _refine_sec_edges(con: duckdb.DuckDBPyConnection, edges: list[dict[str, Any]
     snapshot interval: Alpaca stops filing real bars under the old name on the rename day,
     which pins the date better than a snapshot that may be months later. No bar there -> keep
     the bound. "Traded" = volume > 0: after a rename Alpaca keeps writing volume-0 bars with a
-    frozen close under the old name for years (VTIQ at 33.97 from 2020-06-04 to 2022-12-09)."""
+    frozen close under the old name for years (VTIQ at 33.97 from 2020-06-04 to 2022-09-21)."""
     todo = [e for e in edges if e["evidence"] == "sec" and e["date_lower"] is not None]
     if not todo:
         return
@@ -543,6 +549,19 @@ def _pieces_for(
                 current.valid_to = day
                 pieces.append(current)
             current = _Segment(symbol, day, None, cik_cut=True)
+    # The end of a piece is knowable when the event that ends it is: the rename's or the
+    # takeover's record, or midnight of the SEC snapshot that shows the new CIK -- the same
+    # instant at which the piece that follows becomes knowable. Several events may fall on one
+    # day (Arconic Inc vacated ARNC for HWM, seen by the SEC on 2020-07-10, while Alpaca recorded
+    # ARNC.WI -> ARNC on 04-01 itself; WBD got two takeover records on 2022-04-11): the earliest
+    # of them already tells a reader the label changed hands that day, so it is the instant.
+    ends_known: dict[date, datetime] = {}
+    for day, _kind, edge in rest:
+        known = edge.available_at if edge is not None else _midnight(day)
+        ends_known[day] = min(ends_known.get(day, known), known)
+    for p in pieces:
+        if p.valid_to is not None:
+            p.end_available_at = ends_known[p.valid_to]
     if current is not None:
         pieces.append(current)
     return pieces
@@ -795,14 +814,13 @@ def build_security_master(
         pieces = [p for p in pieces if p.key not in relabelled]
         for i, p in enumerate(pieces):
             p.key = i
+            # Attributes describe how the segment STARTED only. The event that ends it is
+            # recorded on the segment it creates; copying it here (its cusip, its evidence) would
+            # let a reader who may not yet know the end see that one is coming.
             p.cik = _segment_cik(p, presence.get(p.symbol, []))
-            p.cusip = (p.start.new_cusip if p.start else None) or (
-                p.end.old_cusip if p.end else None
-            )
+            p.cusip = p.start.new_cusip if p.start else None
             if p.start is not None:
                 p.evidence = p.start.evidence
-            elif p.end is not None:
-                p.evidence = p.end.evidence
             elif p.cik is not None:
                 p.evidence = "sec"
 
@@ -887,14 +905,25 @@ def build_security_master(
             if p.key in overridden:
                 p.evidence = "override"
 
-        # Fill a segment's CIK from its chain when its own label never reached the SEC table.
+        # Fill a segment's CIK from its chain when its own label never reached the SEC table --
+        # only from members knowable no later than the segment itself, or a reader would learn
+        # the filer from a future rename.
         chains: dict[int, list[_Segment]] = {}
         for p in pieces:
             chains.setdefault(p.chain, []).append(p)
         for members in chains.values():
-            known = [p for p in members if p.cik is not None]
             for p in members:
-                if p.cik is None and known:
+                if p.cik is not None:
+                    continue
+                known = [
+                    q
+                    for q in members
+                    if q.cik is not None
+                    and q.available_at is not None
+                    and p.available_at is not None
+                    and q.available_at <= p.available_at
+                ]
+                if known:
                     p.cik = min(known, key=lambda q: abs((q.valid_from - p.valid_from).days)).cik  # type: ignore[operator]
 
         # Stable, content-derived ids: chains ordered by their earliest segment.
@@ -933,6 +962,7 @@ def build_security_master(
                 "cusip": p.cusip,
                 "evidence": p.evidence,
                 "available_at": p.available_at,
+                "end_available_at": p.end_available_at,
             }
             for p in pieces
         ),

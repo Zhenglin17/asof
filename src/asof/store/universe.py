@@ -10,21 +10,19 @@ Everything is computed from what was visible at ``as_of``:
 
 - bars come through ``visible_bars`` and the calendar through ``visible_sessions``, so a session
   still in progress is not in the window;
-- a bar belongs to a security only through a security-master segment whose ``available_at`` is
-  not after ``as_of``: NKLA's segment starts 2020-06-04 but was published 2020-06-08, so a reader
-  on 06-05 still sees VTIQ; bars matching no visible segment (BNY's copy of BK's history) count
-  for nobody;
+- ``visible_bars`` attributes each bar to a security through the master as known at ``as_of``
+  (``visible_master``): NKLA's segment starts 2020-06-04 but was published 2020-06-08, so a
+  reader on 06-05 still sees VTIQ; LAC's rename to LAAC was filed a month after the cut, so a
+  reader in between keeps counting LAC's bars under LAC; bars matching no knowable segment
+  (BNY's copy of BK's history) count for nobody;
 - the divisor is the number of sessions in the window, not the number of days the security
   traded: a listing in its first week must earn its place and a one-day SPAC spike cannot
   ($900M on one day is $45M a day over 20).
 
 Dollar volume per bar is ``coalesce(vwap, close) * volume``; the 1.18M volume-0 placeholder bars
-Alpaca writes after a rename therefore add nothing. Symbols of one security are summed (VTIQ and
-NKLA across the rename window) and the tier reports the symbol of the latest visible segment.
-
-The segment filter here is the minimum ``visible_bars(resolve=True)`` will need; until that
-lands, this module is the only reader that joins bars to the security master. ``valid_to`` is
-used only to assign bars, never reported: a 2022 reader must not learn that BK ends in 2026.
+Alpaca writes after a rename are dropped by ``visible_bars`` and would add nothing anyway.
+Symbols of one security are summed (VTIQ and NKLA across the rename window) and the tier reports
+the symbol of the latest visible segment.
 """
 
 from collections.abc import Sequence
@@ -38,8 +36,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from asof.ingest.instrument_class import CLASS_FILE
-from asof.ingest.security_master import MASTER_FILE
-from asof.store.market import visible_bars, visible_sessions
+from asof.store.market import visible_bars, visible_master, visible_sessions
 
 ET = ZoneInfo("America/New_York")
 
@@ -104,33 +101,24 @@ def liquid_securities(
     as_of_utc = _aware_utc(as_of, "as_of")
     if lookback_sessions <= 0:
         raise ValueError("lookback_sessions must be positive")
-    master_path = root / MASTER_FILE
     class_path = root / CLASS_FILE
-    for path in (master_path, class_path):
-        if not path.exists():
-            raise FileNotFoundError(f"{path}: build it with `asof market identity` / `instruments`")
+    if not class_path.exists():
+        raise FileNotFoundError(f"{class_path}: build it with `asof market instruments`")
 
     sessions = visible_sessions(con, root, "1Day", as_of_utc, last=lookback_sessions)
     if not sessions:
         return _empty()
     window_start = datetime.combine(sessions[0], datetime.min.time(), tzinfo=ET)
+    # Attributed to securities as the master was known at as_of; untraded bars are already gone.
     bars = visible_bars(con, root, "1Day", as_of_utc, start=window_start)
+    segments = visible_master(con, root, as_of_utc)
 
-    # Segments known at as_of. valid_to only decides which bars a segment owns; it is not
-    # reported (a reader must not learn when a current segment will end).
-    master = pq.read_table(master_path)
-    published = master.column("available_at").to_pylist()
-    if any(t is None for t in published):
-        raise ValueError(f"{master_path}: a segment has no available_at; rebuild the master")
-    known = [t <= as_of_utc for t in published]
-    visible = master.filter(pa.array(known, pa.bool_()))
-    class_table = pq.read_table(class_path)
-    con.register(_SEGMENTS_VIEW, visible)
-    con.register(_CLASS_VIEW, class_table)
+    con.register(_SEGMENTS_VIEW, segments)
+    con.register(_CLASS_VIEW, pq.read_table(class_path))
     con.register(_BARS_VIEW, bars)
     try:
         con.execute("SET TimeZone = 'UTC'")
-        _check_visible_class_rows(con)
+        _check_class_rows(con)
         params: dict[str, Any] = {"sessions": len(sessions), "min_adv": float(min_adv_usd)}
         class_clause = ""
         if classes is not None:
@@ -138,20 +126,11 @@ def liquid_securities(
             params["classes"] = list(classes)
         result = con.execute(
             f"""
-            WITH owned AS (
-                SELECT s.security_id, b.session_date, b.volume,
-                       coalesce(b.vwap, b.close) * b.volume AS dollars
-                FROM {_BARS_VIEW} b
-                JOIN {_SEGMENTS_VIEW} s
-                  ON s.symbol = b.symbol
-                 AND b.session_date >= s.valid_from
-                 AND (s.valid_to IS NULL OR b.session_date < s.valid_to)
-            ),
-            adv AS (
+            WITH adv AS (
                 SELECT security_id,
-                       sum(dollars) / $sessions AS adv_usd,
+                       sum(coalesce(vwap, close) * volume) / $sessions AS adv_usd,
                        count(DISTINCT session_date) FILTER (WHERE volume > 0) AS sessions_traded
-                FROM owned GROUP BY security_id
+                FROM {_BARS_VIEW} GROUP BY security_id
             ),
             latest AS (
                 SELECT security_id, symbol, valid_from FROM {_SEGMENTS_VIEW}
@@ -179,12 +158,10 @@ def liquid_securities(
     return table.select(LIQUID_SCHEMA.names).cast(LIQUID_SCHEMA)
 
 
-def _check_visible_class_rows(con: duckdb.DuckDBPyConnection) -> None:
-    """Three invariants the join relies on, checked on the *visible* segments: every segment
-    has a class row (the class table is keyed by the master's segments and goes stale when the
-    master is rebuilt without it), segment keys are unique (a duplicate would put a security in
-    the tier twice) and a symbol's segments do not overlap (an overlap would count a bar twice).
-    Each would fail silently otherwise."""
+def _check_class_rows(con: duckdb.DuckDBPyConnection) -> None:
+    """Every visible segment must have a class row: the class table is keyed by the master's
+    segments and goes stale when the master is rebuilt without it. (Duplicate keys and
+    overlapping segments are refused by ``visible_master`` itself.)"""
     missing = _scalar(
         con,
         f"SELECT count(*) FROM {_SEGMENTS_VIEW} m ANTI JOIN {_CLASS_VIEW} c "
@@ -195,21 +172,6 @@ def _check_visible_class_rows(con: duckdb.DuckDBPyConnection) -> None:
             f"instrument class table is stale: {missing} visible master segments have no class "
             "row; rerun `asof market instruments`"
         )
-    duplicates = _scalar(
-        con,
-        f"SELECT count(*) FROM (SELECT security_id, symbol, valid_from FROM {_SEGMENTS_VIEW} "
-        "GROUP BY ALL HAVING count(*) > 1)",
-    )
-    if duplicates:
-        raise ValueError(f"security master has {duplicates} duplicate segment keys")
-    overlaps = _scalar(
-        con,
-        f"SELECT count(*) FROM {_SEGMENTS_VIEW} a JOIN {_SEGMENTS_VIEW} b "
-        "ON a.symbol = b.symbol AND a.valid_from < b.valid_from "
-        "AND (a.valid_to IS NULL OR b.valid_from < a.valid_to)",
-    )
-    if overlaps:
-        raise ValueError(f"security master has {overlaps} overlapping segments of one symbol")
 
 
 def _scalar(con: duckdb.DuckDBPyConnection, query: str) -> int:
