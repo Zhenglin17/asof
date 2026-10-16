@@ -1,5 +1,26 @@
 """Guards against bars that claim to be known before the market produced them, half-written
-partition files, and a backfill that re-downloads what it already has or skips what changed."""
+partition files, a backfill that re-downloads what it already has or skips what changed, and a
+refetch that loses or overwrites bars an earlier fetch stored.
+
+The ``chains`` tests (renamed names with no SEC window) carry no ``as_of``; what their fake
+client assumes about Alpaca has to be checked on real data:
+
+- Requested alone, a pruned old name (SPLG) answers with its own bars: after a backfill with
+  ``chains``, count bars_1d rows with symbol SPLG; zero means Alpaca never serves it and the
+  solo request is wasted. Measured 2026-10-16: ``--symbols SPLG`` for 2024 gives 252 rows.
+- Batched with its new name, the old name comes back empty or relabelled (measured for
+  MMC/MRSH on 2026-10-06): compare the SPLG row count of a ``--symbols SPLG,SPYM`` run against
+  a ``--symbols SPLG`` run. Measured 2026-10-16: 0 against 252.
+- An old name batched with an unrelated symbol answers normally, so the solo request is only
+  worth it when a chain partner shared the request (the assumption behind the ``chains``
+  rule): compare the SPLG row count of a ``--symbols SPLG,SPY`` run against ``--symbols
+  SPLG``. Measured 2026-10-16: 252 against 252.
+
+The merge tests model what Alpaca does to a reused symbol (measured 2026-10-16: VJET's
+2020-2024 bars became copies of RMED's; AXNX's 2020-2024 history vanished and 2025 copies of
+MIMI appeared). Check after a forced refetch: the row count of a closed partition never goes
+down, and ``asof market audit`` reports no symbol whose earliest stored bar moved later.
+"""
 
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
@@ -54,6 +75,7 @@ BAR_SCHEMA = pa.schema(
 )
 TODAY = date(2026, 10, 5)
 MINUTE = timedelta(minutes=1)
+NOW_2027 = datetime(2027, 1, 15, tzinfo=UTC)
 
 
 def open_bounds(partition: Partition) -> tuple[datetime, datetime]:
@@ -361,14 +383,15 @@ def test_zero_bars_still_writes_an_empty_file_with_the_schema(tmp_path: Path) ->
     assert table.schema.equals(BAR_SCHEMA, check_metadata=False)
 
 
-def test_write_partition_overwrites_an_existing_file(tmp_path: Path) -> None:
+def test_write_partition_merges_into_an_existing_file(tmp_path: Path) -> None:
+    # Not an overwrite: the row the second call did not carry stays (see the merge section).
     path = tmp_path / "bucket=A.parquet"
     write_partition(path, [make_bar("AAPL", T_DAY), make_bar("AMZN", T_DAY)], "1Day", FETCHED_AT)
 
     count = write_partition(path, [make_bar("AAPL", T_DAY)], "1Day", FETCHED_AT)
 
-    assert count == 1
-    assert pq.read_table(path).column("symbol").to_pylist() == ["AAPL"]
+    assert count == 2
+    assert pq.read_table(path).column("symbol").to_pylist() == ["AAPL", "AMZN"]
     assert leftovers(tmp_path) == ["bucket=A.parquet"]
 
 
@@ -441,6 +464,381 @@ def test_daily_bar_is_not_available_at_its_midnight_timestamp(tmp_path: Path) ->
     assert row["t"] == T_DAY
     assert row["available_at"] == AVAILABLE_DAY
     assert row["available_at"] == datetime(2026, 10, 2, 20, 0, tzinfo=ZoneInfo("America/New_York"))
+
+
+# =============================================================================================
+# write_partition merges: a refetch may add bars, never remove or overwrite stored ones
+# =============================================================================================
+# Alpaca deletes a delisted security's history once its symbol is reused and files the new
+# holder's history under the symbol (measured 2026-10-16: VJET's 2020-2024 bars became copies
+# of RMED's; AXNX's 2020-2024 history vanished and 2025 copies of MIMI appeared). It also
+# revises bars after the fact (888 symbols' 2026-10-05 volumes changed after 20:00 ET). The
+# first-fetched row is what a reader saw at the time, so it stays; discarding a partition means
+# deleting its file.
+
+LATER = FETCHED_AT + timedelta(days=1)
+
+
+def rows_of(path: Path) -> list[dict[str, object]]:
+    return pq.read_table(path).to_pylist()
+
+
+def test_merge_adds_new_keys_and_keeps_existing_rows_unchanged(tmp_path: Path) -> None:
+    # The VJET case: the second fetch answers the same (symbol, t) with different OHLCV (RMED's
+    # bar wearing VJET's label) plus a bar the first fetch did not have.
+    path = tmp_path / "bucket=V.parquet"
+    write_partition(
+        path, [daily("VJET", date(2024, 1, 5), close=1.0, volume=100)], "1Day", FETCHED_AT
+    )
+    [before] = rows_of(path)
+
+    count = write_partition(
+        path,
+        [
+            daily("VJET", date(2024, 1, 5), close=99.0, volume=5_000),
+            daily("VJET", date(2024, 1, 8), close=2.0),
+        ],
+        "1Day",
+        LATER,
+    )
+
+    assert count == 2
+    rows = rows_of(path)
+    assert rows[0] == before  # every column, fetched_at included
+    assert [(r["symbol"], r["session_date"], r["close"]) for r in rows] == [
+        ("VJET", date(2024, 1, 5), 1.0),
+        ("VJET", date(2024, 1, 8), 2.0),
+    ]
+    assert [r["fetched_at"] for r in rows] == [FETCHED_AT, LATER]
+
+
+def test_merge_keeps_rows_the_second_fetch_no_longer_returns(tmp_path: Path) -> None:
+    # The AXNX case: the second fetch has nothing for AXNX any more. Its rows stay.
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(
+        path, [daily("AXNX", date(2024, 1, 5)), daily("AAPL", date(2024, 1, 5))], "1Day", FETCHED_AT
+    )
+
+    count = write_partition(path, [daily("AAPL", date(2024, 1, 5))], "1Day", LATER)
+
+    assert count == 2
+    assert [(r["symbol"], r["session_date"]) for r in rows_of(path)] == [
+        ("AAPL", date(2024, 1, 5)),
+        ("AXNX", date(2024, 1, 5)),
+    ]
+    assert leftovers(tmp_path) == ["bucket=A.parquet"]
+
+
+def test_merged_file_is_sorted_by_symbol_and_time(tmp_path: Path) -> None:
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(
+        path, [daily("MSFT", date(2024, 1, 5)), daily("AAPL", date(2024, 1, 8))], "1Day", FETCHED_AT
+    )
+
+    write_partition(
+        path, [daily("AMZN", date(2024, 1, 5)), daily("AAPL", date(2024, 1, 5))], "1Day", LATER
+    )
+
+    assert [(r["symbol"], r["session_date"]) for r in rows_of(path)] == [
+        ("AAPL", date(2024, 1, 5)),
+        ("AAPL", date(2024, 1, 8)),
+        ("AMZN", date(2024, 1, 5)),
+        ("MSFT", date(2024, 1, 5)),
+    ]
+
+
+def test_merge_updates_the_fetched_at_metadata_to_the_latest_fetch(tmp_path: Path) -> None:
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [make_bar("AAPL", T_DAY)], "1Day", FETCHED_AT)
+
+    write_partition(path, [make_bar("AAPL", T_DAY + timedelta(days=1))], "1Day", LATER)
+
+    assert partition_fetched_at(path) == LATER
+    assert pq.read_table(path).column("fetched_at").to_pylist() == [FETCHED_AT, LATER]
+
+
+def test_merge_returns_the_total_row_count_not_the_incoming_one(tmp_path: Path) -> None:
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [make_bar("AAPL", T_DAY), make_bar("AMZN", T_DAY)], "1Day", FETCHED_AT)
+
+    count = write_partition(
+        path, [make_bar("AMZN", T_DAY), make_bar("AAPL", T_DAY + timedelta(days=1))], "1Day", LATER
+    )
+
+    assert count == 3
+    assert pq.read_table(path).num_rows == 3
+
+
+# --- boundaries --------------------------------------------------------------------------------
+
+
+def test_merging_nothing_keeps_the_rows_and_still_stamps_the_new_fetched_at(tmp_path: Path) -> None:
+    # A closed year refetched and answered empty (Alpaca pruned the symbol): rows stay, and the
+    # metadata records that the refetch happened.
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [make_bar("AAPL", T_DAY), make_bar("AMZN", T_DAY)], "1Day", FETCHED_AT)
+    before = rows_of(path)
+
+    count = write_partition(path, [], "1Day", LATER)
+
+    assert count == 2
+    assert rows_of(path) == before
+    assert partition_fetched_at(path) == LATER
+    assert leftovers(tmp_path) == ["bucket=A.parquet"]
+
+
+def test_merge_still_drops_incoming_bars_not_yet_final(tmp_path: Path) -> None:
+    # Refetch at 10:00 New York on 2026-10-02: yesterday's bar is new and final, today's is
+    # still trading. Only the first joins the stored 09-30 bar.
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [daily("AAPL", date(2026, 9, 30))], "1Day", FETCHED_AT)
+    during_session = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+
+    count = write_partition(
+        path,
+        [daily("AAPL", date(2026, 10, 1)), daily("AAPL", date(2026, 10, 2))],
+        "1Day",
+        during_session,
+    )
+
+    assert count == 2
+    assert [r["session_date"] for r in rows_of(path)] == [date(2026, 9, 30), date(2026, 10, 1)]
+    assert partition_fetched_at(path) == during_session
+
+
+def test_merge_never_drops_a_stored_row_even_when_fetched_at_runs_backwards(
+    tmp_path: Path,
+) -> None:
+    # The not-yet-final filter applies to incoming bars only. A stored 10-02 bar (final at
+    # 20:00 ET that day) stays even if a later call claims a fetched_at from the morning of
+    # 10-02, as a skewed clock might.
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [daily("AAPL", date(2026, 10, 2))], "1Day", FETCHED_AT)
+    before = rows_of(path)
+
+    count = write_partition(path, [], "1Day", datetime(2026, 10, 2, 14, 0, tzinfo=UTC))
+
+    assert count == 1
+    assert rows_of(path) == before
+
+
+def test_merge_into_a_file_written_without_metadata_works(tmp_path: Path) -> None:
+    # Older files carry fetched_at only in the column; their schema still matches.
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [make_bar("AAPL", T_DAY)], "1Day", FETCHED_AT)
+    pq.write_table(pq.read_table(path).replace_schema_metadata({}), path)
+
+    count = write_partition(path, [make_bar("AMZN", T_DAY)], "1Day", LATER)
+
+    assert count == 2
+    assert partition_fetched_at(path) == LATER
+
+
+def test_writing_to_a_deleted_path_starts_the_file_over(tmp_path: Path) -> None:
+    # Discarding a partition is done by deleting its file: nothing from before comes back.
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [make_bar("AAPL", T_DAY), make_bar("AMZN", T_DAY)], "1Day", FETCHED_AT)
+    path.unlink()
+
+    count = write_partition(path, [make_bar("AAPL", T_DAY + timedelta(days=1))], "1Day", LATER)
+
+    assert count == 1
+    assert [(r["symbol"], r["t"]) for r in rows_of(path)] == [("AAPL", T_DAY + timedelta(days=1))]
+    assert partition_fetched_at(path) == LATER
+
+
+def test_duplicate_keys_inside_one_fetch_still_collapse_before_the_merge(tmp_path: Path) -> None:
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [make_bar("AMZN", T_DAY)], "1Day", FETCHED_AT)
+
+    count = write_partition(
+        path,
+        [make_bar("AAPL", T_DAY, close=1.0), make_bar("AAPL", T_DAY, close=99.0)],
+        "1Day",
+        LATER,
+    )
+
+    assert count == 2
+    assert [(r["symbol"], r["close"]) for r in rows_of(path)] == [("AAPL", 99.0), ("AMZN", 1.5)]
+
+
+def wrong_schema_file(path: Path, *, drop: str | None = None, retype: str | None = None) -> None:
+    """A Parquet file at ``path`` whose schema is BAR_SCHEMA minus ``drop`` or with ``retype``
+    turned into a string column."""
+    fields = [
+        pa.field(f.name, pa.string() if f.name == retype else f.type)
+        for f in BAR_SCHEMA
+        if f.name != drop
+    ]
+    pq.write_table(pa.schema(fields).empty_table(), path)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"drop": "vwap"}, {"retype": "volume"}],
+    ids=["missing_column", "wrong_type"],
+)
+def test_merging_into_a_file_with_another_schema_refuses_and_names_the_file(
+    tmp_path: Path, kwargs: dict[str, str]
+) -> None:
+    path = tmp_path / "bucket=A.parquet"
+    wrong_schema_file(path, **kwargs)
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="delete") as info:
+        write_partition(path, [make_bar("AAPL", T_DAY)], "1Day", FETCHED_AT)
+
+    assert str(path) in str(info.value)
+    assert path.read_bytes() == before
+    assert leftovers(tmp_path) == ["bucket=A.parquet"]
+
+
+def test_merge_refuses_a_file_with_the_columns_in_another_order(tmp_path: Path) -> None:
+    path = tmp_path / "bucket=A.parquet"
+    pq.write_table(pa.schema(list(BAR_SCHEMA)[::-1]).empty_table(), path)
+
+    with pytest.raises(ValueError, match="delete"):
+        write_partition(path, [make_bar("AAPL", T_DAY)], "1Day", FETCHED_AT)
+
+
+# --- atomicity: a failed merge leaves the stored file exactly as it was ----------------------
+
+
+def test_failure_while_writing_the_merged_file_keeps_the_old_file_and_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "bucket=A.parquet"
+    write_partition(path, [make_bar("AAPL", T_DAY, close=1.0)], "1Day", FETCHED_AT)
+    before = path.read_bytes()
+
+    def disk_full(table: pa.Table, where: Path, *args: object, **kwargs: object) -> None:
+        Path(where).write_bytes(b"partial")
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("asof.ingest.bars.pq.write_table", disk_full)
+
+    with pytest.raises(OSError, match="No space left"):
+        write_partition(path, [make_bar("AAPL", T_DAY + timedelta(days=1))], "1Day", LATER)
+
+    assert path.read_bytes() == before
+    assert leftovers(tmp_path) == ["bucket=A.parquet"]
+
+
+# --- through backfill: force on a complete partition appends, never replaces ----------------
+
+
+def test_forced_refetch_keeps_bars_the_second_answer_lacks(tmp_path: Path) -> None:
+    # The AXNX case: 2024 complete with AXNX and AAPL; a year later Alpaca has no AXNX bars at
+    # all (measured 2026-10-16) but a new AAPL bar. The forced run adds the AAPL bar and keeps
+    # AXNX.
+    first = FakeBarClient([daily("AXNX", date(2024, 1, 5)), daily("AAPL", date(2024, 1, 5))])
+    backfill(
+        first,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["AAPL", "AXNX"],
+        now=lambda: NOW_2027,
+    )
+    path = tmp_path / "bars_1d" / "year=2024" / "bucket=A.parquet"
+    before = rows_of(path)
+
+    second = FakeBarClient([daily("AAPL", date(2024, 1, 5)), daily("AAPL", date(2024, 1, 8))])
+    later = NOW_2027 + timedelta(days=30)
+    report = backfill(
+        second,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["AAPL", "AXNX"],
+        force=True,
+        now=lambda: later,
+    )
+
+    assert report.written == [Partition("1Day", 2024, None, "A")]
+    assert report.rows == 3
+    rows = rows_of(path)
+    assert [r for r in rows if r["fetched_at"] == NOW_2027] == before
+    assert [(r["symbol"], r["session_date"]) for r in rows] == [
+        ("AAPL", date(2024, 1, 5)),
+        ("AAPL", date(2024, 1, 8)),
+        ("AXNX", date(2024, 1, 5)),
+    ]
+    assert partition_fetched_at(path) == later
+
+
+def test_forced_refetch_keeps_bars_the_second_answer_relabels(tmp_path: Path) -> None:
+    # The VJET case: VJET's stored 2024 bars; a year later the same (symbol, t) keys come back
+    # with RMED's prices (measured 2026-10-16). The stored prices stay; only the key the first
+    # fetch did not have is added.
+    first = FakeBarClient(
+        [daily("VJET", date(2024, 1, 5), close=1.0), daily("VJET", date(2024, 1, 8), close=1.1)]
+    )
+    backfill(
+        first,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["VJET"],
+        now=lambda: NOW_2027,
+    )
+    path = tmp_path / "bars_1d" / "year=2024" / "bucket=V.parquet"
+
+    second = FakeBarClient(
+        [
+            daily("VJET", date(2024, 1, 5), close=50.0, volume=9_999),
+            daily("VJET", date(2024, 1, 8), close=51.0, volume=9_999),
+            daily("VJET", date(2024, 1, 9), close=52.0, volume=9_999),
+        ]
+    )
+    report = backfill(
+        second,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["VJET"],
+        force=True,
+        now=lambda: NOW_2027 + timedelta(days=30),
+    )
+
+    assert report.rows == 3
+    assert [(r["session_date"], r["close"], r["volume"]) for r in rows_of(path)] == [
+        (date(2024, 1, 5), 1.0, 100),
+        (date(2024, 1, 8), 1.1, 100),
+        (date(2024, 1, 9), 52.0, 9_999),
+    ]
+
+
+def test_daily_refetch_of_the_open_year_only_appends(tmp_path: Path) -> None:
+    # The open year is refetched on every run. A revised volume for a day already stored
+    # (888 symbols' 2026-10-05 volumes changed after 20:00 ET) must not replace the value a
+    # reader saw at the time.
+    day_one = datetime(2026, 10, 6, 1, 0, tzinfo=UTC)
+    first = FakeBarClient([daily("AAPL", date(2026, 10, 5), volume=100)])
+    backfill(
+        first, tmp_path, "1Day", date(2026, 1, 1), date(2026, 10, 6), ["AAPL"], now=lambda: day_one
+    )
+    path = tmp_path / "bars_1d" / "year=2026" / "bucket=A.parquet"
+
+    day_two = datetime(2026, 10, 7, 1, 0, tzinfo=UTC)
+    second = FakeBarClient(
+        [daily("AAPL", date(2026, 10, 5), volume=150), daily("AAPL", date(2026, 10, 6), volume=200)]
+    )
+    report = backfill(
+        second, tmp_path, "1Day", date(2026, 1, 1), date(2026, 10, 7), ["AAPL"], now=lambda: day_two
+    )
+
+    assert report.written == [Partition("1Day", 2026, None, "A")]
+    assert report.rows == 2
+    assert [(r["session_date"], r["volume"], r["fetched_at"]) for r in rows_of(path)] == [
+        (date(2026, 10, 5), 100, day_one),
+        (date(2026, 10, 6), 200, day_two),
+    ]
+    assert partition_fetched_at(path) == day_two
 
 
 # =============================================================================================
@@ -926,7 +1324,6 @@ class ChainClient(FakeBarClient):
 MMC_BARS = [daily("MMC", date(2026, 1, 5)), daily("MMC", date(2026, 2, 3))]
 MRSH_BARS = [daily("MRSH", date(2026, 4, 1))]
 WINDOWS = {"MMC": (date(2018, 1, 22), date(2026, 3, 29)), "MRSH": (date(2026, 2, 28), None)}
-NOW_2027 = datetime(2027, 1, 15, tzinfo=UTC)
 
 
 def test_symbols_without_a_window_are_kept_whole(tmp_path: Path) -> None:
@@ -1043,3 +1440,376 @@ def test_zero_row_symbol_without_a_window_is_not_retried(tmp_path: Path) -> None
     )
 
     assert [c.symbols for c in client.calls] == [("ZZZZ",)]
+
+
+# =============================================================================================
+# chains: a renamed name that answered nothing is asked for alone only when another name of
+# the same security shared its request (that is the only case Alpaca hides it); the SEC window
+# rule above is unchanged
+# =============================================================================================
+# Measured on real data: retrying every renamed name unconditionally costs 24,337 solo requests
+# a year (about 145 min at the free-tier rate), twelve times that for monthly minute
+# partitions, and Alpaca only hides an old name when a newer name of the same security is in
+# the request (measured for MMC/MRSH and SIVB/SIVBQ). Symbols in ``chains`` that are not in
+# the run are ignored; ``chains=None`` or empty leaves the second pass to the windows.
+
+
+class PrunedRename(FakeBarClient):
+    """Mimics Alpaca for SPLG -> SPYM (a real ETF rename; SPLG is gone from the asset list):
+    asked alone, each name answers with its own bars; when both share a request, SPLG's bars
+    come back labelled SPYM, as measured for MMC/MRSH. Whether that holds for ETFs is an
+    assumption (see the module docstring)."""
+
+    def iter_bars(self, symbols, timeframe, start, end):  # type: ignore[override]
+        self.calls.append(BarsCall(tuple(symbols), timeframe, start, end))
+        wanted = set(symbols)
+        out = [b for b in self.bars if b.symbol in wanted and start <= b.t <= end]
+        if "SPLG" in wanted and "SPYM" in wanted:
+            out = [b.model_copy(update={"symbol": "SPYM"}) for b in out]
+        return iter(out)
+
+
+SPLG_BARS = [daily("SPLG", date(2024, 1, 5)), daily("SPLG", date(2024, 2, 5))]
+SPYM_BARS = [daily("SPYM", date(2024, 6, 3))]
+SPLG_CHAIN = [{"SPLG", "SPYM"}]
+
+
+def test_chain_member_merged_away_in_a_shared_batch_is_refetched_alone(tmp_path: Path) -> None:
+    # No SEC windows (ETFs) and neither name in ``active`` (SPLG pruned): both land in one
+    # request and SPLG comes back as SPYM. Without ``chains`` the windows-only second pass
+    # would never ask for SPLG again, because it has no window.
+    client = PrunedRename(SPLG_BARS + SPYM_BARS)
+
+    report = backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPLG", "SPYM"],
+        now=lambda: NOW_2027,
+        windows={},
+        active=set(),
+        chains=SPLG_CHAIN,
+    )
+
+    assert [c.symbols for c in client.calls] == [("SPLG", "SPYM"), ("SPLG",)]
+    rows = pq.read_table(tmp_path / "bars_1d" / "year=2024" / "bucket=S.parquet").to_pylist()
+    assert [(r["symbol"], r["session_date"]) for r in rows] == [
+        ("SPLG", date(2024, 1, 5)),
+        ("SPLG", date(2024, 2, 5)),
+        ("SPYM", date(2024, 1, 5)),
+        ("SPYM", date(2024, 2, 5)),
+        ("SPYM", date(2024, 6, 3)),
+    ]
+    assert report.rows == 5
+
+
+def test_chains_work_without_windows_or_active_and_accept_any_collections(tmp_path: Path) -> None:
+    client = PrunedRename(SPLG_BARS + SPYM_BARS)
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPLG", "SPYM"],
+        now=lambda: NOW_2027,
+        chains=(["SPYM", "SPLG"],),
+    )
+
+    assert [c.symbols for c in client.calls] == [("SPLG", "SPYM"), ("SPLG",)]
+    rows = pq.read_table(tmp_path / "bars_1d" / "year=2024" / "bucket=S.parquet")
+    assert rows.column("symbol").to_pylist().count("SPLG") == 2
+
+
+def test_three_name_chain_retries_only_the_member_whose_partner_shared_its_batch(
+    tmp_path: Path,
+) -> None:
+    # A synthetic three-name chain in one bucket (real three-name chains such as
+    # VII -> BNZI -> PARA span buckets and never share a request). QNEW is active and alone in
+    # its batch; QOLD and QMID are inactive and share one. The batch answer carries QMID's own
+    # bars and QOLD's relabelled QMID (the MMC/MRSH behaviour). QOLD answered nothing with a
+    # partner present: retried. QNEW answered nothing without a partner: not retried.
+    class ThreeNames(FakeBarClient):
+        def iter_bars(self, symbols, timeframe, start, end):  # type: ignore[override]
+            self.calls.append(BarsCall(tuple(symbols), timeframe, start, end))
+            wanted = set(symbols)
+            out = [b for b in self.bars if b.symbol in wanted and start <= b.t <= end]
+            if "QOLD" in wanted and "QMID" in wanted:
+                out = [b.model_copy(update={"symbol": "QMID"}) for b in out]
+            return iter(out)
+
+    client = ThreeNames([daily("QOLD", date(2024, 1, 5)), daily("QMID", date(2024, 6, 3))])
+
+    report = backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["QOLD", "QMID", "QNEW"],
+        now=lambda: NOW_2027,
+        active={"QNEW"},
+        chains=[{"QOLD", "QMID", "QNEW"}],
+    )
+
+    assert [c.symbols for c in client.calls] == [("QNEW",), ("QOLD", "QMID"), ("QOLD",)]
+    rows = pq.read_table(tmp_path / "bars_1d" / "year=2024" / "bucket=Q.parquet").to_pylist()
+    assert [(r["symbol"], r["session_date"]) for r in rows] == [
+        ("QMID", date(2024, 1, 5)),
+        ("QMID", date(2024, 6, 3)),
+        ("QOLD", date(2024, 1, 5)),
+    ]
+    assert report.rows == 3
+
+
+# --- boundaries: when the partner did not share the request, no solo request -----------------
+
+
+def test_chain_member_whose_partner_is_in_the_other_active_group_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    # SPYM active, SPLG inactive: they never share a request, so SPLG's empty answer is final.
+    client = FakeBarClient(SPYM_BARS)
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPLG", "SPYM"],
+        now=lambda: NOW_2027,
+        active={"SPYM"},
+        chains=SPLG_CHAIN,
+    )
+
+    assert [c.symbols for c in client.calls] == [("SPYM",), ("SPLG",)]
+
+
+def test_chain_member_separated_from_its_partner_by_the_batch_size_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    client = FakeBarClient(SPYM_BARS)
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPLG", "SPYM"],
+        batch_size=1,
+        now=lambda: NOW_2027,
+        active=set(),
+        chains=SPLG_CHAIN,
+    )
+
+    assert [c.symbols for c in client.calls] == [("SPLG",), ("SPYM",)]
+
+
+def test_chain_member_whose_partner_is_not_in_the_run_is_not_retried(tmp_path: Path) -> None:
+    # SIVB's window ends in 2023, so it is left out of 2024 and, answering nothing, asked
+    # again alone in 2022 and 2023 (window rule). SPLG has no window and its partner SPYM is
+    # not in the run: requested every year, never retried.
+    client = FakeBarClient()
+    windows = {"SIVB": (date(2018, 1, 22), date(2023, 4, 5))}
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2022, 1, 1),
+        date(2024, 12, 31),
+        ["SIVB", "SPLG"],
+        now=lambda: NOW_2027,
+        windows=windows,
+        active=set(),
+        chains=SPLG_CHAIN,
+    )
+
+    by_year: dict[int, list[tuple[str, ...]]] = {}
+    for call in client.calls:
+        by_year.setdefault(call.start.astimezone(ET).year, []).append(call.symbols)
+    assert by_year == {
+        2022: [("SIVB", "SPLG"), ("SIVB",)],
+        2023: [("SIVB", "SPLG"), ("SIVB",)],
+        2024: [("SPLG",)],
+    }
+
+
+def test_chain_symbols_absent_from_the_run_are_ignored(tmp_path: Path) -> None:
+    client = FakeBarClient()
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPYM"],
+        now=lambda: NOW_2027,
+        chains=[{"SPLG", "SPYM"}, {"VII", "BNZI", "PARA"}],
+    )
+
+    assert [c.symbols for c in client.calls] == [("SPYM",)]
+
+
+def test_chain_member_that_answered_in_the_shared_batch_is_not_requested_again(
+    tmp_path: Path,
+) -> None:
+    client = FakeBarClient(SPLG_BARS + SPYM_BARS)
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPLG", "SPYM"],
+        now=lambda: NOW_2027,
+        active=set(),
+        chains=SPLG_CHAIN,
+    )
+
+    assert [c.symbols for c in client.calls] == [("SPLG", "SPYM")]
+
+
+def test_two_chain_members_both_empty_in_a_shared_batch_are_each_retried(tmp_path: Path) -> None:
+    # The rule is about who shared the request, not who answered: with neither name answering
+    # (the security has no bars that year) both get a solo request. Pinned so a change here is
+    # a deliberate one.
+    client = FakeBarClient()
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPLG", "SPYM"],
+        now=lambda: NOW_2027,
+        active=set(),
+        chains=SPLG_CHAIN,
+    )
+
+    assert [c.symbols for c in client.calls] == [("SPLG", "SPYM"), ("SPLG",), ("SPYM",)]
+
+
+def test_windowed_symbol_is_still_retried_when_its_chain_partner_was_elsewhere(
+    tmp_path: Path,
+) -> None:
+    # Rule (a) is untouched by ``chains``: MMC has a window over 2026, answers nothing in its
+    # inactive batch while MRSH sits in the active one, and is asked again alone regardless.
+    client = FakeBarClient(MRSH_BARS)
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2026, 1, 1),
+        date(2026, 12, 31),
+        ["MMC", "MRSH"],
+        now=lambda: NOW_2027,
+        windows=WINDOWS,
+        active={"MRSH"},
+        chains=[{"MMC", "MRSH"}],
+    )
+
+    assert [c.symbols for c in client.calls] == [("MRSH",), ("MMC",), ("MMC",)]
+
+
+def test_empty_chains_behave_like_none(tmp_path: Path) -> None:
+    for chains in (None, set(), [], [set()]):
+        client = FakeBarClient()
+
+        backfill(
+            client,
+            tmp_path,
+            "1Day",
+            date(2024, 1, 1),
+            date(2024, 12, 31),
+            ["ZZZZ"],
+            now=lambda: NOW_2027,
+            force=True,
+            chains=chains,
+        )
+
+        assert [c.symbols for c in client.calls] == [("ZZZZ",)], chains
+
+
+def test_retry_keyword_is_gone(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        backfill(
+            FakeBarClient(),
+            tmp_path,
+            "1Day",
+            date(2024, 1, 1),
+            date(2024, 12, 31),
+            ["SPLG"],
+            now=lambda: NOW_2027,
+            retry={"SPLG"},  # type: ignore[call-arg]
+        )
+
+
+# --- invariants: chains shape requests, never what is kept -----------------------------------
+
+
+def test_chains_write_whatever_the_solo_request_returns_under_its_own_label(
+    tmp_path: Path,
+) -> None:
+    # The solo answer for SPLG carries one bar labelled SPLG and one the server filed under
+    # SPYM. Both are written as returned; nothing is dropped or relabelled on the way in.
+    class OddLabels(PrunedRename):
+        def iter_bars(self, symbols, timeframe, start, end):  # type: ignore[override]
+            if tuple(symbols) == ("SPLG",):
+                self.calls.append(BarsCall(tuple(symbols), timeframe, start, end))
+                return iter([daily("SPLG", date(2024, 1, 5)), daily("SPYM", date(2024, 1, 8))])
+            return super().iter_bars(symbols, timeframe, start, end)
+
+    client = OddLabels(SPLG_BARS)
+
+    report = backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2024, 1, 1),
+        date(2024, 12, 31),
+        ["SPLG", "SPYM"],
+        now=lambda: NOW_2027,
+        active=set(),
+        chains=SPLG_CHAIN,
+    )
+
+    rows = pq.read_table(tmp_path / "bars_1d" / "year=2024" / "bucket=S.parquet").to_pylist()
+    assert [(r["symbol"], r["session_date"]) for r in rows] == [
+        ("SPLG", date(2024, 1, 5)),
+        ("SPYM", date(2024, 1, 5)),
+        ("SPYM", date(2024, 1, 8)),
+        ("SPYM", date(2024, 2, 5)),
+    ]
+    assert report.rows == 4
+
+
+def test_chains_none_leaves_the_second_pass_to_the_windows(tmp_path: Path) -> None:
+    # Windows-only behaviour, spelled out: a windowed symbol that answers nothing is asked
+    # again alone; a symbol without a window is not, even though SPLG and SPYM shared a batch.
+    client = FakeBarClient()
+    windows = {"SIVB": (date(2018, 1, 22), date(2023, 4, 5))}
+
+    backfill(
+        client,
+        tmp_path,
+        "1Day",
+        date(2023, 1, 1),
+        date(2023, 12, 31),
+        ["SIVB", "SPLG", "SPYM"],
+        now=lambda: NOW_2027,
+        windows=windows,
+        active=set(),
+        chains=None,
+    )
+
+    assert [c.symbols for c in client.calls] == [("SIVB", "SPLG", "SPYM"), ("SIVB",)]

@@ -52,6 +52,7 @@ from asof.ingest.universe import (
     load_assets,
     load_history,
     load_universe,
+    rename_chains,
     save_assets_snapshot,
 )
 from asof.ingest.watchlist import load_watchlist, resolve_watchlist
@@ -325,7 +326,9 @@ def market_backfill(
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
     ] = None,
 ) -> None:
-    """Download bars into partitioned Parquet; reruns only fetch what is missing or open."""
+    """Download bars into partitioned Parquet; reruns only fetch what is missing or open.
+    Stored bars are never removed: a refetch adds to a partition file, and discarding one means
+    deleting the file."""
     tf = _timeframe(timeframe)
     root = _market_root(data_dir)
     universe = (
@@ -360,6 +363,7 @@ def market_backfill(
             on_partition=progress,
             windows=windows,
             active=active,
+            chains=rename_chains(root),
         )
     except AlpacaError as error:
         _fail(f"Stopped: {error}. Completed partitions are kept; rerun to continue.")

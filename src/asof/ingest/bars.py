@@ -16,12 +16,20 @@ the only column ``visible_bars`` filters on.
 Ticker chains: Alpaca stores a security's whole history under its newest name and, when an old
 and a new name share one request, answers only for the new one. Two measures get every name's
 history out of it: active and inactive symbols are requested separately, and a symbol that came
-back empty although its SEC validity window overlaps the period is requested again on its own.
-The windows also skip requests that cannot return anything. They never decide what is kept:
-everything Alpaca returns is written under the symbol it came back as. Attributing a bar to a
-security, and hiding history that was filed under a name not yet in use, is the security
-master's job at read time (``store.market.visible_bars``). Dropping at write time is
-irreversible and once cost BRK.B five months of 2020.
+back empty although its SEC validity window overlaps the period, or although another name of
+the same security (``chains``, from Alpaca's rename records) shared its request, is requested
+again on its own. The windows also skip requests that cannot return anything. They never
+decide what is kept: everything Alpaca returns is written under the symbol it came back as.
+Attributing a bar to a security, and hiding history that was filed under a name not yet in
+use, is the security master's job at read time (``store.market.visible_bars``). Dropping at
+write time is irreversible and once cost BRK.B five months of 2020.
+
+Nor does a refetch remove anything: ``write_partition`` merges into an existing file and keeps
+every stored row. Alpaca deletes a delisted security's history once its symbol is reused and
+files the new holder's history under the symbol (2026-10-16: VJET's 2020-2024 bars had become
+copies of RMED's, AXNX's history was gone), so overwriting would lose real history on every
+run, including the daily refetch of the open year. The first-fetched value is also what a
+reader saw at the time. To discard a partition, delete its file.
 """
 
 import os
@@ -198,16 +206,39 @@ def _to_table(bars: Iterable[Bar], timeframe: Timeframe, fetched_at: datetime) -
     )
 
 
+def merge_tables(existing: pa.Table, incoming: pa.Table) -> pa.Table:
+    """``existing`` rows unchanged, plus the ``incoming`` rows whose ``(symbol, t)`` is new,
+    sorted by ``(symbol, t)``."""
+
+    # Stays in Arrow: a minute-bar month bucket holds millions of rows.
+    new = incoming.join(
+        existing.select(["symbol", "t"]), keys=["symbol", "t"], join_type="left anti"
+    ).select(BAR_SCHEMA.names)
+    table = pa.concat_tables([existing, new]).cast(BAR_SCHEMA)
+    return table.sort_by([("symbol", "ascending"), ("t", "ascending")])
+
+
 def write_partition(
     path: Path, bars: Iterable[Bar], timeframe: Timeframe, fetched_at: datetime
 ) -> int:
-    """Write one partition file atomically; returns the row count. Nothing is left on failure.
+    """Write one partition file atomically; returns the file's row count. Nothing is left on
+    failure.
 
     Bars not yet final at ``fetched_at`` are dropped; ``fetched_at`` is also stored as file
-    metadata so a later run can tell whether the file was written after its period ended.
+    metadata so a later run can tell whether the file was written after its period ended. An
+    existing file is merged into, never replaced: its rows stay as they are (their own
+    ``fetched_at`` included) and only bars with a new ``(symbol, t)`` are added.
     """
     _require_aware(fetched_at, "fetched_at")
     table = _to_table(bars, timeframe, fetched_at)  # consume fully before writing
+    if path.exists():
+        existing = pq.read_table(path)
+        if not existing.schema.equals(BAR_SCHEMA, check_metadata=False):
+            raise ValueError(
+                f"{path}: stored columns differ from the bar schema; delete the file to refetch "
+                "it from scratch"
+            )
+        table = merge_tables(existing, table)
     table = table.replace_schema_metadata({FETCHED_AT_KEY: fetched_at.astimezone(UTC).isoformat()})
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -259,6 +290,7 @@ def _fetch_partition(
     fetched_at: datetime,
     windows: Mapping[str, Window] | None,
     active: Collection[str] | None,
+    chains: Collection[Collection[str]] | None = None,
 ) -> Iterator[Bar]:
     start, end = partition.bounds()
     end = min(end, fetched_at - RECENT_DATA_MARGIN)  # open period: do not ask for the future
@@ -272,18 +304,29 @@ def _fetch_partition(
         if active is not None
         else [wanted]
     )
+    chain_of: dict[str, frozenset[str]] = {}
+    for chain in chains or ():
+        members = frozenset(chain)
+        for symbol in members:
+            chain_of[symbol] = chain_of.get(symbol, frozenset()) | members
     seen: set[str] = set()
+    shadowed: set[str] = set()  # requested together with another name of the same security
     for group in groups:
         for i in range(0, len(group), batch_size):
-            for bar in client.iter_bars(group[i : i + batch_size], partition.timeframe, start, end):
+            batch = group[i : i + batch_size]
+            for symbol in batch:
+                if symbol in chain_of and any(s in chain_of[symbol] for s in batch if s != symbol):
+                    shadowed.add(symbol)
+            for bar in client.iter_bars(batch, partition.timeframe, start, end):
                 seen.add(bar.symbol)
                 # Defensive: never file a bar under a period its session does not belong to.
                 if partition.contains(session_date(bar.t)):
                     yield bar
-    # Second pass: a symbol with an SEC window over this period that came back empty may have
-    # been folded into a newer name sharing its request. Alone, Alpaca answers for it.
+    # Second pass: a symbol that came back empty although its SEC window says it existed, or
+    # although another name of its security shared the request, may have been folded into that
+    # newer name. Alone, Alpaca answers for it.
     for symbol in wanted:
-        if symbol in seen or not (windows and symbol in windows):
+        if symbol in seen or not (symbol in shadowed or (windows and symbol in windows)):
             continue
         for bar in client.iter_bars([symbol], partition.timeframe, start, end):
             if partition.contains(session_date(bar.t)):
@@ -304,13 +347,15 @@ def backfill(
     on_partition: Callable[[Partition, str, int], None] | None = None,
     windows: Mapping[str, Window] | None = None,
     active: Collection[str] | None = None,
+    chains: Collection[Collection[str]] | None = None,
 ) -> BackfillReport:
     """Fetch and write every partition in range, skipping complete ones unless ``force``.
 
     ``now`` supplies ``fetched_at`` (taken once per partition); it decides which bars are final
-    and how far the request may reach. ``windows`` (SEC validity per symbol) and ``active``
-    (Alpaca's currently listed symbols) only shape the requests, as described above; nothing
-    Alpaca returns for a requested symbol is left out of the file.
+    and how far the request may reach. ``windows`` (SEC validity per symbol), ``active``
+    (Alpaca's currently listed symbols) and ``chains`` (the names each security has traded
+    under) only shape the requests, as described above; nothing Alpaca returns for a requested
+    symbol is left out of the file, and nothing already in the file is removed.
     """
     clock = now or (lambda: datetime.now(UTC))
     _require_aware(clock(), "now()")
@@ -329,7 +374,14 @@ def backfill(
             continue
         fetched_at = clock()
         bars = _fetch_partition(
-            client, partition, by_bucket[partition.bucket], batch_size, fetched_at, windows, active
+            client,
+            partition,
+            by_bucket[partition.bucket],
+            batch_size,
+            fetched_at,
+            windows,
+            active,
+            chains,
         )
         rows = write_partition(path, bars, timeframe, fetched_at)
         report.written.append(partition)

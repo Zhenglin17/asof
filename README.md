@@ -23,14 +23,15 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Entity table: companies, funds and coins under one key; a reviewed watchlist of
       about 300 instruments resolved against the SEC ticker tables
 - [x] Market-wide daily bars: every exchange-listed symbol since 2020, including delisted
-      ones, stored as Parquet with the instant each bar became knowable
+      ones and both sides of every rename, stored as Parquet with the instant each bar became
+      knowable; a refetch adds to the store and never removes what an earlier fetch saw
 - [x] Security identity: corporate actions (splits, renames, mergers) from Alpaca, a
       security master that maps each symbol-day to a permanent security across renames and
       ticker reuse, and an instrument class (common, ETF, leveraged ETF, warrant, unit...)
       for every segment
 - [x] Liquid tier: the securities that averaged more than $50M a day over the previous 20
       sessions, computed as of any instant from data visible then; about 1,100-2,000 a month,
-      3,964 ever between 2020 and 2026
+      3,972 ever between 2020 and 2026
 - [x] Resolved read path: every bar read carries the permanent id of the security that owned
       its symbol that day, as the security master was known at the time; relabelled copies
       and the vendor's volume-0 filler bars are gone by default
@@ -92,13 +93,17 @@ uv run asof market liquid --from 2020-01-01 --to 2026-10-01   # one tier per mon
 uv run asof market audit                 # count every kind of data error found so far
 ```
 
-The universe is the union of every symbol Alpaca lists and every ticker that appeared in an
-SEC ticker table since 2019 (archived copies), so delisted companies are included. Bars are
+The universe is the union of every symbol Alpaca lists, every ticker that appeared in an SEC
+ticker table since 2019 (archived copies) and both names of every rename Alpaca recorded, so
+delisted companies and the old names of renamed ETFs are included. Bars are
 stored unadjusted, one Parquet file per year and first letter, each row stamped with
 `available_at`: the moment the bar was final (20:00 New York for a daily bar, since its volume
 includes after-hours trades). `visible_bars(con, root, timeframe, as_of)` is the only read path
 and returns nothing that was not knowable at `as_of`. Reruns skip files fetched after their
-period ended and refetch the rest, so the command is safe to run daily.
+period ended and refetch the rest, so the command is safe to run daily. A refetch only adds
+rows: the vendor deletes a delisted security's history once its symbol is reused and files the
+new holder's bars under it (Voxeljet's VJET became copies of RMED's history in 2026), so a bar
+once stored is kept as first seen, and a partition is discarded by deleting its file.
 
 Bars are stored exactly as the vendor returns them and never dropped at write time. Which
 security a row belongs to is a separate question, answered at read time by the security

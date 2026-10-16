@@ -76,6 +76,19 @@ def chain(con: duckdb.DuckDBPyConnection, security_id: str) -> list[tuple[str, d
     ]
 
 
+def sid(con: duckdb.DuckDBPyConnection, symbol: str, day: date) -> str:
+    """The security that held ``symbol`` on ``day``, as the master is known at NOW. Ids are
+    assigned by content and shift whenever the store is refetched, so cases name a security by
+    a symbol and a date rather than by id."""
+    found = {
+        security_id
+        for security_id, _, start, end in segments(con, NOW, symbol)
+        if start <= day and (end is None or day < end)
+    }
+    assert len(found) == 1, (symbol, day, found)
+    return found.pop()
+
+
 # -- identity ------------------------------------------------------------------------------------
 
 
@@ -83,7 +96,7 @@ def test_sivb_is_one_security_that_stopped_trading_on_2023_03_09(
     con: duckdb.DuckDBPyConnection,
 ) -> None:
     table = bars(con, NOW, ["SIVB", "SIVBQ"], include_untraded=True)
-    assert set(table.column("security_id").to_pylist()) == {"S005506"}
+    assert set(table.column("security_id").to_pylist()) == {sid(con, "SIVB", date(2022, 1, 3))}
     assert set(table.column("symbol").to_pylist()) == {"SIVB"}  # SIVBQ is OTC, not stored
     assert table.num_rows == 802
     assert max(table.column("session_date").to_pylist()) == date(2023, 3, 9)
@@ -92,12 +105,13 @@ def test_sivb_is_one_security_that_stopped_trading_on_2023_03_09(
 def test_mmc_became_mrsh_and_the_rename_is_unknown_before_it_happened(
     con: duckdb.DuckDBPyConnection,
 ) -> None:
+    mmc = sid(con, "MMC", date(2020, 1, 2))
     assert segments(con, ny(2025, 12, 31, 12), "MMC", "MRSH") == [
-        ("S003965", "MMC", date(2020, 1, 2), None)
+        (mmc, "MMC", date(2020, 1, 2), None)
     ]
     assert segments(con, ny(2026, 2, 1), "MMC", "MRSH") == [
-        ("S003965", "MMC", date(2020, 1, 2), date(2026, 1, 14)),
-        ("S003965", "MRSH", date(2026, 1, 14), None),
+        (mmc, "MMC", date(2020, 1, 2), date(2026, 1, 14)),
+        (mmc, "MRSH", date(2026, 1, 14), None),
     ]
     # one timeline: never two rows on one session
     days = bars(con, NOW, ["MMC", "MRSH"], start=ny(2025, 12, 1)).column("session_date")
@@ -106,11 +120,12 @@ def test_mmc_became_mrsh_and_the_rename_is_unknown_before_it_happened(
 
 def test_bk_in_2022_is_bk_and_bny_carries_nothing(con: duckdb.DuckDBPyConnection) -> None:
     as_of = ny(2022, 3, 1)
-    assert segments(con, as_of, "BK", "BNY") == [("S000730", "BK", date(2020, 1, 2), None)]
+    bk = sid(con, "BK", date(2022, 3, 1))
+    assert segments(con, as_of, "BK", "BNY") == [(bk, "BK", date(2020, 1, 2), None)]
     table = bars(con, as_of, ["BK", "BNY"], start=ny(2022, 2, 1))
     assert set(table.column("symbol").to_pylist()) == {"BK"}  # BNY's copy of BK's past is gone
-    assert set(table.column("security_id").to_pylist()) == {"S000730"}
-    assert chain(con, "S000730") == [
+    assert set(table.column("security_id").to_pylist()) == {bk}
+    assert chain(con, bk) == [
         ("BK", date(2020, 1, 2), date(2026, 5, 21)),
         ("BNY", date(2026, 5, 21), None),
     ]
@@ -119,9 +134,11 @@ def test_bk_in_2022_is_bk_and_bny_carries_nothing(con: duckdb.DuckDBPyConnection
 def test_bbby_is_two_companies(con: duckdb.DuckDBPyConnection) -> None:
     # Bed Bath & Beyond (CIK 886158) delisted 2023; Beyond Inc (ex-Overstock, CIK 1130713) took
     # the ticker on 2025-08-29 and renamed to NXH on 2026-08-17
-    assert ids(con, "BBBY")["BBBY"] == {"S000610", "S004509"}
-    assert chain(con, "S000610") == [("BBBY", date(2020, 1, 2), date(2023, 6, 1))]
-    assert chain(con, "S004509") == [
+    bed_bath = sid(con, "BBBY", date(2021, 1, 4))
+    beyond = sid(con, "BBBY", date(2025, 9, 2))
+    assert ids(con, "BBBY")["BBBY"] == {bed_bath, beyond}
+    assert chain(con, bed_bath) == [("BBBY", date(2020, 1, 2), date(2023, 6, 1))]
+    assert chain(con, beyond) == [
         ("OSTK", date(2020, 1, 2), date(2023, 11, 6)),
         ("BYON", date(2023, 11, 6), date(2025, 8, 29)),
         ("BBBY", date(2025, 8, 29), date(2026, 8, 17)),
@@ -129,57 +146,60 @@ def test_bbby_is_two_companies(con: duckdb.DuckDBPyConnection) -> None:
     ]
     master = visible_master(con, ROOT, NOW).to_pylist()
     ciks = {r["security_id"]: r["cik"] for r in master if r["symbol"] == "BBBY"}
-    assert ciks == {"S000610": 886158, "S004509": 1130713}
+    assert ciks == {bed_bath: 886158, beyond: 1130713}
 
 
 def test_share_classes_with_one_cik_stay_separate(con: duckdb.DuckDBPyConnection) -> None:
     found = ids(con, "GOOG", "GOOGL", "GME", "GME.WS", "BRK.A", "BRK.B")
-    assert found["GOOG"] == {"S002639"} and found["GOOGL"] == {"S002640"}
-    assert found["GME"] == {"S002602"} and found["GME.WS"] == {"S016926"}
-    assert found["BRK.A"] == {"S007209"} and found["BRK.B"] == {"S007210"}
+    assert all(len(found[s]) == 1 for s in found)
+    assert found["GOOG"] != found["GOOGL"]
+    assert found["GME"] != found["GME.WS"]
+    assert found["BRK.A"] != found["BRK.B"]
     master = visible_master(con, ROOT, NOW).to_pylist()
     cik = {r["symbol"]: r["cik"] for r in master if r["symbol"] in found}
     assert cik["GOOG"] == cik["GOOGL"] == 1652044
     assert cik["GME"] == cik["GME.WS"] == 1326380
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BRK.B's first five months of 2020 were dropped at write time in 4b-2; the full "
-    "refetch (4b-2b step 5) brings them back -- then this passes and the marker must go",
-)
 def test_brk_b_starts_on_the_first_session_of_2020(con: duckdb.DuckDBPyConnection) -> None:
+    # 4b-2 dropped BRK.B's first five months of 2020 at write time (the SEC spelled it BRKB
+    # until June); the 4b-2b refetch, which keeps everything Alpaca returns, brought them back
     days = bars(con, NOW, ["BRK.B"]).column("session_date").to_pylist()
     assert min(days) == date(2020, 1, 2)
 
 
 def test_renamed_watchlist_names_kept_their_identity(con: duckdb.DuckDBPyConnection) -> None:
     # Pure Storage -> P (2026-04-17) and EchoStar SATS -> ECHO (2026-06-24): renames, not exits
-    assert chain(con, "S004882") == [
+    assert chain(con, sid(con, "PSTG", date(2021, 1, 4))) == [
         ("PSTG", date(2020, 1, 2), date(2026, 4, 17)),
         ("P", date(2026, 4, 17), None),
     ]
-    assert chain(con, "S005312") == [
+    assert chain(con, sid(con, "SATS", date(2021, 1, 4))) == [
         ("SATS", date(2020, 1, 2), date(2026, 6, 24)),
         ("ECHO", date(2026, 6, 24), None),
     ]
 
 
 def test_ffr_and_para_were_reused_by_unrelated_securities(con: duckdb.DuckDBPyConnection) -> None:
-    assert ids(con, "FFR")["FFR"] == {"S002191", "S005227"}
-    assert chain(con, "S002191") == [
+    first_trust = sid(con, "FFR", date(2021, 1, 4))
+    ritter = sid(con, "FFR", date(2026, 10, 1))
+    assert ids(con, "FFR")["FFR"] == {first_trust, ritter}
+    assert chain(con, first_trust) == [
         ("FFR", date(2020, 1, 2), date(2022, 10, 3)),
         ("DTRE", date(2022, 10, 3), None),
     ]
-    assert [s for s, _, _ in chain(con, "S005227")] == ["RTTR", "QLGN", "AIXC", "FFR"]
+    assert [s for s, _, _ in chain(con, ritter)] == ["RTTR", "QLGN", "AIXC", "FFR"]
     # Paramount (VIAC -> PARA, merged away 2025-08-07) and Banzai (VII -> BNZI -> PARA)
-    assert ids(con, "PARA")["PARA"] == {"S006965", "S006441"}
-    assert chain(con, "S006965") == [
+    paramount = sid(con, "PARA", date(2023, 1, 3))
+    banzai = sid(con, "PARA", date(2026, 10, 1))
+    assert ids(con, "PARA")["PARA"] == {paramount, banzai}
+    assert chain(con, paramount) == [
         ("VIAC", date(2020, 2, 13), date(2022, 2, 17)),
         ("PARA", date(2022, 2, 17), date(2026, 8, 7)),
     ]
-    assert [s for s, _, _ in chain(con, "S006441")] == ["VII", "BNZI", "PARA"]
-    assert ids(con, "VII")["VII"] == {"S006441", "S018729"}  # VII reused again in 2026
+    assert [s for s, _, _ in chain(con, banzai)] == ["VII", "BNZI", "PARA"]
+    # VII reused again from 2026-07-16 by an unrelated listing
+    assert ids(con, "VII")["VII"] == {banzai, sid(con, "VII", date(2026, 8, 3))}
 
 
 def test_nkla_appears_only_once_the_rename_was_filed(con: duckdb.DuckDBPyConnection) -> None:
@@ -204,35 +224,40 @@ def test_nkla_appears_only_once_the_rename_was_filed(con: duckdb.DuckDBPyConnect
         ("NKLA", date(2020, 6, 4)),
         ("NKLA", date(2020, 6, 5)),
     ]
-    assert set(late.column("security_id").to_pylist()) == {"S006538"}
+    assert set(late.column("security_id").to_pylist()) == {sid(con, "NKLA", date(2020, 7, 1))}
 
 
 def test_bbuc_bars_before_the_filing_belong_to_the_old_holder(
     con: duckdb.DuckDBPyConnection,
 ) -> None:
-    # Brookfield Business: S013086 ended under BBUC on 2026-03-31, filed 2026-04-21
+    # Brookfield Business Corp ended under BBUC on 2026-03-31, filed 2026-04-21; Brookfield
+    # Business Partners (BBU) took the symbol that day
     window = {"start": ny(2026, 4, 1), "end": ny(2026, 4, 10)}
     then = bars(con, ny(2026, 4, 10), ["BBUC"], **window)
     now = bars(con, NOW, ["BBUC"], **window)
-    assert set(then.column("security_id").to_pylist()) == {"S013086"}
-    assert set(now.column("security_id").to_pylist()) == {"S000629"}
+    corp, partners = sid(con, "BBUC", date(2026, 3, 2)), sid(con, "BBUC", date(2026, 5, 1))
+    assert corp != partners
+    assert set(then.column("security_id").to_pylist()) == {corp}
+    assert set(now.column("security_id").to_pylist()) == {partners}
     assert then.num_rows == now.num_rows == 6
 
 
 def test_arnc_two_events_on_one_day_leave_no_overlap(con: duckdb.DuckDBPyConnection) -> None:
     # 2020-04-01: Arconic Inc renamed itself Howmet (HWM) and the spun-off Arconic Corp took ARNC
+    arconic_inc = sid(con, "ARNC", date(2020, 1, 2))
+    arconic_corp = sid(con, "ARNC", date(2020, 4, 1))
     assert segments(con, ny(2020, 3, 31, 12), "ARNC", "HWM") == [
-        ("S000437", "ARNC", date(2020, 1, 2), None)
+        (arconic_inc, "ARNC", date(2020, 1, 2), None)
     ]
     assert segments(con, datetime(2020, 4, 1, 5, tzinfo=UTC), "ARNC", "HWM") == [
-        ("S000437", "ARNC", date(2020, 1, 2), date(2020, 4, 1)),
-        ("S000437", "HWM", date(2020, 4, 1), None),
-        ("S007015", "ARNC", date(2020, 4, 1), None),
+        (arconic_inc, "ARNC", date(2020, 1, 2), date(2020, 4, 1)),
+        (arconic_inc, "HWM", date(2020, 4, 1), None),
+        (arconic_corp, "ARNC", date(2020, 4, 1), None),
     ]
     # known imprecision: the SEC kept ARNC under Arconic Inc's CIK until 2020-07-10, and so does
     # the master; no check can see it because both sides agree
     master = visible_master(con, ROOT, NOW).to_pylist()
-    arnc = [(r["valid_from"], r["cik"]) for r in master if r["security_id"] == "S007015"]
+    arnc = [(r["valid_from"], r["cik"]) for r in master if r["security_id"] == arconic_corp]
     assert arnc == [(date(2020, 4, 1), 4281), (date(2020, 7, 10), 1790982)]
 
 
@@ -318,14 +343,11 @@ def test_liquid_tier_membership_at_reference_dates(con: duckdb.DuckDBPyConnectio
 
     march_2021 = tier(ny(2021, 3, 1))
     assert {s: march_2021.get(s) for s in ("SIVB", "GME", "AMC", "BBBY")} == {
-        "SIVB": "S005506",
-        "GME": "S002602",
-        "AMC": "S000291",
-        "BBBY": "S000610",
+        s: sid(con, s, date(2021, 3, 1)) for s in ("SIVB", "GME", "AMC", "BBBY")
     }
     assert "SIVB" not in tier(ny(2026, 10, 1))
     june_2022 = tier(ny(2022, 6, 1))
-    assert june_2022.get("BK") == "S000730" and "BNY" not in june_2022
+    assert june_2022.get("BK") == sid(con, "BK", date(2022, 6, 1)) and "BNY" not in june_2022
     assert "EXEEW" not in tier(ny(2026, 2, 4))
 
 
