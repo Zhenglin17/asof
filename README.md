@@ -37,7 +37,7 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Resolved read path: every bar read carries the permanent id of the security that owned
       its symbol that day, as the security master was known at the time; relabelled copies
       and the vendor's volume-0 filler bars are gone by default
-- [x] Data audit: 30 checks over the real store with reviewed exceptions, and hand-checked
+- [x] Data audit: 32 checks over the real store with reviewed exceptions, and hand-checked
       reference histories asserted as tests against it
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
@@ -126,7 +126,17 @@ from the hand-over visible in the bars, a record whose old name never traded her
 temporary OTC suffix, a rename older than the store) is no event, a label that goes quiet
 and comes back after a gap is a new security from its first bar, and when-issued symbols
 (`.WI`, Nasdaq's fifth-letter V) are never the security itself, so a rename routed through
-one joins the names on either side. `asof market instruments` then tags each segment with an
+one joins the names on either side. The same bars settle what the records leave open: two
+names that traded side by side with different prices right up to a rename record did not
+rename, the old one converted into the new one's existing shares (Carnival plc's ADR into
+Carnival Corp) and the two stay separate securities; a name whose bars become identical to
+another's and then stop while the other trades on was renamed into it even though nobody
+filed it (Cyclerion into Kalaris); and a segment whose trailing bars, after a gap or after
+its filer left the SEC table, are copies of another security's (Axonics after its buyout,
+Voxeljet after its delisting) ends where the copies begin, as does a label whose whole history
+under an earlier holder is the current holder's history rewritten. Every conflict the build
+reports carries a `resolution` (`new_security`, `bridged`, `ignored`, `unresolved`); only the
+unresolved ones wait for a human. `asof market instruments` then tags each segment with an
 instrument class from the name it carried in that era, using the ordered rules in
 `configs/instrument_class_rules.yaml`; the scanner will only look at common stocks and
 unleveraged ETFs. A segment nobody ever named (an ETF's old ticker) inherits the class of a
@@ -170,9 +180,10 @@ a line.
 
 Tests on fake data only show that the code does what its author imagined; they stay green when
 the imagined vendor differs from the real one. `asof market audit` therefore reads the real
-store as of an instant and counts each kind of accident met so far, 30 checks in all:
+store as of an instant and counts each kind of accident met so far, 32 checks in all:
 duplicate or impossible bars, segments of one security that overlap, two securities sharing
-an identical bar (a relabelled history the master did not catch), a split record with no price
+an identical bar (a relabelled history the master did not catch), an earlier holder's segment
+partly made of the current holder's bars, a split record with no price
 move, a one-day thin-volume print far from the previous close with no split to explain it, a
 price jump across a rename, traded bars that no segment owns, a listed symbol whose bars
 stopped although the vendor still serves it. Each finding is a row with a

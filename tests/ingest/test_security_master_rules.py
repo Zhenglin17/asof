@@ -115,6 +115,7 @@ from tests.ingest.test_security_master import (
     segment_at,
     segments,
     sids,
+    unresolved,
     visible_at,
 )
 
@@ -433,7 +434,7 @@ def test_v_viac_segment_starts_at_its_first_bar_not_at_the_record(
     for day in (V_VIAC_FIRST_BAR, date(2020, 1, 15), V_VIAC_RECORD, date(2021, 6, 1)):
         assert segment_at(master, "VIAC", day) == viac, day
     assert "CBS" not in set(master.column("symbol").to_pylist())
-    assert not any("VIAC" in r["symbols"] for r in conflicts.to_pylist())
+    assert not any("VIAC" in r["symbols"] for r in unresolved(conflicts))
 
 
 def test_v_viac_segment_is_knowable_with_its_first_bar(
@@ -493,7 +494,7 @@ def test_v_worx_with_an_sec_life_since_2020_stays_one_security_in_one_segment() 
     assert worx["end_available_at"] is None
     assert segment_at(master, "WORX", date(2026, 9, 15)) == worx
     assert "WORXD" not in set(master.column("symbol").to_pylist())
-    assert not any("WORX" in r["symbols"] for r in conflicts.to_pylist())
+    assert not any("WORX" in r["symbols"] for r in unresolved(conflicts))
     # a reader before the record and one after see the same single open row
     before = [r for r in visible_at(master, et_midnight(date(2026, 8, 3))) if r["symbol"] == "WORX"]
     assert [(r["valid_from"], r["valid_to"]) for r in before] == [(date(2020, 1, 2), None)]

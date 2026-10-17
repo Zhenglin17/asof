@@ -8,7 +8,7 @@ Runs on the real store under ``$ASOF_DATA_DIR/market`` (default /data/asof) and 
 absent, so CI does not run it. Values were read off the store on 2026-10-08 and checked by hand.
 """
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -181,14 +181,19 @@ def test_renamed_watchlist_names_kept_their_identity(con: duckdb.DuckDBPyConnect
 
 
 def test_ffr_and_para_were_reused_by_unrelated_securities(con: duckdb.DuckDBPyConnection) -> None:
-    first_trust = sid(con, "FFR", date(2021, 1, 4))
+    # FFR: First Trust's ETF renamed to DTRE on 2022-10-03 and Ritter (RTTR -> QLGN -> AIXC ->
+    # FFR) took the label in 2026. Alpaca then rewrote FFR's past with Ritter's chain: the 2020-
+    # 2022 bars under FFR close at 0.27-0.29 (Ritter's level, First Trust's ETF traded near 40)
+    # and are OHLC-identical to QLGN / AIXC / RTTR. Since 6-b-2 they belong to nobody and the
+    # label has one security; DTRE's own history before the record is a known loss (I1) until
+    # a second source supplies First Trust's FFR bars (the PARA path).
     ritter = sid(con, "FFR", date(2026, 10, 1))
-    assert ids(con, "FFR")["FFR"] == {first_trust, ritter}
-    assert chain(con, first_trust) == [
-        ("FFR", date(2020, 1, 2), date(2022, 10, 3)),
-        ("DTRE", date(2022, 10, 3), None),
-    ]
+    assert ids(con, "FFR")["FFR"] == {ritter}
     assert [s for s, _, _ in chain(con, ritter)] == ["RTTR", "QLGN", "AIXC", "FFR"]
+    dtre = sid(con, "DTRE", date(2023, 1, 3))
+    assert dtre != ritter
+    assert chain(con, dtre) == [("DTRE", date(2022, 10, 3), None)]
+    assert bars(con, NOW, ["FFR"], start=ny(2021, 1, 4), end=ny(2021, 1, 5)).num_rows == 0
     # Paramount (VIAC -> PARA, merged away 2025-08-07) and Banzai (VII -> BNZI -> PARA)
     paramount = sid(con, "PARA", date(2023, 1, 3))
     banzai = sid(con, "PARA", date(2026, 10, 1))
@@ -197,7 +202,7 @@ def test_ffr_and_para_were_reused_by_unrelated_securities(con: duckdb.DuckDBPyCo
         # CBS -> VIAC was filed 2020-02-13 for a rename of 2019-12-05; the label lives from
         # its first stored bar (rule V, 2026-10-16)
         ("VIAC", date(2020, 1, 2), date(2022, 2, 17)),
-        ("PARA", date(2022, 2, 17), date(2026, 8, 7)),
+        ("PARA", date(2022, 2, 17), date(2025, 8, 7)),
     ]
     assert [s for s, _, _ in chain(con, banzai)] == ["VII", "BNZI", "PARA"]
     # VII reused again from 2026-07-16 by an unrelated listing
@@ -413,17 +418,13 @@ def test_para_2022_2025_is_paramount_from_the_second_source(
     assert imported.num_rows == 869
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="⑥-b: the relabel rule must compare against the acquirer's whole chain (VII + BNZI) "
-    "and end Paramount's PARA segment at the 2025-08-07 merger; until then Banzai's bars under "
-    "PARA resolve to Paramount (reviewer 2026-10-16 #2)",
-)
 def test_banzai_bars_under_para_do_not_resolve_to_paramount(
     con: duckdb.DuckDBPyConnection,
 ) -> None:
     # Measured 2026-10-16: 251 Alpaca PARA bars 2025-08-07 .. 2026-08-06 (Banzai, close
-    # 0.22 .. 7.66) come back with Paramount's security_id. Audit I2 reports BNZI/PARA meanwhile.
+    # 0.22 .. 7.66) come back with Paramount's security_id. 6-b-2 rule F ends Paramount's PARA
+    # segment on 2025-08-07, where the Banzai copies begin (its CIK 813828 leaves the SEC table
+    # after the 2025-08-19 snapshot); the copies then belong to nobody.
     rows = bars(
         con, ny(2026, 10, 16), ["PARA"], start=ny(2025, 8, 7), end=ny(2026, 8, 7)
     ).to_pylist()
@@ -500,3 +501,159 @@ def test_honav_when_issued_is_not_hona(con: duckdb.DuckDBPyConnection) -> None:
     hona = sid(con, "HONA", date(2026, 7, 1))
     assert sid(con, "HONAV", date(2026, 6, 16)) != hona
     assert segments(con, NOW, "HONA") == [(hona, "HONA", date(2026, 6, 29), None)]
+
+
+# -- step 6-b-2 rules (B, E, F, Z, whole-chain relabel, imports in the build), written 2026-10-17
+# to FAIL on the store built before them --
+# Fake-world tests: tests/ingest/test_security_master_copies.py. Values below were read off the
+# store on 2026-10-17 (bars, SEC rows, Alpaca records); the master rows they contradict are
+# quoted in each case. Security ids are content hashes and shift on a rebuild, so every case
+# names a security by (symbol, day).
+
+
+def test_cycn_became_krsa_on_2026_09_09_without_a_record(con: duckdb.DuckDBPyConnection) -> None:
+    # E. Every one of CYCN's 1,662 traded bars (2020-01-02 .. 2026-09-08; 17 more are volume-0
+    # filler) is OHLC-identical to KRSA's; CYCN's last traded bar is 2026-09-08 (close 3.36),
+    # KRSA trades on from 09-09 (open 21.20: a reverse split with the name change); no Alpaca
+    # or SEC record. Master before the rule: CYCN [2020-01-02, None) 'sec' and KRSA
+    # [2020-01-02, None) bars_only in two securities, conflict dup_unlinked "1609 days".
+    cyclerion = sid(con, "CYCN", date(2021, 1, 4))
+    assert segments(con, NOW, "CYCN", "KRSA") == [
+        (cyclerion, "CYCN", date(2020, 1, 2), date(2026, 9, 9)),
+        (cyclerion, "KRSA", date(2026, 9, 9), None),
+    ]
+    master = visible_master(con, ROOT, NOW).to_pylist()
+    [krsa] = [r for r in master if r["symbol"] == "KRSA"]
+    assert krsa["evidence"] == "bars"
+    # knowable with KRSA's first post-run bar (20:00 New York of 2026-09-09), not before
+    first_bar = datetime(2026, 9, 10, 0, 0, tzinfo=UTC)
+    assert krsa["available_at"] == first_bar
+    assert segments(con, first_bar - timedelta(microseconds=1), "CYCN", "KRSA") == [
+        (cyclerion, "CYCN", date(2020, 1, 2), None)
+    ]
+    assert segments(con, first_bar, "CYCN", "KRSA") == [
+        (cyclerion, "CYCN", date(2020, 1, 2), date(2026, 9, 9)),
+        (cyclerion, "KRSA", date(2026, 9, 9), None),
+    ]
+    # one timeline: the identical days are served under CYCN only
+    days = bars(con, NOW, ["CYCN", "KRSA"], start=ny(2026, 8, 1)).column("session_date")
+    assert len(days) == len(set(days.to_pylist()))
+
+
+def test_cuk_converted_into_ccl_on_2026_05_07_and_ccl_is_untouched(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # B1. Carnival plc's ADR (CUK, CIK 1125259) converted into Carnival Corp (CCL, CIK 815097):
+    # record 2026-05-08, CUK's last bar 05-06 (27.47 vs CCL 27.52), 1,594 parallel days all
+    # OHLC-different, CCL under 815097 in every snapshot through 2026-09-08. Master before the
+    # rule: CUK [2020-01-02, 2026-05-07) and CCL cut in two at 05-07, all one security.
+    carnival_plc = sid(con, "CUK", date(2021, 1, 4))
+    carnival_corp = sid(con, "CCL", date(2021, 1, 4))
+    assert carnival_plc != carnival_corp
+    assert segments(con, NOW, "CUK") == [(carnival_plc, "CUK", date(2020, 1, 2), date(2026, 5, 7))]
+    assert segments(con, NOW, "CCL") == [(carnival_corp, "CCL", date(2020, 1, 2), None)]
+
+
+def test_cot_became_prmw_in_2020_although_the_two_traded_in_parallel(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # B1 negative (guard: passes on today's master, must keep passing). Cott (CIK 884713)
+    # bought Primo Water and took its ticker: record COT -> PRMW 2020-03-03, 40 parallel
+    # differing days, PRMW 14.00 -> 14.78 across the record. The PRMW label's CIK before the
+    # record is old Primo's 1365101 -- rows the build drops as a zombie in the 2020-07-10 SEC
+    # correction, so the CIK reads UNKNOWN, not "different"; either way not a conversion. COT
+    # and PRMW from 03-03 are one security; nothing of old Primo's PRMW belongs to it.
+    cott = sid(con, "COT", date(2020, 2, 3))
+    assert sid(con, "PRMW", date(2020, 6, 1)) == cott
+    assert segments(con, NOW, "COT") == [(cott, "COT", date(2020, 1, 2), date(2020, 3, 3))]
+    before = [s for s in segments(con, NOW, "PRMW") if s[2] < date(2020, 3, 3)]
+    assert all(s[0] != cott and s[3] == date(2020, 3, 3) for s in before), before
+
+
+def test_iivip_preferred_moved_to_the_vacated_iivi_label_in_2023(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # B1 negative (guard: passes on today's master, must keep passing). IIVIP -> IIVI recorded
+    # 2023-02-23: II-VI's preferred took the common's vacated ticker after IIVI -> COHR
+    # 2022-10-18 (IIVIP's last bar 02-22 at 187.51, IIVI from 02-23 at 195.01). The 465 parallel
+    # differing days are the common's, a year earlier: no differing day in the five sessions
+    # before the record, so the record is a rename and the preferred keeps one security across
+    # the label move. II-VI's common (IIVI before 2022-10-18) is another security.
+    preferred = sid(con, "IIVIP", date(2021, 1, 4))
+    assert segments(con, NOW, "IIVIP") == [
+        (preferred, "IIVIP", date(2020, 8, 7), date(2023, 2, 23))
+    ]
+    assert sid(con, "IIVI", date(2023, 3, 1)) == preferred
+    assert sid(con, "IIVI", date(2021, 1, 4)) != preferred  # II-VI's common, COHR since 2022
+
+
+def test_axnx_ends_where_the_mimi_copies_begin_after_the_2025_gap(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # F, gap variant. Axonics' last own bar 2024-11-14 (70.98; acquired by Boston Scientific),
+    # no traded bar for 57 days, then 245 bars from 2025-01-10 (4.11) identical to MIMI's, whose
+    # SEC rows start 2024-11-28. Master before the rule: AXNX [2020-01-02, None) owns them;
+    # I2 reports AXNX/MIMI.
+    axonics = sid(con, "AXNX", date(2021, 1, 4))
+    assert segments(con, NOW, "AXNX") == [(axonics, "AXNX", date(2020, 1, 2), date(2025, 1, 10))]
+    assert bars(con, NOW, ["AXNX"], start=ny(2025, 1, 10)).num_rows == 0
+    assert sid(con, "MIMI", date(2025, 6, 2)) != axonics
+    # the end is knowable with the first tail bar (20:00 New York of 2025-01-10 = 01:00 UTC)
+    end_known = datetime(2025, 1, 11, 1, 0, tzinfo=UTC)
+    assert segments(con, end_known - timedelta(microseconds=1), "AXNX") == [
+        (axonics, "AXNX", date(2020, 1, 2), None)
+    ]
+    assert segments(con, end_known, "AXNX") == [
+        (axonics, "AXNX", date(2020, 1, 2), date(2025, 1, 10))
+    ]
+
+
+def test_vjet_ends_on_2024_03_25_where_the_vtak_copies_begin(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # F, CIK-leaves variant. Voxeljet's own bars stop 2024-03-22 (0.6401); from 03-25 (0.501)
+    # VJET's 634 bars are VTAK's; VJET's SEC rows (CIK 1582581) end 2024-04-01 and the filer
+    # reappears as VJTTY from 05-02. No gap in the traded bars. Master before the rule: VJET
+    # [2020-01-02, 2024-05-02); the copies from 03-25 to 05-01 are Voxeljet's, the rest nobody's.
+    voxeljet = sid(con, "VJET", date(2021, 1, 4))
+    assert segments(con, NOW, "VJET") == [(voxeljet, "VJET", date(2020, 1, 2), date(2024, 3, 25))]
+    assert bars(con, NOW, ["VJET"], start=ny(2024, 3, 25)).num_rows == 0
+    assert sid(con, "VTAK", date(2024, 6, 3)) != voxeljet
+
+
+def test_btln_old_holder_segment_is_gone_and_its_bars_live_under_vrar(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # Z / whole-chain relabel. The Glimpse Group (CIK 1854445): VRAR 2021-07-01 .. 2026-02-18,
+    # GGRP 2026-02-19 .. 08-19, BTLN from 2026-08-20. The 1,289 BTLN bars before the takeover
+    # are exact copies of VRAR (1,163) + GGRP (126); the old BTLN filer (CIK 1425289) was listed
+    # 2021-06..2022-01 only. Master before the rule: BTLN [2021-07-01, 2026-08-20) under the old
+    # CIK (GGRP alone covers 10% of its days), conflict reuse_looks_continuous GGRP/BTLN.
+    glimpse = sid(con, "BTLN", date(2026, 9, 1))
+    assert segments(con, NOW, "BTLN") == [(glimpse, "BTLN", date(2026, 8, 20), None)]
+    assert chain(con, glimpse) == [
+        ("VRAR", date(2021, 7, 1), date(2026, 2, 19)),
+        ("GGRP", date(2026, 2, 19), date(2026, 8, 20)),
+        ("BTLN", date(2026, 8, 20), None),
+    ]
+    window = {"start": ny(2023, 6, 1), "end": ny(2023, 6, 2)}
+    assert bars(con, NOW, ["BTLN"], **window).num_rows == 0
+    [vrar] = bars(con, NOW, ["VRAR"], **window).to_pylist()
+    assert vrar["security_id"] == glimpse
+
+
+def test_para_2023_bar_is_paramounts_through_a_build_that_reads_the_imports(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # Build reads bars_1d_ext. PARA 2023-06-01: Yahoo (SKYD) close 15.39, Alpaca's Banzai row
+    # 10.45. The build must see the imported row, or the whole-chain relabel / F comparison
+    # runs on Banzai's copies and misjudges Paramount's piece. After F the piece ends
+    # 2025-08-07 (Paramount's CIK 813828 leaves the SEC table after 2025-08-19; the Banzai
+    # copies under PARA begin 08-07). Master before 6-b-2: PARA [2022-02-17, 2026-08-07).
+    paramount = sid(con, "VIAC", date(2021, 6, 1))
+    window = {"start": ny(2023, 6, 1), "end": ny(2023, 6, 2)}
+    [row] = bars(con, NOW, ["PARA"], **window).to_pylist()
+    assert row["source"] == "yahoo"
+    assert row["close"] == pytest.approx(15.39, abs=1e-4)
+    assert row["security_id"] == paramount
+    assert (paramount, "PARA", date(2022, 2, 17), date(2025, 8, 7)) in segments(con, NOW, "PARA")

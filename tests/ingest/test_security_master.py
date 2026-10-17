@@ -82,7 +82,7 @@ MASTER_COLUMNS = [
     "available_at",
     "end_available_at",
 ]
-CONFLICT_COLUMNS = ["kind", "symbols", "dates", "detail"]
+CONFLICT_COLUMNS = ["kind", "symbols", "dates", "detail", "resolution"]
 
 
 # =============================================================================================
@@ -347,6 +347,12 @@ def sids(master: pa.Table, symbol: str) -> set[str]:
 def only_sid(master: pa.Table, symbol: str) -> str:
     [sid] = sids(master, symbol)
     return sid
+
+
+def unresolved(conflicts: pa.Table) -> list[dict[str, Any]]:
+    """Conflict rows left for a human; the build's own decisions (``cik_switch_bridged``,
+    ``record_without_taker``, ``cik_switch_discontinuous``) carry another ``resolution``."""
+    return [r for r in conflicts.to_pylist() if r["resolution"] == "unresolved"]
 
 
 def conflicts_of(conflicts: pa.Table, kind: str) -> list[dict[str, Any]]:
@@ -1161,12 +1167,16 @@ def test_r4_previous_holder_with_mostly_different_bars_keeps_its_segment(
     # ASSUMPTION (threshold boundary, no real example in hand): ~50% identical days is not
     # relabelling. Needs a real-data check: the identical-day ratio of every pre-takeover piece
     # the build drops vs keeps should be bimodal (near 100% vs near 0%), not spread out.
+    # Since 6-b-2 the kept piece ends where its copied tail begins (rule F: PRV's filer left
+    # the SEC table after 2021-01-04 and every PRV bar of 2021 is TKR's): the 2021 copies belong
+    # to TKR under its own name, not to the previous holder. Before 6-b-2 the piece ran to the
+    # record and the copies resolved to CIK 3001 -- the AXNX / MIMI error in miniature.
     master, _ = r4_built
 
     old, new = segments(master, "PRV")
     assert (old["valid_from"], old["valid_to"], old["cik"]) == (
         date(2020, 1, 2),
-        date(2022, 1, 3),
+        date(2021, 1, 1),
         3001,
     )
     assert (new["valid_from"], new["valid_to"], new["cik"]) == (date(2022, 1, 3), None, 3002)
@@ -1259,7 +1269,7 @@ def test_r5_same_cik_continuous_takeover_is_one_security(
     assert before["cik"] == after["cik"] == 1796280
     assert segments(master, "ORIC")[0]["valid_from"] == date(2020, 1, 2)
     assert segments(master, "ORIC")[-1]["valid_to"] is None
-    assert not any("ORIC" in r["symbols"] for r in conflicts.to_pylist())
+    assert not any("ORIC" in r["symbols"] for r in unresolved(conflicts))
 
 
 def test_r5_different_cik_continuous_takeover_is_reported_not_merged(
@@ -2251,7 +2261,7 @@ def test_f10_cik_switch_not_explained_by_the_rename_stays_an_event(
     # conflict here, which predates F11 and described the wrong outcome.
     later = segment_at(master, "INBX", date(2024, 8, 1))
     assert later["security_id"] == first["security_id"], (first, later)
-    assert not any("INBX" in r["symbols"] for r in conflicts.to_pylist()), conflicts.to_pylist()
+    assert not any("INBX" in r["symbols"] for r in unresolved(conflicts)), conflicts.to_pylist()
 
 
 def test_f10_new_holders_piece_is_not_knowable_before_the_switch_snapshot(
@@ -2821,7 +2831,7 @@ def test_g2_short_gap_between_traded_bars_is_still_bridged() -> None:
     old, new = segments(master, "L")
     assert old["valid_to"] == new["valid_from"] == date(2020, 7, 10)
     assert (old["cik"], new["cik"]) == (G2_OLD_CIK, G2_NEW_CIK)
-    assert not any("L" in r["symbols"] for r in conflicts.to_pylist())
+    assert not any("L" in r["symbols"] for r in unresolved(conflicts))
 
 
 def test_g2_filler_days_are_in_the_old_holders_piece_and_nothing_leaks() -> None:

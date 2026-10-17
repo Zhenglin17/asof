@@ -102,6 +102,12 @@ def _files(root: Path, timeframe: Timeframe) -> list[Path]:
     return [*_alpaca_files(root, timeframe), *_ext_files(root, timeframe)]
 
 
+def bar_files(root: Path, timeframe: Timeframe) -> tuple[list[Path], list[Path]]:
+    """The Alpaca partitions and the imported-bar files of ``timeframe``, for callers that
+    build their own query over ``bars_source_sql`` (the security master build)."""
+    return _alpaca_files(root, timeframe), _ext_files(root, timeframe)
+
+
 def _source(files: Sequence[Path]) -> str:
     paths = ", ".join("'" + str(p).replace("'", "''") + "'" for p in files)
     return f"read_parquet([{paths}], hive_partitioning = true, union_by_name = true)"

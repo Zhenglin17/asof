@@ -92,16 +92,32 @@ CONFLICT_SCHEMA = pa.schema(
         ("symbols", pa.list_(pa.string())),
         ("dates", pa.list_(pa.date32())),
         ("detail", pa.string()),
+        ("resolution", pa.string()),  # what the build did about it, one of RESOLUTIONS
     ]
+)
+# new_security: the build kept two securities (a CIK switch with a price break); bridged: the
+# build joined them; ignored: a record that is not an event; unresolved: for a human (the
+# audit's M6 gates only these)
+RESOLUTIONS = ("new_security", "bridged", "ignored", "unresolved")
+IDENT_SCHEMA = pa.schema(
+    [("symbol_a", pa.string()), ("symbol_b", pa.string()), ("session_date", pa.date32())]
 )
 DUP_SCHEMA = pa.schema([("symbol_a", pa.string()), ("symbol_b", pa.string()), ("days", pa.int64())])
 
 DUP_MIN_VOLUME = 1000  # thin names can match by accident; identical days above this cannot
+DUP_MIN_DAYS = 3  # one or two identical days are a coincidence (SPAC trusts all print 10.00)
 CONTINUOUS = (0.8, 1.25)  # close after / close before: a rename or CIK switch, not a new security
 MAX_GAP_DAYS = 10  # bars this far apart are not "continuous" whatever the ratio
 SEC_HISTORY_START = date(2019, 10, 2)  # first refreshed SEC snapshot; earlier ones are stale
 TABLE_CORRECTION_MIN_SWITCHES = 50  # CIK switches in one snapshot pair; normal pairs: <= 14
-RELABEL_MIN_IDENTICAL = 0.9  # share of a pre-takeover piece's days identical to the taker's bars
+RELABEL_MIN_IDENTICAL = 0.9  # copy rules: share of a piece's traded days identical to another's
+COPY_MIN_DAYS = 3  # fewer identical days never make a copy (one-day coincidences, the H cluster)
+RUN_MIN_DAYS = 3  # E: shortest identical run that reads as an unfiled rename
+RUN_NEAR_SESSIONS = 10  # E: ender's last own bar and continuer's first bar vs the run start
+RUN_TOLERANCE = (3, 0.05)  # E: continuer's differing days before the run end <= max(3, 5% of run)
+CONVERSION_MIN_DIFFERING_DAYS = 5  # B: parallel OHLC-differing days that make a conversion
+CONVERSION_WINDOW = 5  # B: sessions before the record that must hold one of them
+TAIL_GAP_SESSIONS = 10  # F: a copied tail that starts after a gap this long is cut off
 SEC_LAG_MAX_DAYS = 183  # an SEC snapshot may record a rename this long after Alpaca's date
 HANDOVER_MAX_DAYS = 5  # new name's first traded bar this close after the old name's last: the cut
 RESUME_GAP_DAYS = 14  # traded bars of a closed label resuming later than this start a new piece
@@ -277,13 +293,26 @@ def merge_edges(alpaca_edges: pa.Table, sec_edges: pa.Table) -> pa.Table:
 # -- duplicates ----------------------------------------------------------------------------------
 
 
-def ohlcv_duplicates(bars: pa.Table, con: duckdb.DuckDBPyConnection | None = None) -> pa.Table:
+def ohlcv_duplicates(
+    bars: pa.Table, con: duckdb.DuckDBPyConnection | None = None, owned: pa.Table | None = None
+) -> pa.Table:
     """Pairs of symbols with identical open/high/low/close/volume on the same day, counted over
-    days with volume above ``DUP_MIN_VOLUME``."""
+    days with volume above ``DUP_MIN_VOLUME``. With ``owned`` (``symbol, lo, hi`` ranges) only
+    bars inside a range count: a copied tail the build has cut off belongs to nobody and has
+    nothing left to link (the loss metric lists it instead)."""
     own = con is None
     con = con or duckdb.connect()
     try:
         con.register("_dup_bars", bars)
+        inside = ""
+        if owned is not None:
+            con.register("_dup_owned", owned)
+            inside = """
+             AND EXISTS (SELECT 1 FROM _dup_owned o WHERE o.symbol = a.symbol
+                         AND a.session_date >= o.lo AND (o.hi IS NULL OR a.session_date < o.hi))
+             AND EXISTS (SELECT 1 FROM _dup_owned o WHERE o.symbol = b.symbol
+                         AND b.session_date >= o.lo AND (o.hi IS NULL OR b.session_date < o.hi))
+            """
         table = con.execute(
             f"""
             SELECT a.symbol AS symbol_a, b.symbol AS symbol_b, count(*) AS days
@@ -291,15 +320,94 @@ def ohlcv_duplicates(bars: pa.Table, con: duckdb.DuckDBPyConnection | None = Non
               ON a.session_date = b.session_date AND a.symbol < b.symbol
              AND a.open = b.open AND a.high = b.high AND a.low = b.low
              AND a.close = b.close AND a.volume = b.volume
-            WHERE a.volume > {DUP_MIN_VOLUME}
+            WHERE a.volume > {DUP_MIN_VOLUME} {inside}
             GROUP BY 1, 2 ORDER BY 3 DESC, 1, 2
             """
         ).to_arrow_table()
         con.unregister("_dup_bars")
+        if owned is not None:
+            con.unregister("_dup_owned")
     finally:
         if own:
             con.close()
     return table.cast(DUP_SCHEMA) if table.num_rows else DUP_SCHEMA.empty_table()
+
+
+def identical_days(bars: pa.Table, con: duckdb.DuckDBPyConnection | None = None) -> pa.Table:
+    """One row per pair of symbols and day on which both traded (volume > 0) the same
+    open/high/low/close, ``symbol_a < symbol_b``. Volume is ignored: Alpaca revises it after
+    20:00 New York, so a relabelled copy can differ from its original on volume alone (the E
+    cluster count found pairs identical on OHLC and not on OHLCV). Computed once per build and
+    read by every copy rule (relabel, E, C, F, Z); the audit's I2 keeps its stricter OHLCV
+    test because it gates on it."""
+    own = con is None
+    con = con or duckdb.connect()
+    try:
+        con.register("_id_bars", bars)
+        table = con.execute(
+            """
+            SELECT a.symbol AS symbol_a, b.symbol AS symbol_b, a.session_date
+            FROM _id_bars a JOIN _id_bars b
+              ON a.session_date = b.session_date AND a.open = b.open AND a.high = b.high
+             AND a.low = b.low AND a.close = b.close AND a.symbol < b.symbol
+            WHERE a.volume > 0 AND b.volume > 0
+            ORDER BY 1, 2, 3
+            """
+        ).to_arrow_table()
+        con.unregister("_id_bars")
+    finally:
+        if own:
+            con.close()
+    return table.cast(IDENT_SCHEMA) if table.num_rows else IDENT_SCHEMA.empty_table()
+
+
+def _register_sessions(con: duckdb.DuckDBPyConnection) -> None:
+    """``_sessions`` (every weekday from the first traded bar to the last, numbered) and
+    ``_traded`` (every traded bar with its session number): the copy rules count gaps in
+    sessions, not calendar days. Weekdays rather than traded dates, so that a store holding few
+    symbols (a test world, a partial backfill) does not see a whole quiet quarter as one
+    session; exchange holidays count as sessions, which only shifts the thresholds by a day
+    or two a year."""
+    con.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE _sessions AS
+        SELECT session_date, row_number() OVER (ORDER BY session_date) AS n
+        FROM (
+            SELECT unnest(generate_series(lo, hi, INTERVAL 1 DAY))::DATE AS session_date
+            FROM (SELECT min(session_date) AS lo, max(session_date) AS hi
+                  FROM _bars WHERE volume > 0)
+            WHERE lo IS NOT NULL
+        )
+        WHERE dayofweek(session_date) BETWEEN 1 AND 5
+        """
+    )
+    con.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE _traded AS
+        SELECT b.symbol, b.session_date, s.n, b.available_at
+        FROM _bars b JOIN _sessions s USING (session_date) WHERE b.volume > 0
+        """
+    )
+
+
+def _symbol_components(edges: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """Symbol -> representative of its connected component over the linking edges."""
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for e in edges:
+        if not e.get("links", True):
+            continue
+        a, b = find(e["old_symbol"]), find(e["new_symbol"])
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+    return {x: find(x) for x in list(parent)}
 
 
 # -- segments ------------------------------------------------------------------------------------
@@ -417,8 +525,10 @@ def _collapse_when_issued(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _drop_takeovers_without_a_taker(
     edges: list[dict[str, Any]], first_traded: Mapping[str, date], stats: Mapping[str, Any]
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """A rename whose old name never traded here while the new name already did is no event.
+    Returns the edges kept and the ones dropped (the build lists the latter as
+    ``record_without_taker`` conflicts, resolution ``ignored``).
 
     CBS -> VIAC was filed 2020-02-13 for a rename that happened 2019-12-05, before the store
     starts; WORXD -> WORX files the return from a temporary OTC suffix that never traded on
@@ -452,12 +562,11 @@ def _drop_takeovers_without_a_taker(
         and touching[e["old_symbol"]]
         <= {(e["old_symbol"], e["new_symbol"]), (e["new_symbol"], e["old_symbol"])}
     }
-    return [
-        e
-        for e in edges
-        if (e["old_symbol"], e["new_symbol"]) not in dropped
-        and (e["new_symbol"], e["old_symbol"]) not in dropped
-    ]
+    kept, gone = [], []
+    for e in edges:
+        pair = (e["old_symbol"], e["new_symbol"])
+        (gone if pair in dropped or pair[::-1] in dropped else kept).append(e)
+    return kept, gone
 
 
 def _refine_sec_edges(con: duckdb.DuckDBPyConnection, edges: list[dict[str, Any]]) -> None:
@@ -552,6 +661,276 @@ def _refine_alpaca_edges(con: duckdb.DuckDBPyConnection, edges: list[dict[str, A
             e["date"] = new_date
 
 
+def _cik_on(presence: list[tuple[date, int]], day: date) -> set[int]:
+    return {cik for d, cik in presence if d == day}
+
+
+def _mark_conversions(
+    con: duckdb.DuckDBPyConnection,
+    edges: list[dict[str, Any]],
+    presence: Mapping[str, list[tuple[date, int]]],
+) -> None:
+    """Rule B: an Alpaca record whose two names traded side by side right up to the record is a
+    conversion -- the old security became the new one's existing shares (CUK -> CCL: Carnival
+    plc's ADR into Carnival Corp; GNTY -> GBCI: a merger; CWEN.A -> CWEN: a share-class
+    consolidation) -- not a rename. The old label's piece ends at the record; the new label is
+    not cut and the two are not joined.
+
+    Three tests, all on the (refined) record date. Parallel days: at least
+    ``CONVERSION_MIN_DIFFERING_DAYS`` sessions before the record on which both names traded
+    bars that differ on OHLC (identical bars are Alpaca's relabelling, whatever the volume says:
+    FFR -> DTRE). Recency: one of them inside the last ``CONVERSION_WINDOW`` sessions before the
+    record, or the previous holder of the new label had already stopped and the record is a
+    plain rename into a vacated ticker (SCHN -> RDUS: 659 parallel days with Radius Health, a
+    year earlier). Same filer: the new label's SEC CIK is known and equal in the last snapshot
+    before the record and in the first one at least ``SEC_LAG_MAX_DAYS`` after it (the SEC lists
+    the old filer for months: IR -> TT reads unchanged in the first snapshot after the record);
+    when the table has no snapshot that late, the latest one after the record. A changed or
+    unknown CIK means the new label was taken by a new filer (GOLD -> B: Barnes Group's ticker
+    taken by Barrick; COT -> PRMW: the acquirer took the target's ticker) and the record is a
+    rename, handled by the takeover rules. Counted on the whole store 2026-10-17: 45 records
+    with five or more differing parallel days, 30 recent, 15 of those with one filer.
+    """
+    todo = [
+        e
+        for e in edges
+        if e["evidence"] != "sec"
+        and e.get("links", True)
+        and e.get("starts", True)
+        and WHEN_ISSUED.fullmatch(e["old_symbol"]) is None
+    ]
+    if not todo:
+        return
+    con.register(
+        "_conv",
+        pa.table(
+            {
+                "key": pa.array(range(len(todo)), pa.int64()),
+                "old": [e["old_symbol"] for e in todo],
+                "new": [e["new_symbol"] for e in todo],
+                "date": pa.array([e["date"] for e in todo], pa.date32()),
+            }
+        ),
+    )
+    rows = con.execute(
+        f"""
+        WITH ct AS (
+            SELECT * FROM _traded
+            WHERE symbol IN (SELECT old FROM _conv UNION SELECT new FROM _conv)
+        ), since AS (
+            SELECT c.key, (SELECT s.session_date FROM _sessions s WHERE s.session_date < c.date
+                           ORDER BY s.session_date DESC LIMIT 1 OFFSET {CONVERSION_WINDOW - 1}
+                          ) AS since
+            FROM _conv c
+        ), par AS (
+            SELECT c.key, a.session_date,
+                   NOT EXISTS (SELECT 1 FROM _ident i WHERE i.session_date = a.session_date
+                               AND i.symbol_a = least(c.old, c.new)
+                               AND i.symbol_b = greatest(c.old, c.new)) AS differ
+            FROM _conv c
+            JOIN ct a ON a.symbol = c.old AND a.session_date < c.date
+            JOIN ct b ON b.symbol = c.new AND b.session_date = a.session_date
+        )
+        SELECT p.key, count(*) FILTER (WHERE p.differ) AS differing,
+               count(*) FILTER (WHERE p.differ AND p.session_date >= s.since) AS recent
+        FROM par p JOIN since s USING (key) GROUP BY 1
+        """
+    ).fetchall()
+    con.unregister("_conv")
+    counts = {key: (differing, recent) for key, differing, recent in rows}
+    for key, e in enumerate(todo):
+        differing, recent = counts.get(key, (0, 0))
+        if differing < CONVERSION_MIN_DIFFERING_DAYS or not recent:
+            continue
+        rows_of = presence.get(e["new_symbol"], [])
+        before = [d for d, _ in rows_of if d < e["date"]]
+        late = [d for d, _ in rows_of if d >= e["date"] + timedelta(days=SEC_LAG_MAX_DAYS)]
+        after = [d for d, _ in rows_of if d >= e["date"]]
+        if not before or not after:
+            continue
+        cik_before = _cik_on(rows_of, before[-1])
+        # every snapshot late enough must still show the same filer: a lag longer than
+        # SEC_LAG_MAX_DAYS would otherwise read a takeover as a conversion for good
+        late_days = set(late) if late else {after[-1]}
+        cik_after = {cik for d, cik in rows_of if d in late_days}
+        if len(cik_before) == 1 and cik_before == cik_after:
+            e["starts"] = False
+            e["links"] = False
+
+
+def _edges_from_bars(
+    con: duckdb.DuckDBPyConnection, edges: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Rule E: the rename Alpaca did not file. When one name's bars become identical to
+    another's for a run of sessions and then stop while the other trades on, the first name was
+    renamed into the second and Alpaca rewrote the new name's history (CYCN -> KRSA: all 1,662
+    of Cyclerion's bars sit under KRSA too; XPOA -> QBTS: D-Wave's SPAC). The edge is dated the
+    continuer's first traded bar after the run, evidence ``bars``, knowable with that bar.
+    "Stops" means no traded bar within ``RUN_NEAR_SESSIONS`` of the run end: a label that comes
+    back years later under a new holder (EYES, Second Sight's ticker, trading again in 2026)
+    still ended there, and rule O opens the later bars as a new security.
+
+    Conditions, each one separating the 18 renames found on the store (2026-10-16) from the
+    shapes next to them: the run is at least ``RUN_MIN_DAYS`` sessions and ends on the ender's
+    last traded bar; the ender's own bars (in no identical pair with anyone) end within
+    ``RUN_NEAR_SESSIONS`` sessions of the run start, or the run begins on the ender's first bar
+    (CYCN; a label whose every bar copies someone and whose run starts later is a relabelled
+    ghost, not a predecessor); the continuer's first bar is within ``RUN_NEAR_SESSIONS`` of the
+    run start and it had at most max(3, 5%) differing days before the run end (a continuer with
+    a life of its own before -- BNZI under PARA, 893 differing days -- is a stranger whose bars
+    were copied); no edge of any evidence joins the pair already; the pair is unique both ways.
+    A gap between the ender's own bars and the run (AXNX / MIMI) is rule F's shape. Everything
+    that fails stays a ``dup_unlinked`` conflict for a human.
+    """
+    cands = con.execute(
+        f"""
+        WITH pairs AS (
+            SELECT symbol_a, symbol_b, max(session_date) AS last_ident
+            FROM _ident GROUP BY 1, 2 HAVING count(*) >= {RUN_MIN_DAYS}
+        ), pt AS (
+            SELECT * FROM _traded
+            WHERE symbol IN (SELECT symbol_a FROM pairs UNION SELECT symbol_b FROM pairs)
+        ), nxt AS (  -- each name's first session after the run end; NULL: it never trades again
+            SELECT p.*, s.n AS end_n,
+                   (SELECT min(t.n) FROM pt t
+                    WHERE t.symbol = p.symbol_a AND t.session_date > p.last_ident) AS next_a,
+                   (SELECT min(t.n) FROM pt t
+                    WHERE t.symbol = p.symbol_b AND t.session_date > p.last_ident) AS next_b
+            FROM pairs p JOIN _sessions s ON s.session_date = p.last_ident
+        )
+        SELECT CASE WHEN stops_a AND goes_on_b THEN symbol_a
+                    WHEN stops_b AND goes_on_a THEN symbol_b END AS ender,
+               CASE WHEN stops_a AND goes_on_b THEN symbol_b
+                    WHEN stops_b AND goes_on_a THEN symbol_a END AS continuer,
+               last_ident AS run_end
+        FROM (SELECT *,
+                     next_a IS NULL OR next_a - end_n > {RUN_NEAR_SESSIONS} AS stops_a,
+                     next_b IS NULL OR next_b - end_n > {RUN_NEAR_SESSIONS} AS stops_b,
+                     next_a IS NOT NULL AND next_a - end_n <= {RUN_NEAR_SESSIONS} AS goes_on_a,
+                     next_b IS NOT NULL AND next_b - end_n <= {RUN_NEAR_SESSIONS} AS goes_on_b
+              FROM nxt)
+        WHERE ender IS NOT NULL
+        """
+    ).fetchall()
+    if not cands:
+        return []
+    con.register(
+        "_ecand",
+        pa.table(
+            {
+                "key": pa.array(range(len(cands)), pa.int64()),
+                "ender": [c[0] for c in cands],
+                "continuer": [c[1] for c in cands],
+                "run_end": pa.array([c[2] for c in cands], pa.date32()),
+            }
+        ),
+    )
+    rows = con.execute(
+        """
+        WITH et AS (
+            SELECT * FROM _traded
+            WHERE symbol IN (SELECT ender FROM _ecand UNION SELECT continuer FROM _ecand)
+        ), pair_ident AS (  -- identical days of each candidate pair
+            SELECT c.key, i.session_date
+            FROM _ecand c JOIN _ident i
+              ON i.symbol_a = least(c.ender, c.continuer)
+             AND i.symbol_b = greatest(c.ender, c.continuer)
+        ), any_ident AS (  -- days on which a symbol is identical to anyone
+            SELECT symbol_a AS symbol, session_date FROM _ident
+            UNION SELECT symbol_b, session_date FROM _ident
+        ), run AS (
+            SELECT c.key,
+                   (SELECT min(t.session_date) FROM et t
+                    WHERE t.symbol = c.ender AND t.session_date <= c.run_end
+                      AND t.session_date > coalesce(
+                          (SELECT max(u.session_date) FROM et u
+                           WHERE u.symbol = c.ender AND u.session_date <= c.run_end
+                             AND u.session_date NOT IN
+                                 (SELECT session_date FROM pair_ident WHERE key = c.key)),
+                          DATE '1900-01-01')) AS run_start
+            FROM _ecand c
+        )
+        SELECT c.key, r.run_start,
+               (SELECT count(*) FROM et t WHERE t.symbol = c.ender
+                 AND t.session_date BETWEEN r.run_start AND c.run_end) AS run_len,
+               (SELECT min(t.session_date) FROM et t WHERE t.symbol = c.ender) AS ender_first,
+               (SELECT max(t.n) FROM et t WHERE t.symbol = c.ender AND t.session_date < r.run_start
+                 AND NOT EXISTS (SELECT 1 FROM any_ident x
+                                 WHERE x.symbol = t.symbol AND x.session_date = t.session_date)
+               ) AS last_own_n,
+               (SELECT n FROM _sessions WHERE session_date = r.run_start) AS run_start_n,
+               (SELECT min(t.n) FROM et t WHERE t.symbol = c.continuer) AS cont_first_n,
+               (SELECT count(*) FROM et t WHERE t.symbol = c.continuer
+                 AND t.session_date <= c.run_end
+                 AND t.session_date NOT IN (SELECT session_date FROM pair_ident WHERE key = c.key)
+               ) AS cont_differing,
+               (SELECT min(t.session_date) FROM et t WHERE t.symbol = c.continuer
+                 AND t.session_date > c.run_end) AS cut,
+               (SELECT arg_min(t.available_at, t.session_date) FROM et t
+                 WHERE t.symbol = c.continuer AND t.session_date > c.run_end) AS cut_available
+        FROM _ecand c JOIN run r USING (key)
+        """
+    ).to_arrow_table()  # arrow, not fetchall: a TIMESTAMPTZ column would need pytz
+    con.unregister("_ecand")
+    components = _symbol_components(edges)
+    paired = {frozenset((e["old_symbol"], e["new_symbol"])) for e in edges}
+    found: list[dict[str, Any]] = []
+    for row in rows.to_pylist():
+        key, run_start, run_len, ender_first, last_own_n, run_start_n = (
+            row["key"],
+            row["run_start"],
+            row["run_len"],
+            row["ender_first"],
+            row["last_own_n"],
+            row["run_start_n"],
+        )
+        cont_first_n, cont_differing, cut, cut_available = (
+            row["cont_first_n"],
+            row["cont_differing"],
+            row["cut"],
+            row["cut_available"],
+        )
+        ender, continuer, run_end = cands[key]
+        if run_len < RUN_MIN_DAYS or cut is None:
+            continue
+        if WHEN_ISSUED.fullmatch(ender) or WHEN_ISSUED.fullmatch(continuer):
+            continue  # a when-issued name prints the regular share's bars: rule A's shape
+        if last_own_n is None:
+            if run_start != ender_first:
+                continue
+        elif run_start_n - last_own_n > RUN_NEAR_SESSIONS:
+            continue
+        if abs(cont_first_n - run_start_n) > RUN_NEAR_SESSIONS:
+            continue
+        if cont_differing > max(RUN_TOLERANCE[0], RUN_TOLERANCE[1] * run_len):
+            continue
+        if frozenset((ender, continuer)) in paired:
+            continue
+        if components.get(ender, ender) == components.get(continuer, continuer):
+            continue
+        if cut_available.tzinfo is None:
+            cut_available = cut_available.replace(tzinfo=UTC)
+        found.append(
+            {
+                "old_symbol": ender,
+                "new_symbol": continuer,
+                "date": cut,
+                "date_lower": None,
+                "evidence": "bars",
+                "available_at": cut_available,
+                "old_cusip": None,
+                "new_cusip": None,
+            }
+        )
+    unique = [
+        e
+        for e in found
+        if sum(f["old_symbol"] == e["old_symbol"] for f in found) == 1
+        and sum(f["new_symbol"] == e["new_symbol"] for f in found) == 1
+    ]
+    return sorted(unique, key=lambda e: (e["date"], e["old_symbol"], e["new_symbol"]))
+
+
 def _sec_presence(sec_history: pa.Table) -> dict[str, list[tuple[date, int]]]:
     out: dict[str, list[tuple[date, int]]] = {}
     for r in sec_history.select(["snapshot_date", "ticker", "cik"]).to_pylist():
@@ -635,7 +1014,13 @@ def _pieces_for(
         events.append((e.date, 1, e))
     for lower, upper in _cik_switches(presence):
         now = {cik for day, cik in presence if day == upper}
-        explained = any(lower < e.date <= upper and ciks_of.get(e.old, set()) & now for e in starts)
+        # Alpaca may file the record a few days after the snapshot that already shows the new
+        # filer (DPW -> NILE: snapshot 2022-01-03, record 01-04): still the same event.
+        explained = any(
+            lower < e.date <= upper + timedelta(days=MAX_GAP_DAYS)
+            and ciks_of.get(e.old, set()) & now
+            for e in starts
+        )
         if not explained:
             events.append((upper, 2, None))
     # Same day, same kind: the edge that joins a chain goes last, so it is the one the piece
@@ -813,21 +1198,100 @@ def _resumed_pieces(con: duckdb.DuckDBPyConnection, pieces: list[_Segment]) -> l
     return new_pieces
 
 
-def _relabelled_pieces(con: duckdb.DuckDBPyConnection, pieces: list[_Segment]) -> set[int]:
-    """Keys of pieces that are the taker's own history filed under a label it took later.
+def _chain_symbols_without(edges: Sequence[_Edge], start: str, without: str) -> set[str]:
+    """Symbols reachable from ``start`` over linking edges with the node ``without`` removed:
+    the taker's whole chain, seen from outside the label it took."""
+    adjacent: dict[str, set[str]] = {}
+    for e in edges:
+        if e.links:
+            adjacent.setdefault(e.old, set()).add(e.new)
+            adjacent.setdefault(e.new, set()).add(e.old)
+    seen, stack = {start}, [start]
+    while stack:
+        for nxt in adjacent.get(stack.pop(), ()):
+            if nxt != without and nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return seen
+
+
+def _copy_shares(
+    con: duckdb.DuckDBPyConnection, cands: Sequence[tuple[int, str, str, date, date | None]]
+) -> dict[int, tuple[int, int]]:
+    """For candidates ``(key, symbol, other, lo, hi)``: key -> (traded days of ``symbol`` in
+    [lo, hi), days among them identical to any of the key's ``other`` symbols)."""
+    if not cands:
+        return {}
+    con.register(
+        "_copy",
+        pa.table(
+            {
+                "key": pa.array([c[0] for c in cands], pa.int64()),
+                "symbol": [c[1] for c in cands],
+                "other": [c[2] for c in cands],
+                "lo": pa.array([c[3] for c in cands], pa.date32()),
+                "hi": pa.array([c[4] for c in cands], pa.date32()),
+            }
+        ),
+    )
+    traded = dict(
+        con.execute(
+            """
+            SELECT c.key, count(*)
+            FROM (SELECT DISTINCT key, symbol, lo, hi FROM _copy) c
+            JOIN _traded t ON t.symbol = c.symbol AND t.session_date >= c.lo
+             AND (c.hi IS NULL OR t.session_date < c.hi)
+            GROUP BY 1
+            """
+        ).fetchall()
+    )
+    identical = dict(
+        con.execute(
+            """
+            SELECT c.key, count(DISTINCT i.session_date)
+            FROM _copy c JOIN _ident i
+              ON i.symbol_a = least(c.symbol, c.other) AND i.symbol_b = greatest(c.symbol, c.other)
+             AND i.session_date >= c.lo AND (c.hi IS NULL OR i.session_date < c.hi)
+            GROUP BY 1
+            """
+        ).fetchall()
+    )
+    con.unregister("_copy")
+    return {c[0]: (traded.get(c[0], 0), identical.get(c[0], 0)) for c in cands}
+
+
+def _is_copy(traded: int, identical: int) -> bool:
+    return identical >= COPY_MIN_DAYS and identical >= RELABEL_MIN_IDENTICAL * traded
+
+
+def _relabelled_pieces(
+    con: duckdb.DuckDBPyConnection, pieces: list[_Segment], edges: Sequence[_Edge]
+) -> dict[int, int]:
+    """Pieces that are the taker's own history filed under a label it took later: key of the
+    dropped piece -> key of the taker's piece. A dropped piece that was itself opened by a
+    rename record (JCS -> SUNE, found from the bars, while SUNE's label then carried PEGY's
+    bars) hands that record on: the name renamed into the copy was renamed into the chain the
+    copy belongs to, and the build unions the two.
 
     For every takeover (a piece opened by a rename) each earlier piece of the same label is
-    compared with the taker's old name day by day; identical OHLCV on at least
-    ``RELABEL_MIN_IDENTICAL`` of the piece's days means Alpaca relabelling, not a previous
-    holder. Real: BNY carried BK's bars while the SEC listed BNY as a BlackRock fund.
+    compared day by day with the taker's WHOLE chain -- every symbol reachable from the taker's
+    old name over linking edges, the taken label itself left out of the graph (PARA removed,
+    Banzai's chain is {VII, BNZI}; Paramount's PARA piece is compared with both, not with BNZI
+    alone, since Alpaca rewrote PARA with the chain's full history). OHLC-identical days on at
+    least ``RELABEL_MIN_IDENTICAL`` of the piece's traded days (and ``COPY_MIN_DAYS`` of them)
+    mean Alpaca relabelling, not a previous holder. Real: BNY carried BK's bars while the SEC
+    listed BNY as a BlackRock fund.
     """
     by_symbol: dict[str, list[_Segment]] = {}
     for p in pieces:
         by_symbol.setdefault(p.symbol, []).append(p)
-    cands: list[tuple[int, str, str, date, date, int]] = []
+    cands: list[tuple[int, str, str, date, date | None]] = []
+    cand_takers: list[int] = []
+    by_construction: dict[int, int] = {}
     for p in pieces:
         if p.start is None or p.valid_from is None:
             continue
+        chain = _chain_symbols_without(edges, p.start.old, p.symbol)
         for q in by_symbol[p.symbol]:
             if q.valid_from is None or q.valid_to is None or not q.n_bars:
                 continue
@@ -840,39 +1304,256 @@ def _relabelled_pieces(con: duckdb.DuckDBPyConnection, pieces: list[_Segment]) -
                 q.start is not None and q.start.old == p.start.old
             ):
                 continue
-            cands.append((q.key, q.symbol, p.start.old, q.valid_from, q.valid_to, q.n_bars))
-    if not cands:
-        return set()
+            if p.start.evidence == "bars" and q.valid_to == p.valid_from and q.start is None:
+                # rule E already established that the label's bars up to the cut are the
+                # ender's: its opening piece is the copy, whatever its few own days weigh
+                by_construction[q.key] = p.key
+                continue
+            for other in sorted(chain):
+                if other != q.symbol:
+                    cands.append((q.key, q.symbol, other, q.valid_from, q.valid_to))
+                    cand_takers.append(p.key)
+    taker_of = {c[0]: p_key for c, p_key in zip(cands, cand_takers, strict=True)}
+    shares = _copy_shares(con, cands)
+    return by_construction | {
+        key: taker_of[key]
+        for key, (traded, identical) in shares.items()
+        if _is_copy(traded, identical)
+    }
+
+
+def _clip_identical_overlaps(
+    con: duckdb.DuckDBPyConnection, pieces: list[_Segment], chain_of: Mapping[int, int]
+) -> None:
+    """Rule C: two pieces of one chain overlap in time and the earlier label's traded bars
+    inside the overlap are copies of the later label's (AZRX / FWBI, 181 days: Alpaca kept
+    filing the new name's bars under the old one past the switch) -> the earlier piece ends
+    where the later one begins, knowable with it. A non-identical overlap (two names really
+    trading side by side) is left alone: that is rule B's shape or a conflict."""
+    by_chain: dict[int, list[_Segment]] = {}
+    for p in pieces:
+        by_chain.setdefault(chain_of[p.key], []).append(p)
+    cands: list[tuple[int, str, str, date, date | None]] = []
+    overlaps: list[tuple[_Segment, _Segment]] = []  # (earlier, later), same order as cands
+    for members in by_chain.values():
+        for a in members:
+            for b in members:
+                if (
+                    a is b
+                    or a.symbol == b.symbol
+                    or a.valid_from is None
+                    or b.valid_from is None
+                    or not (a.valid_from < b.valid_from < (a.valid_to or date.max))
+                ):
+                    continue
+                hi = min(a.valid_to or date.max, b.valid_to or date.max)
+                cands.append(
+                    (len(cands), a.symbol, b.symbol, b.valid_from, None if hi == date.max else hi)
+                )
+                overlaps.append((a, b))
+    shares = _copy_shares(con, cands)
+    for key, (a, b) in sorted(enumerate(overlaps), key=lambda t: t[1][1].valid_from or date.min):
+        if a.valid_to is not None and b.valid_from is not None and a.valid_to <= b.valid_from:
+            continue  # already clipped at an earlier overlap
+        if _is_copy(*shares.get(key, (0, 0))):
+            a.valid_to, a.end, a.end_available_at = b.valid_from, None, b.available_at
+
+
+def _cut_copied_tails(
+    con: duckdb.DuckDBPyConnection,
+    pieces: list[_Segment],
+    presence: Mapping[str, list[tuple[date, int]]],
+    snapshots: Sequence[date],
+    chain_of: Mapping[int, int],
+) -> set[int]:
+    """Rule F: a piece whose trailing traded bars are copies of another security's, after the
+    holder itself stopped -- the tail begins either after a gap of more than
+    ``TAIL_GAP_SESSIONS`` sessions in the label's trading (AXNX: Axonics was bought in 2024-11,
+    MIMI's bars sit under the label from 2025-01) or once the piece's filer leaves the SEC table
+    (VJET: Voxeljet's own bars stop 2024-03-22, VTAK's copies begin 03-25, the SEC lists VJET
+    once more on 04-01 and never again; the tail may start in the filer's last snapshot
+    interval). The piece ends on the tail's first day, knowable with that bar; the tail owns
+    nothing (the loss metric names it; the other label owns the same bars under its own name).
+    A tail identical to a symbol of the piece's own chain is a late-filed rename, not a copy.
+
+    The tail is the earliest traded bar from which the rest of the piece is at least
+    ``RELABEL_MIN_IDENTICAL`` identical to one other symbol (``COPY_MIN_DAYS`` at least) and
+    whose previous bar is not; a piece that copies from its first bar is rule Z's or the relabel
+    rule's, never cut here. The other side is a whole chain (a tail that copies VII and then
+    BNZI is Banzai's), never the piece's own chain. Returns the keys of the pieces cut."""
     con.register(
-        "_cands",
+        "_fchain",
         pa.table(
             {
-                "key": pa.array([c[0] for c in cands], pa.int64()),
-                "symbol": [c[1] for c in cands],
-                "other": [c[2] for c in cands],
-                "lo": pa.array([c[3] for c in cands], pa.date32()),
-                "hi": pa.array([c[4] for c in cands], pa.date32()),
+                "symbol": [p.symbol for p in pieces],
+                "chain": pa.array([chain_of[p.key] for p in pieces], pa.int64()),
+            }
+        ),
+    )
+    con.register(
+        "_fp",
+        pa.table(
+            {
+                "key": pa.array([p.key for p in pieces], pa.int64()),
+                "symbol": [p.symbol for p in pieces],
+                "lo": pa.array([p.valid_from for p in pieces], pa.date32()),
+                "hi": pa.array([p.valid_to for p in pieces], pa.date32()),
             }
         ),
     )
     rows = con.execute(
+        f"""
+        WITH ident_days AS (  -- (piece, other chain, day) identical inside the piece
+            SELECT DISTINCT p.key, p.symbol, c.chain AS other, i.session_date
+            FROM _fp p JOIN _ident i
+              ON (i.symbol_a = p.symbol OR i.symbol_b = p.symbol)
+             AND i.session_date >= p.lo AND (p.hi IS NULL OR i.session_date < p.hi)
+            JOIN _fchain c
+              ON c.symbol = CASE WHEN i.symbol_a = p.symbol THEN i.symbol_b ELSE i.symbol_a END
+        ), others AS (  -- (piece, other chain) with enough identical days inside the piece
+            SELECT key, symbol, other FROM ident_days
+            GROUP BY ALL HAVING count(*) >= {COPY_MIN_DAYS}
+        ), bars AS (
+            SELECT o.key, o.other, t.session_date, t.n, t.available_at,
+                   EXISTS (SELECT 1 FROM ident_days d WHERE d.key = o.key AND d.other = o.other
+                           AND d.session_date = t.session_date) AS ident
+            FROM others o JOIN _fp p USING (key)
+            JOIN _traded t ON t.symbol = p.symbol AND t.session_date >= p.lo
+             AND (p.hi IS NULL OR t.session_date < p.hi)
+        ), suffix AS (
+            SELECT *,
+                   sum(ident::INT) OVER w AS suffix_identical, count(*) OVER w AS suffix_n,
+                   lag(n) OVER (PARTITION BY key, other ORDER BY session_date) AS prev_n,
+                   lag(ident) OVER (PARTITION BY key, other ORDER BY session_date) AS prev_ident
+            FROM bars
+            WINDOW w AS (PARTITION BY key, other ORDER BY session_date DESC
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+        )
+        SELECT key, other, arg_min(session_date, session_date) AS tail_start,
+               arg_min(n, session_date) AS tail_n, arg_min(prev_n, session_date) AS prev_n,
+               arg_min(available_at, session_date) AS tail_available
+        FROM suffix
+        WHERE ident AND NOT prev_ident AND prev_n IS NOT NULL
+          AND suffix_identical >= {COPY_MIN_DAYS}
+          AND suffix_identical >= {RELABEL_MIN_IDENTICAL} * suffix_n
+        GROUP BY 1, 2
         """
-        SELECT c.key, count(*)
-        FROM _cands c
-        JOIN _bars a ON a.symbol = c.symbol AND a.session_date >= c.lo AND a.session_date < c.hi
-        JOIN _bars b ON b.symbol = c.other AND b.session_date = a.session_date
-         AND b.open = a.open AND b.high = a.high AND b.low = a.low
-         AND b.close = a.close AND b.volume = a.volume
-        GROUP BY 1
-        """
-    ).fetchall()
-    con.unregister("_cands")
-    identical = dict(rows)
-    return {
-        key
-        for key, _s, _o, _lo, _hi, n_bars in cands
-        if identical.get(key, 0) >= RELABEL_MIN_IDENTICAL * n_bars
-    }
+    ).to_arrow_table()  # arrow, not fetchall: the TIMESTAMPTZ column would need pytz
+    con.unregister("_fp")
+    con.unregister("_fchain")
+    by_key = {p.key: p for p in pieces}
+    snapshot_list = sorted(set(snapshots))
+    cuts: dict[int, tuple[date, datetime]] = {}
+    for row in rows.to_pylist():
+        key, other, tail_start = row["key"], row["other"], row["tail_start"]
+        tail_n, prev_n, tail_available = row["tail_n"], row["prev_n"], row["tail_available"]
+        piece = by_key[key]
+        if other == chain_of[key]:
+            continue
+        gap = tail_n - prev_n > TAIL_GAP_SESSIONS
+        left = False
+        if piece.cik is not None and snapshot_list:
+            seen = [d for d, cik in presence.get(piece.symbol, []) if cik == piece.cik]
+            if seen and seen[-1] < snapshot_list[-1]:
+                earlier = [d for d in snapshot_list if d < seen[-1]]
+                left = tail_start >= (earlier[-1] if earlier else seen[-1])
+        if not (gap or left):
+            continue
+        if key not in cuts or tail_start < cuts[key][0]:
+            cuts[key] = (tail_start, tail_available)
+    cut_keys: set[int] = set()
+    for key, (tail_start, tail_available) in cuts.items():
+        piece = by_key[key]
+        if piece.valid_from is not None and tail_start <= piece.valid_from:
+            continue
+        piece.valid_to = tail_start
+        piece.end = None
+        piece.end_available_at = (
+            tail_available.replace(tzinfo=UTC) if tail_available.tzinfo is None else tail_available
+        )
+        cut_keys.add(key)
+    return cut_keys
+
+
+def _drop_copied_pieces(
+    con: duckdb.DuckDBPyConnection, pieces: list[_Segment], chain_of: Mapping[int, int]
+) -> set[int]:
+    """Rule Z: keys of pieces that are relabelled history of another chain. (a) A label held by
+    two or more securities whose earlier holder's traded bars are copies of the latest holder's
+    chain (BTLN: the old filer's 1,289 bars are VRAR's and GGRP's, Glimpse's chain, which now
+    holds BTLN) -- Alpaca rewrote the label's past with the current holder's history. (b) A
+    piece opened by bars resuming under a closed label (rule O) that copies a stranger (the
+    VJET ghost): the resumed bars are the stranger's, not a new holder's."""
+    by_symbol: dict[str, list[_Segment]] = {}
+    for p in pieces:
+        by_symbol.setdefault(p.symbol, []).append(p)
+    symbols_of_chain: dict[int, set[str]] = {}
+    for p in pieces:
+        symbols_of_chain.setdefault(chain_of[p.key], set()).add(p.symbol)
+    cands: list[tuple[int, str, str, date, date | None]] = []
+    for members in by_symbol.values():
+        chains = {chain_of[p.key] for p in members}
+        if len(chains) < 2:
+            continue
+        latest = chain_of[max(members, key=lambda p: p.valid_from or date.min).key]
+        for q in members:
+            if chain_of[q.key] == latest or q.valid_from is None:
+                continue
+            for other in sorted(symbols_of_chain[latest] - {q.symbol}):
+                cands.append((q.key, q.symbol, other, q.valid_from, q.valid_to))
+    shares = _copy_shares(con, cands)
+    dropped = {key for key, (traded, identical) in shares.items() if _is_copy(traded, identical)}
+
+    resumed = [p for p in pieces if p.resumed and p.valid_from is not None and p.key not in dropped]
+    if resumed:
+        con.register(
+            "_zres",
+            pa.table(
+                {
+                    "key": pa.array([p.key for p in resumed], pa.int64()),
+                    "symbol": [p.symbol for p in resumed],
+                    "lo": pa.array([p.valid_from for p in resumed], pa.date32()),
+                    "hi": pa.array([p.valid_to for p in resumed], pa.date32()),
+                }
+            ),
+        )
+        con.register(
+            "_zchain",
+            pa.table(
+                {
+                    "key": pa.array(
+                        [p.key for p in resumed for _ in symbols_of_chain[chain_of[p.key]]],
+                        pa.int64(),
+                    ),
+                    "symbol": [
+                        s for p in resumed for s in sorted(symbols_of_chain[chain_of[p.key]])
+                    ],
+                }
+            ),
+        )
+        rows = con.execute(
+            """
+            WITH traded AS (
+                SELECT p.key, count(*) AS n
+                FROM _zres p JOIN _traded t ON t.symbol = p.symbol AND t.session_date >= p.lo
+                 AND (p.hi IS NULL OR t.session_date < p.hi)
+                GROUP BY 1
+            ), copied AS (
+                SELECT p.key, count(DISTINCT i.session_date) AS n
+                FROM _zres p JOIN _ident i
+                  ON (i.symbol_a = p.symbol OR i.symbol_b = p.symbol)
+                 AND i.session_date >= p.lo AND (p.hi IS NULL OR i.session_date < p.hi)
+                WHERE (CASE WHEN i.symbol_a = p.symbol THEN i.symbol_b ELSE i.symbol_a END)
+                      NOT IN (SELECT symbol FROM _zchain z WHERE z.key = p.key)
+                GROUP BY 1
+            )
+            SELECT t.key, t.n, coalesce(c.n, 0) FROM traded t LEFT JOIN copied c USING (key)
+            """
+        ).fetchall()
+        con.unregister("_zres")
+        con.unregister("_zchain")
+        dropped |= {key for key, traded, identical in rows if _is_copy(traded, identical)}
+    return dropped
 
 
 def _closes_around(
@@ -971,10 +1652,13 @@ def build_security_master(
     try:
         con.execute("SET TimeZone = 'UTC'")
         con.register("_bars", bars)
+        _register_sessions(con)
+        con.register("_ident", identical_days(bars, con))
         stats = _symbol_stats(con)
         first_traded = _first_traded(con)
         sec = drop_table_corrections(normalize_spelling(sec_history, stats))
         presence = _sec_presence(sec)
+        snapshots = sorted(set(sec.column("snapshot_date").to_pylist()))
         ciks_of = {symbol: {cik for _, cik in rows} for symbol, rows in presence.items()}
 
         edge_rows = merge_edges(
@@ -982,9 +1666,11 @@ def build_security_master(
         ).to_pylist()
         edge_rows = [e for e in edge_rows if e["old_symbol"] in stats or e["new_symbol"] in stats]
         edge_rows = _collapse_when_issued(edge_rows)
-        edge_rows = _drop_takeovers_without_a_taker(edge_rows, first_traded, stats)
+        edge_rows, no_taker = _drop_takeovers_without_a_taker(edge_rows, first_traded, stats)
         _refine_sec_edges(con, edge_rows)
         _refine_alpaca_edges(con, edge_rows)
+        _mark_conversions(con, edge_rows, presence)
+        edge_rows += _edges_from_bars(con, edge_rows)
         edges = [
             _Edge(
                 e["old_symbol"],
@@ -1001,7 +1687,7 @@ def build_security_master(
         ]
         # pairs a when-issued record explains; a linking edge that failed to join its two
         # pieces must still surface as dup_unlinked
-        edge_pairs = {frozenset((e.old, e.new)) for e in edges if not e.links}
+        edge_pairs = {frozenset((e.old, e.new)) for e in edges if not e.links and e.starts}
         starts: dict[str, list[_Edge]] = {}
         ends: dict[str, list[_Edge]] = {}
         for e in edges:
@@ -1031,7 +1717,21 @@ def build_security_master(
             p.key = len(pieces)
             pieces.append(p)
         _fill_bar_stats(con, resumed)
-        relabelled = _relabelled_pieces(con, pieces)
+        relabelled = _relabelled_pieces(con, pieces, edges)
+        by_key = {p.key: p for p in pieces}
+        # A bar-evidence edge that opened a dropped copy leads into the taker's chain: the E
+        # edge JCS -> SUNE says JCS's bars continue under SUNE, and SUNE's piece is PEGY's bars,
+        # so JCS joins PEGY. Only for edges read off the bars: a filed record into a label whose
+        # history a later holder overwrote (VIAC -> PARA, PARA's piece being Banzai's bars) is
+        # about the earlier company and must not pull it into the later one's chain.
+        handed_on = []
+        for q_key, p_key in relabelled.items():
+            start = by_key[q_key].start
+            if start is None or not start.links or start.evidence != "bars":
+                continue
+            while p_key in relabelled:  # the taker itself a copy of a later holder's chain
+                p_key = relabelled[p_key]
+            handed_on.append((start, by_key[p_key]))
         pieces = [p for p in pieces if p.key not in relabelled]
         for i, p in enumerate(pieces):
             p.key = i
@@ -1048,13 +1748,41 @@ def build_security_master(
         by_start = {(p.symbol, p.valid_from): p for p in pieces if p.start is not None or p.cik_cut}
         by_end = {(p.symbol, p.valid_to): p for p in pieces if p.valid_to is not None}
         uf = _Union(len(pieces))
-        conflicts: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = [
+            {
+                "kind": "record_without_taker",
+                "symbols": [e["old_symbol"], e["new_symbol"]],
+                "dates": [e["date"]],
+                "detail": f"{e['old_symbol']} never traded here while {e['new_symbol']} did: "
+                "not an event (rule V)",
+                "resolution": "ignored",
+            }
+            for e in no_taker
+        ]
+        conflicts += [
+            {
+                "kind": "bars_edge",
+                "symbols": [e.old, e.new],
+                "dates": [e.date],
+                "detail": f"{e.old} -> {e.new} read off identical bars (rule E), no record",
+                "resolution": "bridged",
+            }
+            for e in edges
+            if e.evidence == "bars"
+        ]
+        # reuse_looks_continuous rows are only true while the previous holder's piece still
+        # ends at the cut; the copy rules below may end or drop it (index, piece, cut)
+        reuses: list[tuple[int, _Segment, date]] = []
         for e in edges:
             a, b = by_end.get((e.old, e.date)), by_start.get((e.new, e.date))
             # Two edges may start one label on one day (HWM.WI -> HWM and ARNC -> HWM, both
             # 2020-04-01); the piece belongs to the day, whichever edge created it.
             if a is not None and b is not None and a.end is e and e.links:
                 uf.union(a.key, b.key)
+        for edge, taker in handed_on:
+            a = by_end.get((edge.old, edge.date))  # type: ignore[union-attr]
+            if a is not None and a.end is edge:
+                uf.union(a.key, taker.key)
 
         # CIK switches inside one label and takeovers of a label still in use: bridge or report
         # by looking at the prices on both sides of the cut.
@@ -1074,6 +1802,7 @@ def build_security_master(
                 # is another filer however close the prices: never bridged, reported if close.
                 if _continuous(around[(symbol, cut)]):
                     d0, c0, d1, c1 = around[(symbol, cut)]
+                    reuses.append((len(conflicts), before, cut))
                     conflicts.append(
                         {
                             "kind": "reuse_looks_continuous",
@@ -1081,19 +1810,30 @@ def build_security_master(
                             "dates": [d for d in (d0, cut, d1) if d is not None],
                             "detail": f"cik {before.cik} -> {after.cik} after {symbol} -> "
                             f"{before.end.new}, close {c0} -> {c1}: relabelled?",
+                            "resolution": "unresolved",
                         }
                     )
                 continue
+            d0, c0, d1, c1 = around[(symbol, cut)]
             if _continuous(around[(symbol, cut)]):
                 uf.union(before.key, after.key)
+                conflicts.append(
+                    {
+                        "kind": "cik_switch_bridged",
+                        "symbols": [symbol],
+                        "dates": [d for d in (d0, cut, d1) if d is not None],
+                        "detail": f"cik {before.cik} -> {after.cik}, close {c0} -> {c1}",
+                        "resolution": "bridged",
+                    }
+                )
             else:
-                d0, c0, d1, c1 = around[(symbol, cut)]
                 conflicts.append(
                     {
                         "kind": "cik_switch_discontinuous",
                         "symbols": [symbol],
                         "dates": [d for d in (d0, cut, d1) if d is not None],
                         "detail": f"cik {before.cik} -> {after.cik}, close {c0} -> {c1}",
+                        "resolution": "new_security",
                     }
                 )
         for symbol, cut in takeovers:
@@ -1104,6 +1844,7 @@ def build_security_master(
             if before.cik is not None and before.cik == after.cik:
                 uf.union(before.key, after.key)  # temporary ticker, SPAC completion, ...
             else:
+                reuses.append((len(conflicts), before, cut))
                 conflicts.append(
                     {
                         "kind": "reuse_looks_continuous",
@@ -1111,8 +1852,25 @@ def build_security_master(
                         "dates": [d for d in (d0, cut, d1) if d is not None],
                         "detail": f"cik {before.cik} -> {after.cik}, close {c0} -> {c1}: "
                         "relabelled?",
+                        "resolution": "unresolved",
                     }
                 )
+
+        # Copy rules on the chained pieces: all three read the identical-day table built once
+        # above. C clips a copied overlap inside a chain, F ends a piece where a copied tail
+        # begins, Z drops pieces that are another chain's relabelled history.
+        chain_of = {p.key: uf.find(p.key) for p in pieces}
+        _clip_identical_overlaps(con, pieces, chain_of)
+        tails_cut = _cut_copied_tails(con, pieces, presence, snapshots, chain_of)
+        gone = _drop_copied_pieces(con, pieces, chain_of)
+        pieces = [p for p in pieces if p.key not in gone]
+        # C clips inside one chain, so the price comparison at the takeover still stands
+        stale = {
+            index
+            for index, before, cut in reuses
+            if before.key in gone or (before.key in tails_cut and before.valid_to != cut)
+        }
+        conflicts = [c for i, c in enumerate(conflicts) if i not in stale]
 
         overridden: set[int] = set()
         for o in overrides:
@@ -1157,8 +1915,19 @@ def build_security_master(
         sids_by_symbol: dict[str, set[str]] = {}
         for p in pieces:
             sids_by_symbol.setdefault(p.symbol, set()).add(sid[p.chain])
-        for r in ohlcv_duplicates(bars, con).to_pylist():
+        owned = pa.table(
+            {
+                "symbol": [p.symbol for p in pieces],
+                "lo": pa.array([p.valid_from for p in pieces], pa.date32()),
+                "hi": pa.array([p.valid_to for p in pieces], pa.date32()),
+            }
+        )
+        for r in ohlcv_duplicates(bars, con, owned).to_pylist():
             a, b = r["symbol_a"], r["symbol_b"]
+            if r["days"] < DUP_MIN_DAYS:
+                continue
+            if WHEN_ISSUED.fullmatch(a) or WHEN_ISSUED.fullmatch(b):
+                continue  # a when-issued name prints the regular share's bars by construction
             if sids_by_symbol.get(a, set()) & sids_by_symbol.get(b, set()):
                 continue
             if frozenset((a, b)) in edge_pairs:
@@ -1169,6 +1938,7 @@ def build_security_master(
                     "symbols": [a, b],
                     "dates": [],
                     "detail": f"{r['days']} days of identical OHLCV, no rename links them",
+                    "resolution": "unresolved",
                 }
             )
     finally:
@@ -1221,14 +1991,36 @@ def build_from_store(
     market_root: Path, overrides: Sequence[Mapping[str, Any]] = ()
 ) -> tuple[pa.Table, pa.Table]:
     """Build from the daily bars, the SEC history and the Alpaca name changes on disk."""
+    # Imported bars override the vendor's row of the same (symbol, t), exactly as the read path
+    # serves them (PARA 2022-02..2025-08 is Paramount from Yahoo, not Alpaca's Banzai copies):
+    # a master built on the vendor's rows alone would judge Paramount's piece on Banzai's bars.
+    from asof.store.market import bar_files, bars_source_sql  # noqa: PLC0415  (market imports us)
+
+    alpaca_files, ext_files = bar_files(market_root, "1Day")
     con = duckdb.connect()
     try:
         con.execute("SET TimeZone = 'UTC'")
-        bars_glob = str(market_root / "bars_1d" / "**" / "*.parquet").replace("'", "''")
-        bars = con.execute(
-            "SELECT symbol, session_date, open, high, low, close, volume, available_at "
-            f"FROM read_parquet('{bars_glob}')"
-        ).to_arrow_table()
+        columns = "symbol, session_date, open, high, low, close, volume, available_at"
+        if alpaca_files or ext_files:
+            bars = con.execute(
+                f"SELECT {columns} FROM ({bars_source_sql(alpaca_files, ext_files)})"
+            ).to_arrow_table()
+        else:
+            bars = pa.Table.from_pylist(
+                [],
+                schema=pa.schema(
+                    [
+                        ("symbol", pa.string()),
+                        ("session_date", pa.date32()),
+                        ("open", pa.float64()),
+                        ("high", pa.float64()),
+                        ("low", pa.float64()),
+                        ("close", pa.float64()),
+                        ("volume", pa.int64()),
+                        ("available_at", TS_UTC),
+                    ]
+                ),
+            )
         sec = pq.read_table(market_root / "symbols" / "sec_history.parquet")
         changes_path = market_root / "corporate_actions" / "name_changes.parquet"
         name_changes = (

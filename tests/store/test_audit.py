@@ -115,6 +115,8 @@ GATES: dict[str, str | None] = {
     "M4": "all",
     "M5": "liquid",
     "M6": "liquid",
+    "M7": "liquid",  # old-holder segment partly copies of the label's latest holder (6-b-2)
+    "M8": None,  # identity decisions the build settled: informational
     "I1": None,
     "I2": "liquid",
     "I3": "liquid",
@@ -316,8 +318,20 @@ def rename(old: str, new: str, process_date: date) -> dict[str, Any]:
     }
 
 
-def conflict(kind: str, symbols: Sequence[str], dates: Sequence[date], detail: str) -> dict:
-    return {"kind": kind, "symbols": list(symbols), "dates": list(dates), "detail": detail}
+def conflict(
+    kind: str,
+    symbols: Sequence[str],
+    dates: Sequence[date],
+    detail: str,
+    resolution: str = "unresolved",
+) -> dict:
+    return {
+        "kind": kind,
+        "symbols": list(symbols),
+        "dates": list(dates),
+        "detail": detail,
+        "resolution": resolution,
+    }
 
 
 def _write(path: Path, table: pa.Table) -> Path:
@@ -485,6 +499,8 @@ SAMPLE_KEYS = {
     "M4": "BBB:2016-01-04",
     "M5": "BBB:2016-01-04",
     "M6": "AAA/QQQ:dup_unlinked:2020-01-02,2020-01-03",
+    "M7": "S000008:LBL:2020-01-02",
+    "M8": "PPP:cik_switch_discontinuous:2020-01-07,2020-01-08,2020-01-08",
     "I1": "ORPH",
     "I2": "AAA/BBB",
     "I3": "S000001",
@@ -524,6 +540,9 @@ def test_key_pattern_accepts_the_documented_key_shape(check_id: str) -> None:
         ("I1", "AAA:2020-01-07"),
         ("N1", "CCC:2020-03-08"),
         ("C2", "NOBL:2020-01-07"),
+        ("M7", "LBL:2020-01-02"),  # the security id is part of the key
+        ("M7", "S000008:LBL"),
+        ("M8", "PPP:cik_switch_discontinuous"),  # dates missing
     ],
 )
 def test_key_pattern_rejects_other_shapes(check_id: str, bad: str) -> None:
@@ -1448,11 +1467,23 @@ def test_m6_identity_conflicts_are_listed_one_row_each(
     world.conflicts = [
         conflict("dup_unlinked", ["AAA", "QQQ"], [DAYS[0], DAYS[1]], "2 identical days"),
         conflict("reuse_looks_continuous", ["PPP"], [DAYS[4]], "ratio 1.01 across the reuse"),
+        # settled by the build (6-b-2, G): informational, listed by M8 and never by M6
+        conflict(
+            "cik_switch_discontinuous",
+            ["RRR"],
+            [DAYS[3], DAYS[4], DAYS[4]],
+            "cik 1 -> 2, close None -> 5",
+            resolution="new_security",
+        ),
     ]
 
-    result = world.audit(con, checks=["M6"])["M6"]
+    results = world.audit(con, checks=["M6", "M8"])
+    result = results["M6"]
 
     assert result.rows.schema.names == [*HEAD, "kind", "symbols", "dates", "detail"]
+    assert keys(results["M8"]) == [
+        f"RRR:cik_switch_discontinuous:{iso(DAYS[3])},{iso(DAYS[4])},{iso(DAYS[4])}"
+    ]
     assert rows(result) == [
         {
             "key": f"AAA/QQQ:dup_unlinked:{iso(DAYS[0])},{iso(DAYS[1])}",
@@ -1483,6 +1514,174 @@ def test_m6_identity_conflicts_are_listed_one_row_each(
     assert excepted.fails("liquid") is False and excepted.fails("all") is True
     world.conflicts = None  # no file at all
     assert rows(world.audit(con, checks=["M6"])["M6"]) == []
+
+
+# =============================================================================================
+# M7 / M8 (6-b-2): copies of the latest holder, and settled identity decisions
+# =============================================================================================
+
+
+def copies_world(world: World, *, old_days: int, copied: int) -> str:
+    """Label LBL changes hands on DAYS[old_days]: the old holder SID_X1 (renamed to OLDX that
+    day) and the latest holder SID_X2, which carried PREV before. LBL's old-holder bars copy
+    PREV's on ``copied`` of their ``old_days`` traded days (the relabelling the Z rule of the
+    build is about); LBL's bars under the latest holder copy OLDX's (never reported: the
+    latest holder is the one the label's history was rewritten for). Returns the M7 key."""
+    cut = DAYS[old_days]
+    world.segs += [
+        Seg(SID_X1, "LBL", DAYS[0], cut, avail(DAYS[0]), known(cut), cik=2001),
+        Seg(SID_X1, "OLDX", cut, None, known(cut), cik=2001),
+        Seg(SID_X2, "PREV", START, cut, KNOWN_EARLY, known(cut), cik=2002),
+        Seg(SID_X2, "LBL", cut, None, known(cut), cik=2002),
+    ]
+    prev = series("PREV", DAYS[:old_days], 40.0, 9_000)
+    lbl = series("LBL", DAYS[:old_days], 25.0, 8_000)
+    for d in DAYS[:copied]:
+        lbl = replace(lbl, "LBL", d, {**find(prev, "PREV", d), "symbol": "LBL"})
+    oldx = series("OLDX", DAYS[old_days:], 26.0, 8_500, start=old_days)
+    world.bars += prev + lbl + oldx + relabel(oldx, "LBL")
+    world.liquid_ids.add(SID_X2)
+    return f"{SID_X1}:LBL:{iso(DAYS[0])}"
+
+
+def test_m7_old_holder_segment_partly_copies_of_the_latest_holders_chain(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    # M7. 10 of the old holder's 20 traded days under LBL are PREV's bars (the latest holder's
+    # chain): share 0.5, reported against the old-holder segment. The latest holder's own LBL
+    # segment copies OLDX on every day and is not a row. Liquid because LBL is a liquid symbol
+    # (SID_X2 is in the tier).
+    key = copies_world(world, old_days=20, copied=10)
+
+    result = world.audit(con, checks=["M7"])["M7"]
+
+    assert result.spec.gate == "liquid"
+    assert result.rows.schema.names == [
+        *HEAD,
+        "security_id",
+        "symbol",
+        "valid_from",
+        "valid_to",
+        "latest_security",
+        "traded_days",
+        "copied_days",
+        "share",
+    ]
+    assert rows(result) == [
+        {
+            "key": key,
+            "in_liquid": True,
+            "excepted": False,
+            "security_id": SID_X1,
+            "symbol": "LBL",
+            "valid_from": DAYS[0],
+            "valid_to": DAYS[20],
+            "latest_security": SID_X2,
+            "traded_days": 20,
+            "copied_days": 10,
+            "share": 0.5,
+        }
+    ]
+    assert result.fails("liquid") is True
+    excepted = world.audit(con, checks=["M7"], exceptions=[exc("M7", key)])["M7"]
+    assert (excepted.liquid, excepted.total, excepted.excepted) == (0, 0, 1)
+    assert excepted.fails("liquid") is False and excepted.fails("all") is False
+
+
+@pytest.mark.parametrize(
+    ("old_days", "copied", "reported"),
+    [(24, 3, True), (24, 2, False)],
+    ids=["three_of_24", "two_of_24"],
+)
+def test_m7_reports_from_three_copied_days(
+    con: duckdb.DuckDBPyConnection, world: World, old_days: int, copied: int, reported: bool
+) -> None:
+    # 3 of 24 = 0.125 is reported (>= COPY_SHARE_WARN); 2 of 24 is not, and 2 of 20 = 0.10
+    # would not be either: fewer than COPY_MIN_DAYS (3) copied days are the H-cluster
+    # coincidence, not a rewritten history. (The 25-session world cannot hold the exact 0.10
+    # boundary with three copies; the constants are pinned instead.)
+    from asof.ingest.security_master import COPY_MIN_DAYS
+    from asof.store.audit import COPY_SHARE_WARN
+
+    assert (COPY_SHARE_WARN, COPY_MIN_DAYS) == (0.10, 3)
+    key = copies_world(world, old_days=old_days, copied=copied)
+
+    result = world.audit(con, checks=["M7"])["M7"]
+
+    if reported:
+        [row] = rows(result)
+        assert (row["key"], row["traded_days"], row["copied_days"]) == (key, 24, 3)
+        assert row["share"] == pytest.approx(0.125)
+    else:
+        assert rows(result) == []
+
+
+def test_m7_label_with_one_security_is_never_reported(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    # SOLO's bars are AAA's bars relabelled on every day, but SOLO has one security: nothing
+    # to compare it with (I2 / N3 see the pair; M7 is about labels that changed hands).
+    world.segs.append(Seg("S000011", "SOLO", DAYS[0], None, avail(DAYS[0]), cik=2011))
+    world.bars += relabel(series("AAA", DAYS, 100.0, 30_000), "SOLO")
+
+    assert rows(world.audit(con, checks=["M7"])["M7"]) == []
+
+
+def test_m7_latest_holders_own_segment_is_never_reported(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    # The old holder copies nothing; the latest holder's LBL bars copy OLDX (the old holder's
+    # chain) on every day. No row: only non-latest segments are candidates.
+    copies_world(world, old_days=20, copied=0)
+
+    assert rows(world.audit(con, checks=["M7"])["M7"]) == []
+
+
+def test_m8_lists_the_conflicts_the_build_settled_with_their_resolution(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    # M8 (gate None): every conflict row with a resolution other than "unresolved", keyed like
+    # M6 and carrying the resolution; the unresolved rows are M6's and never appear here.
+    world.conflicts = [
+        conflict(
+            "cik_switch_discontinuous",
+            ["PPP"],
+            [DAYS[3], DAYS[4], DAYS[4]],
+            "cik 1 -> 2, close None -> 5",
+            resolution="new_security",
+        ),
+        conflict(
+            "cik_switch_bridged",
+            ["AAA"],
+            [DAYS[3], DAYS[4], DAYS[4]],
+            "cik 1 -> 2, close 100.0 -> 100.5",
+            resolution="bridged",
+        ),
+        conflict(
+            "record_without_taker",
+            ["CBS", "VIAC"],
+            [DAYS[6]],
+            "CBS never traded",
+            resolution="ignored",
+        ),
+        conflict("dup_unlinked", ["AAA", "QQQ"], [DAYS[0], DAYS[1]], "2 identical days"),
+    ]
+
+    results = world.audit(con, checks=["M6", "M8"])
+    m8 = results["M8"]
+
+    assert m8.spec.gate is None
+    assert m8.rows.schema.names == [*HEAD, "kind", "symbols", "dates", "detail", "resolution"]
+    dates = f"{iso(DAYS[3])},{iso(DAYS[4])},{iso(DAYS[4])}"
+    assert [(r["key"], r["resolution"], r["in_liquid"]) for r in rows(m8)] == [  # sorted by key
+        (f"AAA:cik_switch_bridged:{dates}", "bridged", True),
+        (f"CBS/VIAC:record_without_taker:{iso(DAYS[6])}", "ignored", False),
+        (f"PPP:cik_switch_discontinuous:{dates}", "new_security", False),
+    ]
+    assert m8.fails("all") is False and m8.fails("liquid") is False
+    assert keys(results["M6"]) == [f"AAA/QQQ:dup_unlinked:{iso(DAYS[0])},{iso(DAYS[1])}"]
+    world.conflicts = None
+    assert rows(world.audit(con, checks=["M8"])["M8"]) == []
 
 
 # =============================================================================================

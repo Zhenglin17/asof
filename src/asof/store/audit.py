@@ -44,9 +44,12 @@ from asof.ingest.sec_ticker_history import HISTORY_SCHEMA
 from asof.ingest.security_master import (
     CONFLICT_SCHEMA,
     CONFLICTS_FILE,
+    COPY_MIN_DAYS,
+    DUP_MIN_DAYS,
     DUP_MIN_VOLUME,
     MASTER_FILE,
     SEC_HISTORY_START,
+    WHEN_ISSUED,
     drop_table_corrections,
     normalize_spelling,
 )
@@ -90,6 +93,7 @@ SPARSE_SESSION = 0.1  # I7: traded symbols below this share of the median
 RENAME_LAG_DAYS = 30  # N1: rows beyond this many days between last old bar and the record
 RELABEL_BAND = (0.1, 0.9)  # N3: identical-day share between "accident" and "relabelled"
 STALE_SESSIONS = 10  # C2: a listed symbol whose last bar is further behind the store's end
+COPY_SHARE_WARN = 0.10  # M7: share of an old-holder segment's days copied from the latest holder
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,18 @@ CHECKS: dict[str, CheckSpec] = dict(
             "M6",
             "identity conflicts the build could not settle",
             "liquid",
+            f"{_SYM}(/{_SYM})*:{_KIND}:{_DATE}(,{_DATE})*",
+        ),  # fmt: skip
+        _spec(
+            "M7",
+            "old-holder segment partly copies of the label's latest holder",
+            "liquid",
+            f"{_SID}:{_SYM}:{_DATE}",
+        ),  # fmt: skip
+        _spec(
+            "M8",
+            "identity decisions settled by the build",
+            None,
             f"{_SYM}(/{_SYM})*:{_KIND}:{_DATE}(,{_DATE})*",
         ),  # fmt: skip
         _spec("I1", "traded bars no segment owns (loss)", None, _SYM),
@@ -668,39 +684,101 @@ class _Audit:
         }
         return table, notes
 
-    def m6(self) -> tuple[pa.Table, dict]:
+    def _conflict_rows(self, *, unresolved: bool) -> pa.Table:
+        """The build's conflict table as audit rows: the unresolved ones (M6) or the ones the
+        build settled (M8, carrying the resolution). A conflicts file written before the
+        ``resolution`` column existed reads as all unresolved."""
         path = self.root / CONFLICTS_FILE
         conflicts = pq.read_table(path) if path.exists() else CONFLICT_SCHEMA.empty_table()
         rows = []
         for c in conflicts.to_pylist():
+            resolution = c.get("resolution") or "unresolved"
+            if (resolution == "unresolved") != unresolved:
+                continue
             symbols = list(c["symbols"] or [])
-            rows.append(
-                {
-                    # the dates make the key unique: ADRA has three cik_switch_discontinuous
-                    # conflicts, and one exception must not silence all three
-                    "key": "/".join(symbols)
-                    + ":"
-                    + c["kind"]
-                    + ":"
-                    + ",".join(d.isoformat() for d in c["dates"] or []),
-                    "_liq": any(s in self.liquid_symbols for s in symbols),
-                    "kind": c["kind"],
-                    "symbols": "/".join(symbols),
-                    "dates": ",".join(d.isoformat() for d in c["dates"] or []),
-                    "detail": c["detail"],
-                }
+            row = {
+                # the dates make the key unique: ADRA has three cik_switch_discontinuous
+                # conflicts, and one exception must not silence all three
+                "key": "/".join(symbols)
+                + ":"
+                + c["kind"]
+                + ":"
+                + ",".join(d.isoformat() for d in c["dates"] or []),
+                "_liq": any(s in self.liquid_symbols for s in symbols),
+                "kind": c["kind"],
+                "symbols": "/".join(symbols),
+                "dates": ",".join(d.isoformat() for d in c["dates"] or []),
+                "detail": c["detail"],
+            }
+            if not unresolved:
+                row["resolution"] = resolution
+            rows.append(row)
+        fields = [
+            ("key", pa.string()),
+            ("_liq", pa.bool_()),
+            ("kind", pa.string()),
+            ("symbols", pa.string()),
+            ("dates", pa.string()),
+            ("detail", pa.string()),
+        ]
+        if not unresolved:
+            fields.append(("resolution", pa.string()))
+        return pa.Table.from_pylist(rows, schema=pa.schema(fields))
+
+    def m6(self) -> tuple[pa.Table, dict]:
+        return self._conflict_rows(unresolved=True), {}
+
+    def m7(self) -> tuple[pa.Table, dict]:
+        # A label held by two or more securities: how much of each earlier holder's segment is
+        # OHLC-identical to the latest holder's chain on the same day. The build drops such a
+        # segment at 90% (rule Z) and cuts copied tails (rule F); what is left above
+        # COPY_SHARE_WARN is the next PARA / SPWR -- a history rewritten by the vendor that no
+        # rule has caught yet.
+        same = " AND ".join(f"c.{x} = t.{x}" for x in ("open", "high", "low", "close"))
+        return self._q(
+            f"""
+            WITH latest AS (
+                SELECT symbol, arg_max(security_id, valid_from) AS latest_security
+                FROM {_MASTER} GROUP BY symbol HAVING count(DISTINCT security_id) > 1
+            ), old AS (
+                SELECT m.security_id, m.symbol, m.valid_from, m.valid_to, l.latest_security
+                FROM {_MASTER} m JOIN latest l USING (symbol)
+                WHERE m.security_id <> l.latest_security
+            ), chain_bars AS (
+                SELECT c.security_id AS latest_security, r.symbol, r.session_date,
+                       r.open, r.high, r.low, r.close
+                FROM {_RAW} r
+                JOIN (SELECT DISTINCT security_id, symbol FROM {_MASTER}) c USING (symbol)
+                WHERE r.volume > 0 AND c.security_id IN (SELECT latest_security FROM latest)
+            ), traded AS (
+                SELECT o.security_id, o.symbol, o.valid_from, o.valid_to, o.latest_security,
+                       t.session_date, t.open, t.high, t.low, t.close
+                FROM old o JOIN {_RAW} t ON t.symbol = o.symbol AND t.volume > 0
+                 AND t.session_date >= o.valid_from
+                 AND (o.valid_to IS NULL OR t.session_date < o.valid_to)
+            ), scored AS (
+                SELECT t.security_id, t.symbol, t.valid_from, t.valid_to, t.latest_security,
+                       t.session_date,
+                       EXISTS (SELECT 1 FROM chain_bars c
+                               WHERE c.latest_security = t.latest_security
+                                 AND c.session_date = t.session_date AND c.symbol <> t.symbol
+                                 AND {same}) AS copied
+                FROM traded t
             )
-        schema = pa.schema(
-            [
-                ("key", pa.string()),
-                ("_liq", pa.bool_()),
-                ("kind", pa.string()),
-                ("symbols", pa.string()),
-                ("dates", pa.string()),
-                ("detail", pa.string()),
-            ]
-        )
-        return pa.Table.from_pylist(rows, schema=schema), {}
+            SELECT security_id || ':' || symbol || ':' || {_day("valid_from")} AS key,
+                   {_liq_sym("symbol")} AS _liq,
+                   security_id, symbol, valid_from, valid_to, latest_security,
+                   count(*) AS traded_days, count(*) FILTER (WHERE copied) AS copied_days,
+                   count(*) FILTER (WHERE copied) / count(*) AS share
+            FROM scored
+            GROUP BY ALL
+            HAVING count(*) FILTER (WHERE copied) >= {COPY_MIN_DAYS}
+               AND count(*) FILTER (WHERE copied) / count(*) >= {COPY_SHARE_WARN}
+            """
+        ), {}
+
+    def m8(self) -> tuple[pa.Table, dict]:
+        return self._conflict_rows(unresolved=False), {}
 
     # -- I: identity across bars and master ------------------------------------------------------
 
@@ -749,7 +827,10 @@ class _Audit:
               ON a.session_date = b.session_date AND a.symbol < b.symbol AND {same}
              AND a.security_id <> b.security_id
             WHERE a.volume > {DUP_MIN_VOLUME}
+              AND NOT regexp_full_match(a.symbol, '{WHEN_ISSUED.pattern}')
+              AND NOT regexp_full_match(b.symbol, '{WHEN_ISSUED.pattern}')
             GROUP BY a.symbol, b.symbol
+            HAVING count(*) >= {DUP_MIN_DAYS}
             """
         ), {}
 
