@@ -194,7 +194,9 @@ def test_ffr_and_para_were_reused_by_unrelated_securities(con: duckdb.DuckDBPyCo
     banzai = sid(con, "PARA", date(2026, 10, 1))
     assert ids(con, "PARA")["PARA"] == {paramount, banzai}
     assert chain(con, paramount) == [
-        ("VIAC", date(2020, 2, 13), date(2022, 2, 17)),
+        # CBS -> VIAC was filed 2020-02-13 for a rename of 2019-12-05; the label lives from
+        # its first stored bar (rule V, 2026-10-16)
+        ("VIAC", date(2020, 1, 2), date(2022, 2, 17)),
         ("PARA", date(2022, 2, 17), date(2026, 8, 7)),
     ]
     assert [s for s, _, _ in chain(con, banzai)] == ["VII", "BNZI", "PARA"]
@@ -427,3 +429,74 @@ def test_banzai_bars_under_para_do_not_resolve_to_paramount(
     ).to_pylist()
     paramount = sid(con, "VIAC", date(2021, 6, 1))
     assert all(r["security_id"] != paramount for r in rows)
+
+
+# -- step 6-b rules (N, D, V, O, A), written 2026-10-16 to FAIL on the store built before them --
+# Fake-world tests: tests/ingest/test_security_master_rules.py. Values below were read off the
+# store on 2026-10-16 (bars, SEC rows, Alpaca records) and checked against the companies' own
+# notices; the master rows they contradict are quoted in each case.
+
+
+def test_kinzu_carries_the_cik_the_sec_wrote_under_kinz_u(con: duckdb.DuckDBPyConnection) -> None:
+    # N: the SEC wrote KINZ.U once (2020-11-03) and KINZU 21 times after; the store has KINZU.
+    # Master before the rule: KINZU [2021-01-04, None) bars_only, cik None.
+    master = visible_master(con, ROOT, NOW).to_pylist()
+    rows = [r for r in master if r["symbol"] == "KINZU"]
+    assert rows and all(r["cik"] == 1820875 for r in rows), rows
+    assert not any(r["symbol"] == "KINZ.U" for r in master)
+
+
+def test_svmk_became_mntv_on_2021_06_15_although_alpaca_filed_it_in_august(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # D: SVMK's last bar 2021-06-14, MNTV's first 06-15, Alpaca's record 08-09. Master before
+    # the rule: SVMK to 08-09, MNTV [06-15, 08-09) + [08-09, None) -- an overlap.
+    momentive = sid(con, "SVMK", date(2021, 1, 4))
+    assert chain(con, momentive) == [
+        ("SVMK", date(2020, 1, 2), date(2021, 6, 15)),
+        ("MNTV", date(2021, 6, 15), None),
+    ]
+    assert ids(con, "SVMK", "MNTV") == {"SVMK": {momentive}, "MNTV": {momentive}}
+    # the rename is knowable on 08-09: a reader on 07-01 sees SVMK open and no MNTV
+    assert segments(con, ny(2021, 7, 1), "SVMK", "MNTV") == [
+        (momentive, "SVMK", date(2020, 1, 2), None)
+    ]
+
+
+def test_viac_and_worx_start_at_their_first_bar_not_at_the_late_record(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # V: CBS -> VIAC recorded 2020-02-13 with VIAC trading from 2020-01-02 and CBS never stored;
+    # WORXD -> WORX recorded 2026-09-01 with WORX listed by the SEC since 2019 and trading
+    # throughout. Master before the rule: VIAC from 02-13 (29 orphan bars), WORX cut in two.
+    paramount = sid(con, "VIAC", date(2021, 6, 1))
+    assert segments(con, NOW, "VIAC") == [(paramount, "VIAC", date(2020, 1, 2), date(2022, 2, 17))]
+    assert sid(con, "VIAC", date(2020, 1, 15)) == paramount
+    scworx = sid(con, "WORX", date(2021, 1, 4))
+    assert segments(con, NOW, "WORX") == [(scworx, "WORX", date(2020, 1, 2), None)]
+
+
+def test_jamf_and_intl_bars_after_the_vacated_placeholder_have_a_security(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # O: JAMF -> JNMF (2020-01-13) vacated a pre-IPO placeholder; Jamf's real bars start
+    # 2020-07-22 and the SEC lists JAMF under 1721947 from 2020-08-13. INTL -> SNEX (StoneX,
+    # 2020-07-06); an ETF trades under INTL from 2022-12-02 and never reaches the SEC table.
+    # Master before the rule: neither label has a segment on the dates below.
+    jamf = sid(con, "JAMF", date(2021, 1, 4))
+    assert jamf != sid(con, "JAMF", date(2020, 1, 2))
+    master = visible_master(con, ROOT, NOW).to_pylist()
+    assert {r["cik"] for r in master if r["security_id"] == jamf} == {1721947}
+    etf = sid(con, "INTL", date(2023, 1, 3))
+    stonex = sid(con, "INTL", date(2020, 3, 2))
+    assert etf != stonex
+    assert stonex == sid(con, "SNEX", date(2023, 1, 3))
+    assert {r["cik"] for r in master if r["security_id"] == etf} == {None}
+
+
+def test_honav_when_issued_is_not_hona(con: duckdb.DuckDBPyConnection) -> None:
+    # A: HONAV traded when-issued 2026-06-15..06-26, HONAV -> HONA recorded 06-29. Master before
+    # the rule: one security for both.
+    hona = sid(con, "HONA", date(2026, 7, 1))
+    assert sid(con, "HONAV", date(2026, 6, 16)) != hona
+    assert segments(con, NOW, "HONA") == [(hona, "HONA", date(2026, 6, 29), None)]

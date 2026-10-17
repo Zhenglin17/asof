@@ -35,6 +35,9 @@
 # - 6,281 segments only have an SEC name, which is the issuer's name ("ADIAL PHARMACEUTICALS,
 #   INC." for the warrant ADILW); the nasdaq_suffix lookup covers those before the common rule.
 
+- id: sym_when_issued  # NYSE .WI / .RTWI, Nasdaq fifth letter V; the SEC lists some for a
+  class: when_issued   # snapshot under the issuer's name (CMCSV "COMCAST CORP"), so symbol first
+  symbol: '.*\.(WI|RTWI)$|[A-Z]{4}V'
 - id: sym_warrant
   class: warrant
   symbol: '.*\.(WS|WT)$'

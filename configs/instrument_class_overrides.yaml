@@ -48,3 +48,26 @@
 - symbol: XXXX
   class: leveraged_etf
   reason: MAX S&P 500 4X Leveraged ETN (Bank of Montreal); in the tier 2024-04 and 2024-05.
+# Shelf ETNs that qualified for the liquid tier while unknown (audit M5, 2026-10-16). Their
+# only name is the issuing bank's SEC name, so no name rule can place them.
+- symbol: DWT
+  class: leveraged_etf
+  reason: VelocityShares 3x Inverse Crude Oil ETN (Citigroup Global Markets); delisted 2020-04.
+- symbol: UWT
+  class: leveraged_etf
+  reason: VelocityShares 3x Long Crude Oil ETN (Citigroup Global Markets); delisted 2020-04.
+- symbol: FBGX
+  class: leveraged_etf
+  reason: UBS ETRACS 2x Leveraged Long FANG+ ETN (UBS AG).
+- symbol: FIHD
+  class: leveraged_etf
+  reason: UBS ETRACS 2x Monthly Leveraged MSCI USA High Dividend ETN (UBS AG).
+- symbol: FLGE
+  class: leveraged_etf
+  reason: Credit Suisse FI Large Cap Growth Enhanced ETN (2x, Credit Suisse AG).
+- symbol: OIL
+  class: etf
+  valid_from: 2020-01-02
+  reason: >-
+    iPath Series B S&P GSCI Crude Oil ETN (Barclays Bank PLC), the OIL label until 2020-07-29;
+    the label was reused afterwards by another security, so the decision is dated.

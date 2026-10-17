@@ -29,8 +29,8 @@ Any violation is look-ahead leakage and is treated as a bug.
       and registered with a reason
 - [x] Security identity: corporate actions (splits, renames, mergers) from Alpaca, a
       security master that maps each symbol-day to a permanent security across renames and
-      ticker reuse, and an instrument class (common, ETF, leveraged ETF, warrant, unit...)
-      for every segment
+      ticker reuse, and an instrument class (common, ETF, leveraged ETF, warrant, unit,
+      when-issued...) for every segment
 - [x] Liquid tier: the securities that averaged more than $50M a day over the previous 20
       sessions, computed as of any instant from data visible then; about 1,100-2,000 a month,
       3,972 ever between 2020 and 2026
@@ -120,12 +120,19 @@ the SEC's own ticker table lags renames by months. `asof market identity` cuts e
 timeline into segments from Alpaca's name-change records and archived SEC ticker tables,
 links segments of the same security under one permanent id, checks the links against
 same-day identical OHLCV, and lists the cases it could not settle for a human to decide in
-`configs/security_overrides.yaml`. `asof market instruments` then tags each segment with an
+`configs/security_overrides.yaml`. The vendor's records are read against the bars rather
+than taken at face value: a rename filed weeks after the new name started trading is dated
+from the hand-over visible in the bars, a record whose old name never traded here (a
+temporary OTC suffix, a rename older than the store) is no event, a label that goes quiet
+and comes back after a gap is a new security from its first bar, and when-issued symbols
+(`.WI`, Nasdaq's fifth-letter V) are never the security itself, so a rename routed through
+one joins the names on either side. `asof market instruments` then tags each segment with an
 instrument class from the name it carried in that era, using the ordered rules in
 `configs/instrument_class_rules.yaml`; the scanner will only look at common stocks and
-unleveraged ETFs. Names the rules cannot judge (an issuer whose SEC entry carries dozens of
-notes, such as the ETN shelves of Credit Suisse or Bank of Montreal) stay `unknown` until a
-human records the class in `configs/instrument_class_overrides.yaml`.
+unleveraged ETFs. A segment nobody ever named (an ETF's old ticker) inherits the class of a
+later segment of the same security. Names the rules cannot judge (an issuer whose SEC entry
+carries dozens of notes, such as the ETN shelves of Credit Suisse or Bank of Montreal) stay
+`unknown` until a human records the class in `configs/instrument_class_overrides.yaml`.
 
 Reading applies all of this by default. `visible_bars` matches each bar to the segment that
 owned its symbol on that session date and returns it with the segment's `security_id`; a bar

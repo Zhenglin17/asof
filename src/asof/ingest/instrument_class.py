@@ -54,9 +54,11 @@ CLASSES = (
     "right",
     "note",
     "crypto",
+    "when_issued",  # trades for a few sessions before a spin-off / split settles; never scanned
     "unknown",
 )
 LOOKUPS = ("sec_funds", "nasdaq_suffix", "sec_shelf", "sec_companies")
+INHERIT_RULE = "inherit_later"  # an unknown segment named by a later segment of its security
 NASDAQ_SUFFIX = {"W": "warrant", "R": "right", "U": "unit", "P": "preferred"}
 NASDAQ_SUFFIX_SHAPE = re.compile(r"[A-Z]{4}[WRUP]")
 MIN_PREFIX_LEN = 3  # EXE -> EXEEW counts; a 2-letter prefix matches too much by accident
@@ -422,6 +424,12 @@ def build_instrument_class(
         cls, rule_id = classify(symbol, name, cik, lookups, rules, name_source=source)
         classes.append(cls)
         hits.append(rule_id)
+    inherit_later(
+        master.column("security_id").to_pylist(),
+        master.column("valid_from").to_pylist(),
+        classes,
+        hits,
+    )
     table = pa.table(
         {
             "security_id": master.column("security_id"),
@@ -436,6 +444,34 @@ def build_instrument_class(
         schema=CLASS_SCHEMA,
     )
     return apply_overrides(table, overrides)
+
+
+def inherit_later(
+    security_ids: Sequence[str],
+    valid_froms: Sequence[date],
+    classes: list[str],
+    rules: list[str],
+) -> None:
+    """An ``unknown`` segment takes the class of its security's later segments, in place.
+
+    Alpaca deletes the inactive row of a renamed ETF and the SEC never listed it, so the old
+    name has no name at all (SPLG 2020-2025 before it became SPYM; 344 such segments, 192 of
+    them ETFs). The security is the same, so the later name's class applies -- but only
+    backwards: a label's earlier era may be another product entirely, so an earlier class
+    never propagates forward (12 real segments). When the later known segments disagree the
+    segment stays unknown for the audit. Runs on the rule-file classes, before overrides.
+    """
+    later: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    for sid, valid_from, cls in zip(security_ids, valid_froms, classes, strict=True):
+        if cls != "unknown":
+            later[sid].append((valid_from, cls))
+    for i, (sid, valid_from) in enumerate(zip(security_ids, valid_froms, strict=True)):
+        if classes[i] != "unknown":
+            continue
+        known = {cls for start, cls in later.get(sid, ()) if start > valid_from}
+        if len(known) == 1:
+            classes[i] = known.pop()
+            rules[i] = INHERIT_RULE
 
 
 def build_from_store(

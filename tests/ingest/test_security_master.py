@@ -2111,23 +2111,25 @@ def test_f9_moved_cut_keeps_the_records_availability(
     assert_nothing_known_before_its_valid_from(master)
 
 
-def test_f9_gap_longer_than_max_gap_days_keeps_the_alpaca_date(
+def test_f9_gap_longer_than_max_gap_days_moves_the_cut_when_the_handover_is_in_the_bars(
     f9_built: tuple[pa.Table, pa.Table],
 ) -> None:
-    # F9 (2), guard (passes today, must keep passing). ASSUMPTION: a halt of more than
-    # MAX_GAP_DAYS between the old name's last bar and Alpaca's date is not a late record but
-    # something else (a long suspension); HLTN's 05-04..06-05 bars stay uncovered on purpose
-    # and are not asserted either way. Needs a real-data check: the lag between the old
-    # name's last bar and Alpaca's date over all name_change rows should be a few days, with
-    # no mass between 10 days and months.
+    # F9 (2). This test first assumed (2026-10-08) that a lag of more than MAX_GAP_DAYS was a
+    # long suspension and kept Alpaca's date. The real-data check it asked for was done on
+    # 2026-10-16 (step6b-counts.md, D): 248 records trail the old name's last bar by 11-60
+    # days while the new name starts the very next session (SVMK -> MNTV filed 2021-08-09,
+    # traded 06-15; many exactly 42 days: SPAC completions filed six weeks late). The
+    # hand-over is in the bars, so the cut is the day after HLTO's last bar; the record's
+    # instant stays the only moment the rename was knowable. A new name starting more than
+    # HANDOVER_MAX_DAYS after the old one is covered in test_security_master_rules.py.
     master, _ = f9_built
 
     assert sm.MAX_GAP_DAYS == 10
     [hlto] = segments(master, "HLTO")
     [hltn] = segments(master, "HLTN")
-    assert hltn["valid_from"] == F9_HALT_DAY
-    assert hlto["valid_to"] == F9_HALT_DAY
+    assert hltn["valid_from"] == hlto["valid_to"] == date(2020, 5, 2)
     assert hltn["available_at"] == et_midnight(F9_HALT_DAY)
+    assert hlto["end_available_at"] == et_midnight(F9_HALT_DAY)
     assert hlto["security_id"] == hltn["security_id"]
 
 

@@ -87,6 +87,7 @@ from asof.ingest.security_master import MASTER_SCHEMA
 
 RULES_PATH = Path(__file__).resolve().parents[2] / "configs" / "instrument_class_rules.yaml"
 RULE_IDS_IN_FILE = [
+    "sym_when_issued",
     "sym_warrant",
     "sym_unit",
     "sym_right",
@@ -248,6 +249,7 @@ def test_constants_cover_every_class_and_lookup_named_in_the_rule_file() -> None
         "right",
         "note",
         "crypto",
+        "when_issued",
         "unknown",
     )
     assert LOOKUPS == ("sec_funds", "nasdaq_suffix", "sec_shelf", "sec_companies")
