@@ -132,6 +132,7 @@ GATES: dict[str, str | None] = {
     "N2": None,
     "N3": None,
     "C1": None,
+    "C2": "all",
 }
 HEAD = ["key", "in_liquid", "excepted"]
 
@@ -501,6 +502,7 @@ SAMPLE_KEYS = {
     "N2": "ROLD/RNEW:2020-01-16",
     "N3": "AAA/BBB",
     "C1": "2020",
+    "C2": "NOBL",
 }
 
 
@@ -521,6 +523,7 @@ def test_key_pattern_accepts_the_documented_key_shape(check_id: str) -> None:
         ("I7", "2020"),
         ("I1", "AAA:2020-01-07"),
         ("N1", "CCC:2020-03-08"),
+        ("C2", "NOBL:2020-01-07"),
     ],
 )
 def test_key_pattern_rejects_other_shapes(check_id: str, bad: str) -> None:
@@ -2480,6 +2483,8 @@ def test_c1_coverage_per_year(con: duckdb.DuckDBPyConnection, world: World) -> N
         "liquid_symbols",
         "name_changes",
         "name_changes_linked",
+        "ext_bars",
+        "ext_overrides",
     ]
     assert rows(result) == [
         {
@@ -2492,6 +2497,8 @@ def test_c1_coverage_per_year(con: duckdb.DuckDBPyConnection, world: World) -> N
             "liquid_symbols": 3,  # AAA, BBB and ROLD's open-ended-in-2019 segment
             "name_changes": 0,
             "name_changes_linked": 0,
+            "ext_bars": 0,
+            "ext_overrides": 0,
         },
         {
             "key": "2020",
@@ -2503,6 +2510,8 @@ def test_c1_coverage_per_year(con: duckdb.DuckDBPyConnection, world: World) -> N
             "liquid_symbols": 4,
             "name_changes": 2,
             "name_changes_linked": 1,
+            "ext_bars": 0,
+            "ext_overrides": 0,
         },
     ]
     assert result.notes == {"name_changes": 2, "name_changes_linked": 1}

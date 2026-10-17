@@ -174,3 +174,18 @@ def load_universe(root: Path, data_dir: Path | None = None) -> list[str]:
 
 def active_symbols(assets: Iterable[Asset]) -> set[str]:
     return {a.symbol for a in assets if a.status == "active"}
+
+
+def read_symbols_file(path: Path) -> list[str]:
+    """A hand-kept symbol list, one per line: blank lines and ``#`` comments are skipped, the
+    rest must be valid symbols in canonical spelling. Sorted, without duplicates. A bad line
+    stops the run rather than silently shrinking the list."""
+    symbols: set[str] = set()
+    for number, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not is_valid_symbol(line):
+            raise ValueError(f"{path}:{number}: {line!r} is not a symbol")
+        symbols.add(line)
+    return sorted(symbols)

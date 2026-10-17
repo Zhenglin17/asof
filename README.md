@@ -24,7 +24,9 @@ Any violation is look-ahead leakage and is treated as a bug.
       about 300 instruments resolved against the SEC ticker tables
 - [x] Market-wide daily bars: every exchange-listed symbol since 2020, including delisted
       ones and both sides of every rename, stored as Parquet with the instant each bar became
-      knowable; a refetch adds to the store and never removes what an earlier fetch saw
+      knowable; a refetch adds to the store and never removes what an earlier fetch saw; a
+      stretch the vendor has lost is imported from a second source, kept in its own directory
+      and registered with a reason
 - [x] Security identity: corporate actions (splits, renames, mergers) from Alpaca, a
       security master that maps each symbol-day to a permanent security across renames and
       ticker reuse, and an instrument class (common, ETF, leveraged ETF, warrant, unit...)
@@ -35,7 +37,7 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Resolved read path: every bar read carries the permanent id of the security that owned
       its symbol that day, as the security master was known at the time; relabelled copies
       and the vendor's volume-0 filler bars are gone by default
-- [x] Data audit: 29 checks over the real store with reviewed exceptions, and hand-checked
+- [x] Data audit: 30 checks over the real store with reviewed exceptions, and hand-checked
       reference histories asserted as tests against it
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
@@ -84,6 +86,8 @@ Backfill market data from Alpaca (a free paper-trading account is enough for his
 export ALPACA_API_KEY=... ALPACA_SECRET_KEY=...
 uv run asof market universe              # Alpaca asset list + historical SEC ticker tables
 uv run asof market backfill              # daily bars since 2020 into $ASOF_DATA_DIR/market
+uv run asof market backfill --symbols-file stale.txt --force   # top up a list of symbols
+uv run asof market import-bars           # registered second-source bars (configs/bar_imports.yaml)
 uv run asof market status                # rows, symbols and date range per year
 uv run asof market actions               # corporate actions: splits, name changes, mergers...
 uv run asof market identity              # security master: which security each symbol was, per day
@@ -95,7 +99,10 @@ uv run asof market audit                 # count every kind of data error found 
 
 The universe is the union of every symbol Alpaca lists, every ticker that appeared in an SEC
 ticker table since 2019 (archived copies) and both names of every rename Alpaca recorded, so
-delisted companies and the old names of renamed ETFs are included. Bars are
+delisted companies and the old names of renamed ETFs are included. A symbol Alpaca still lists
+is requested for every period; the SEC tables only bound the requests for symbols it no longer
+lists (the SEC company table carries ETFs erratically, and a window closed by such a gap once
+left 197 listed symbols without years of bars). Bars are
 stored unadjusted, one Parquet file per year and first letter, each row stamped with
 `available_at`: the moment the bar was final (20:00 New York for a daily bar, since its volume
 includes after-hours trades). `visible_bars(con, root, timeframe, as_of)` is the only read path
@@ -132,6 +139,17 @@ for years after a rename (1.18M such bars, 6.5% of the store), and these are dro
 asked for. `split_day` marks the ex-date bar of a split known at the time, so a return across
 it is not mistaken for a move. `resolve=False` returns the raw store for audits.
 
+The vendor files a symbol's whole history under its current holder, so when a ticker is reused
+the old holder's history can disappear: after Banzai took PARA in 2026, Paramount Global's
+class B bars from the 2022 rename to the 2025 merger were gone. Such a stretch is imported from
+a second source (Yahoo's chart API, which keeps the lineage under the company's newest symbol)
+into `$ASOF_DATA_DIR/market/bars_1d_ext/`, with `source` and `source_symbol` columns, and
+registered in `configs/bar_imports.yaml` with the range, a reason and a date; the Alpaca files
+are not touched. On read an imported row replaces the vendor's row of the same symbol and
+instant, so the entry is the recorded decision that the vendor's rows there are wrong, and
+every bar read says where it came from (`source`). The audit counts the imported rows and how
+many of them override a vendor row.
+
 The scanner does not look at all 20,000 symbols. `asof market liquid` computes the liquid
 tier as of an instant: securities whose dollar volume over the previous 20 sessions averaged
 more than $50M a day, common stocks and unleveraged ETFs only, with no price floor. Everything
@@ -145,11 +163,12 @@ a line.
 
 Tests on fake data only show that the code does what its author imagined; they stay green when
 the imagined vendor differs from the real one. `asof market audit` therefore reads the real
-store as of an instant and counts each kind of accident met so far, 29 checks in all:
+store as of an instant and counts each kind of accident met so far, 30 checks in all:
 duplicate or impossible bars, segments of one security that overlap, two securities sharing
 an identical bar (a relabelled history the master did not catch), a split record with no price
 move, a one-day thin-volume print far from the previous close with no split to explain it, a
-price jump across a rename, traded bars that no segment owns. Each finding is a row with a
+price jump across a rename, traded bars that no segment owns, a listed symbol whose bars
+stopped although the vendor still serves it. Each finding is a row with a
 short key (`AAA:2020-01-07`, `S000730`, `AAA/BBB`) written to
 `$ASOF_DATA_DIR/market/audit/<check>.parquet`. Gated checks must be clean inside the liquid
 tier, the rest are reported for a human to read. A reviewed finding goes into
@@ -184,7 +203,8 @@ configs/             watchlist.yaml (instruments that get filings and fundamenta
                      security_overrides.yaml (human identity decisions),
                      instrument_class_rules.yaml (ordered class rules),
                      instrument_class_overrides.yaml (human class decisions),
-                     audit_exceptions.yaml (reviewed audit findings)
+                     audit_exceptions.yaml (reviewed audit findings),
+                     bar_imports.yaml (bars imported from a second source)
 docs/                public documentation                                  (planned)
 ```
 

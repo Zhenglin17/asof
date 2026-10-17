@@ -16,23 +16,28 @@ real data has to be checked on the real files instead:
   missing; a much smaller delta means the exclusions above are eating real symbols.
 """
 
+import re
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
+from typer.testing import CliRunner
 
+from asof.cli import app
 from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA, actions_dir
 from asof.ingest.universe import (
     HISTORY_PATH,
     build_universe,
     load_renamed,
     load_universe,
+    read_symbols_file,
     rename_chains,
     save_assets_snapshot,
 )
-from tests.ingest.fakes import make_asset
+from tests.ingest.fakes import FakeBarClient, daily, make_asset
 
 AAPL = make_asset("AAPL", exchange="NASDAQ")
 MSFT = make_asset("MSFT", exchange="NASDAQ")
@@ -355,3 +360,132 @@ def test_rename_chains_merge_the_two_holders_of_a_reused_symbol(tmp_path: Path) 
 
 def test_rename_chains_of_a_root_without_name_changes_is_empty(tmp_path: Path) -> None:
     assert rename_chains(tmp_path) == []
+
+
+# --- symbols file: a hand-kept list of symbols to backfill ----------------------------------------
+# ``asof market backfill --symbols-file PATH`` reads one symbol per line (the 197 listed names
+# with a closed SEC window are too many for ``--symbols``). The file format is the project's own
+# (assumption: nothing external produces it); a bad line must stop the run rather than silently
+# shrink the list.
+
+
+def write_symbols(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "symbols.txt"
+    path.write_text(text)
+    return path
+
+
+def test_read_symbols_file_sorts_dedupes_and_skips_comments_and_blanks(tmp_path: Path) -> None:
+    path = write_symbols(
+        tmp_path,
+        "# listed names whose SEC window closed (2026-10-16)\n"
+        "NOBL\n"
+        "\n"
+        "  SPLG  \n"
+        "AAPL\n"
+        "NOBL\n"
+        "   # indented comment\n"
+        "BRK.B\n",
+    )
+
+    assert read_symbols_file(path) == ["AAPL", "BRK.B", "NOBL", "SPLG"]
+
+
+def test_read_symbols_file_of_an_empty_or_comment_only_file_is_empty(tmp_path: Path) -> None:
+    assert read_symbols_file(write_symbols(tmp_path, "")) == []
+    assert read_symbols_file(write_symbols(tmp_path, "# nothing yet\n\n")) == []
+
+
+def test_read_symbols_file_without_a_trailing_newline(tmp_path: Path) -> None:
+    assert read_symbols_file(write_symbols(tmp_path, "NOBL")) == ["NOBL"]
+
+
+@pytest.mark.parametrize("bad", ["abc def", "nobl", "BRK-B", "X_DELISTED", "384CNT069"])
+def test_read_symbols_file_rejects_a_line_that_is_not_a_symbol(tmp_path: Path, bad: str) -> None:
+    path = write_symbols(tmp_path, f"AAPL\n{bad}\nNOBL\n")
+
+    with pytest.raises(ValueError, match=re.escape(bad)):
+        read_symbols_file(path)
+
+
+def test_read_symbols_file_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        read_symbols_file(tmp_path / "absent.txt")
+
+
+# --- the CLI option ---------------------------------------------------------------------------
+
+
+def test_backfill_cli_refuses_symbols_and_symbols_file_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A fake client so that the only reason to stop is the conflicting options.
+    monkeypatch.setattr("asof.cli._alpaca_client", lambda: FakeBarClient())
+    path = write_symbols(tmp_path, "NOBL\n")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "market",
+            "backfill",
+            "--symbols",
+            "AAPL",
+            "--symbols-file",
+            str(path),
+            "--start",
+            "2021-01-01",
+            "--end",
+            "2021-12-31",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--symbols" in result.output and "--symbols-file" in result.output
+    assert not (tmp_path / "market" / "bars_1d").exists()
+
+
+def test_backfill_cli_requests_the_symbols_of_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeBarClient([daily("NOBL", date(2021, 1, 4), close=86.0)])
+    monkeypatch.setattr("asof.cli._alpaca_client", lambda: client)
+    path = write_symbols(tmp_path, "# listed, SEC window closed\nNOBL\nSPLG\n")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "market",
+            "backfill",
+            "--symbols-file",
+            str(path),
+            "--start",
+            "2021-01-01",
+            "--end",
+            "2021-12-31",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert {s for c in client.calls for s in c.symbols} == {"NOBL", "SPLG"}
+    assert (tmp_path / "market" / "bars_1d" / "year=2021" / "bucket=N.parquet").exists()
+
+
+def test_backfill_cli_stops_on_a_bad_line_before_requesting_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeBarClient()
+    monkeypatch.setattr("asof.cli._alpaca_client", lambda: client)
+    path = write_symbols(tmp_path, "NOBL\nabc def\n")
+
+    result = CliRunner().invoke(
+        app,
+        ["market", "backfill", "--symbols-file", str(path), "--data-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code != 0
+    assert "abc def" in result.output
+    assert client.calls == []

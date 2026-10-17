@@ -176,6 +176,21 @@ def _overlaps(windows: Mapping[str, Window] | None, symbol: str, partition: "Par
     return start < p_end and (end is None or end > p_start)
 
 
+def windows_for_requests(
+    windows: Mapping[str, Window], active: Collection[str]
+) -> dict[str, Window]:
+    """The SEC windows that may limit requests: those of symbols Alpaca no longer lists.
+
+    A symbol Alpaca lists as active is requested in every period whatever the SEC table says.
+    The SEC company table carries ETFs erratically (NOBL appeared in the 2019-10 .. 2020-06
+    snapshots only), and a window closed by such a gap once left 197 listed symbols with no bar
+    after their window's end. Requests go out in batches of 100 symbols, so an extra listed
+    symbol in a batch costs nothing; a delisted symbol with a closed window still skips the
+    periods in which it cannot have traded.
+    """
+    return {symbol: window for symbol, window in windows.items() if symbol not in active}
+
+
 def _to_table(bars: Iterable[Bar], timeframe: Timeframe, fetched_at: datetime) -> pa.Table:
     fetched = fetched_at.astimezone(UTC)
     latest: dict[tuple[str, datetime], Bar] = {}
@@ -206,16 +221,53 @@ def _to_table(bars: Iterable[Bar], timeframe: Timeframe, fetched_at: datetime) -
     )
 
 
-def merge_tables(existing: pa.Table, incoming: pa.Table) -> pa.Table:
+def merge_tables(
+    existing: pa.Table, incoming: pa.Table, schema: pa.Schema = BAR_SCHEMA
+) -> pa.Table:
     """``existing`` rows unchanged, plus the ``incoming`` rows whose ``(symbol, t)`` is new,
-    sorted by ``(symbol, t)``."""
+    sorted by ``(symbol, t)``. ``schema`` is the file's column set (the bar schema, or the
+    imported-bar schema with its source columns)."""
 
     # Stays in Arrow: a minute-bar month bucket holds millions of rows.
     new = incoming.join(
         existing.select(["symbol", "t"]), keys=["symbol", "t"], join_type="left anti"
-    ).select(BAR_SCHEMA.names)
-    table = pa.concat_tables([existing, new]).cast(BAR_SCHEMA)
+    ).select(schema.names)
+    table = pa.concat_tables([existing, new]).cast(schema)
     return table.sort_by([("symbol", "ascending"), ("t", "ascending")])
+
+
+def write_merged(
+    path: Path, incoming: pa.Table, schema: pa.Schema, fetched_at: datetime
+) -> tuple[int, int]:
+    """Merge ``incoming`` into the file at ``path`` atomically; returns ``(rows in the file,
+    rows added)``. Nothing is left on failure.
+
+    An existing file is merged into, never replaced: its rows stay as they are (their own
+    ``fetched_at`` included) and only rows with a new ``(symbol, t)`` are added. ``fetched_at``
+    is stored as file metadata so a later run can tell when the file was last written. A file
+    whose columns differ from ``schema`` is refused rather than guessed at.
+    """
+    _require_aware(fetched_at, "fetched_at")
+    table = incoming.cast(schema)
+    before = 0
+    if path.exists():
+        existing = pq.read_table(path)
+        if not existing.schema.equals(schema, check_metadata=False):
+            raise ValueError(
+                f"{path}: stored columns differ from the expected schema; delete the file to "
+                "refetch it from scratch"
+            )
+        before = existing.num_rows
+        table = merge_tables(existing, table, schema)
+    table = table.replace_schema_metadata({FETCHED_AT_KEY: fetched_at.astimezone(UTC).isoformat()})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        pq.write_table(table, tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return table.num_rows, table.num_rows - before
 
 
 def write_partition(
@@ -226,28 +278,12 @@ def write_partition(
 
     Bars not yet final at ``fetched_at`` are dropped; ``fetched_at`` is also stored as file
     metadata so a later run can tell whether the file was written after its period ended. An
-    existing file is merged into, never replaced: its rows stay as they are (their own
-    ``fetched_at`` included) and only bars with a new ``(symbol, t)`` are added.
+    existing file is merged into, never replaced (``write_merged``).
     """
     _require_aware(fetched_at, "fetched_at")
     table = _to_table(bars, timeframe, fetched_at)  # consume fully before writing
-    if path.exists():
-        existing = pq.read_table(path)
-        if not existing.schema.equals(BAR_SCHEMA, check_metadata=False):
-            raise ValueError(
-                f"{path}: stored columns differ from the bar schema; delete the file to refetch "
-                "it from scratch"
-            )
-        table = merge_tables(existing, table)
-    table = table.replace_schema_metadata({FETCHED_AT_KEY: fetched_at.astimezone(UTC).isoformat()})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        pq.write_table(table, tmp)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return table.num_rows
+    rows, _ = write_merged(path, table, BAR_SCHEMA, fetched_at)
+    return rows
 
 
 def partition_fetched_at(path: Path) -> datetime | None:

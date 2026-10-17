@@ -1,10 +1,53 @@
 # Reviewed exceptions to `asof market audit`. Each entry needs every field:
 #
-#   - check: S3                  # a check id (P1..C1; `asof market audit` lists them)
+#   - check: S3                  # a check id (P1..C2; `asof market audit` lists them)
 #     key: "EXEEW:2026-02-03"    # the row key exactly as the audit prints it
 #     reason: "warrant; one-day print at 0.0101 between 105 and 125"
 #     added: 2026-10-09
 #     by: greyson
 #
 # An entry that no longer matches any row is reported as stale.
-[]
+
+# C2: symbols Alpaca still lists as active although they stopped trading. The vendor served
+# volume-0 placeholder bars for a while after the last trade, then nothing; a top-up request
+# (2026-10-16) returned nothing new. If one of them resumes trading the entry turns stale.
+- check: C2
+  key: BOWN
+  reason: "Bowen Acquisition SPAC; last trade 2025-07-15, placeholders until 2026-07-14, nothing since"
+  added: 2026-10-16
+  by: greyson
+- check: C2
+  key: HYB
+  reason: "New America High Income Fund; last trade 2025-02-11, placeholders until 2026-02-10"
+  added: 2026-10-16
+  by: greyson
+- check: C2
+  key: IPXGU
+  reason: "Inflection Point VII SPAC unit; last trade 2026-07-06, no bar after 2026-08-25 (units stop once separated)"
+  added: 2026-10-16
+  by: greyson
+- check: C2
+  key: MUI
+  reason: "BlackRock Municipal Income Fund; last trade 2025-02-14, placeholders until 2026-02-13"
+  added: 2026-10-16
+  by: greyson
+- check: C2
+  key: OST
+  reason: "Ostin Technology; last trade 2025-09-12, placeholders until 2026-09-11"
+  added: 2026-10-16
+  by: greyson
+- check: C2
+  key: SVA
+  reason: "Sinovac Biotech, halted on Nasdaq since 2019; no traded bar in the store, placeholders until 2025-03-21"
+  added: 2026-10-16
+  by: greyson
+- check: C2
+  key: UCFI
+  reason: "CN Healthy Food Tech (IROH renamed 2025-10-01); last trade 2025-10-01, placeholders until 2026-09-30"
+  added: 2026-10-16
+  by: greyson
+- check: C2
+  key: UCFIW
+  reason: "warrant of UCFI; same history as the common"
+  added: 2026-10-16
+  by: greyson

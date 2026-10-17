@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -49,7 +50,19 @@ from asof.ingest.security_master import (
     drop_table_corrections,
     normalize_spelling,
 )
-from asof.store.market import _files, _source, visible_bars, visible_master, visible_splits
+from asof.ingest.tickers import is_valid_symbol
+from asof.ingest.universe import ASSET_SCHEMA, assets_snapshots
+from asof.store.market import (
+    _alpaca_files,
+    _ext_files,
+    _source,
+    bars_source_sql,
+    visible_bars,
+    visible_master,
+    visible_splits,
+)
+
+ET = ZoneInfo("America/New_York")
 
 Gate = Literal["liquid", "all"] | None
 Tier = Literal["liquid", "all"]
@@ -76,6 +89,7 @@ BAD_BAR_RETURN = (0.5, 1.5)  # S3: next close / prev close, i.e. the price came 
 SPARSE_SESSION = 0.1  # I7: traded symbols below this share of the median
 RENAME_LAG_DAYS = 30  # N1: rows beyond this many days between last old bar and the record
 RELABEL_BAND = (0.1, 0.9)  # N3: identical-day share between "accident" and "relabelled"
+STALE_SESSIONS = 10  # C2: a listed symbol whose last bar is further behind the store's end
 
 
 @dataclass(frozen=True)
@@ -138,6 +152,7 @@ CHECKS: dict[str, CheckSpec] = dict(
         _spec("N2", "both names traded after the rename date", None, f"{_SYM}/{_SYM}:{_DATE}"),
         _spec("N3", "symbol pairs partly identical", None, f"{_SYM}/{_SYM}"),
         _spec("C1", "coverage per year", None, _YEAR),
+        _spec("C2", "listed asset with stale bars", "all", _SYM),
     ]
 )
 
@@ -204,7 +219,7 @@ def load_exceptions(path: Path) -> list[AuditException]:
 class CheckResult:
     spec: CheckSpec
     rows: pa.Table  # key, in_liquid, excepted, then the check's own columns; sorted by key
-    notes: dict[str, int | float]
+    notes: dict[str, int | float | str | None]
 
     def _count(self, liquid_only: bool) -> int:
         n = 0
@@ -278,9 +293,23 @@ _LIQ_SYMS = "_audit_liquid_symbols"
 _SESSIONS = "_audit_sessions"
 _TRADED = "_audit_traded"
 _ORPHANS = "_audit_orphans"
+_ALPACA_KEYS = "_audit_alpaca_keys"  # (symbol, t) of every Alpaca row, imported rows aside
+_LISTED = "_audit_listed"  # the Alpaca listing as of the audit (C2)
 
-_REGISTERED = (_RES, _MASTER, _MASTER_FILE, _CLASS, _SPLITS, _NAMES, _SEC, _LIQ_IDS, _QUAL_IDS)
+_REGISTERED = (
+    _RES,
+    _MASTER,
+    _MASTER_FILE,
+    _CLASS,
+    _SPLITS,
+    _NAMES,
+    _SEC,
+    _LIQ_IDS,
+    _QUAL_IDS,
+    _LISTED,
+)
 _TEMP_TABLES = (_LIQ_SYMS, _SESSIONS, _TRADED, _ORPHANS, _SPLIT_DAYS)
+_TEMP_VIEWS = (_RAW, _ALPACA_KEYS)
 
 
 def _liq_sym(column: str) -> str:
@@ -305,6 +334,7 @@ class _Audit:
         self.root = root
         self.as_of = as_of
         self._traded_ready = False
+        self.snapshot_date: date | None = None  # the listing C2 used; set by load()
 
     # -- setup -----------------------------------------------------------------------------------
 
@@ -332,17 +362,36 @@ class _Audit:
             _QUAL_IDS, pa.table({"security_id": pa.array(sorted(qualified_ids), pa.string())})
         )
 
-        files = _files(root, "1Day")
-        if files:
+        files, ext_files = _alpaca_files(root, "1Day"), _ext_files(root, "1Day")
+        if files or ext_files:
+            # one bar per (symbol, t): an imported row replaces the Alpaca row of its key
+            stamp = f"TIMESTAMPTZ '{as_of.isoformat()}'"
             con.execute(
                 f"CREATE OR REPLACE TEMP VIEW {_RAW} AS "
-                f"SELECT * REPLACE (CAST(year AS BIGINT) AS year) FROM {_source(files)} "
-                f"WHERE available_at <= TIMESTAMPTZ '{as_of.isoformat()}'"
+                f"SELECT * FROM ({bars_source_sql(files, ext_files, stamp)})"
             )
         else:
-            empty = BAR_SCHEMA.append(pa.field("year", pa.int64())).empty_table()
+            empty = (
+                BAR_SCHEMA.append(pa.field("year", pa.int64()))
+                .append(pa.field("source", pa.string()))
+                .empty_table()
+            )
             con.register("_audit_raw_empty", empty)
             con.execute(f"CREATE OR REPLACE TEMP VIEW {_RAW} AS SELECT * FROM _audit_raw_empty")
+        if files:
+            con.execute(
+                f"CREATE OR REPLACE TEMP VIEW {_ALPACA_KEYS} AS "
+                f"SELECT symbol, t FROM {_source(files)}"
+            )
+        else:
+            con.register(
+                "_audit_alpaca_keys_empty", BAR_SCHEMA.empty_table().select(["symbol", "t"])
+            )
+            con.execute(
+                f"CREATE OR REPLACE TEMP VIEW {_ALPACA_KEYS} AS "
+                "SELECT * FROM _audit_alpaca_keys_empty"
+            )
+        con.register(_LISTED, self._listed())
 
         con.execute(
             f"CREATE OR REPLACE TEMP TABLE {_LIQ_SYMS} AS SELECT DISTINCT symbol FROM {_MASTER} "
@@ -383,13 +432,39 @@ class _Audit:
         # SEC's table clean-ups (AFC still listed under Allied Capital until 2020-07) dropped
         return drop_table_corrections(normalize_spelling(pq.read_table(path)))
 
+    def _listed(self) -> pa.Table:
+        """Alpaca's listing as of the audit: the newest assets snapshot dated on or before
+        ``as_of`` (a snapshot is knowable from 00:00 New York of its date), kept to the symbols
+        the universe would take: active, not OTC, a valid symbol. ``snapshot_date`` is None when
+        no snapshot is usable."""
+        self.snapshot_date = None
+        usable: list[tuple[date, Path]] = []
+        for path in assets_snapshots(self.root):
+            try:
+                day = date.fromisoformat(path.parent.name.split("=", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if datetime(day.year, day.month, day.day, tzinfo=ET) <= self.as_of:
+                usable.append((day, path))
+        if not usable:
+            return ASSET_SCHEMA.empty_table()
+        self.snapshot_date, path = max(usable)
+        table = pq.read_table(path)
+        rows = [
+            r
+            for r in table.to_pylist()
+            if r["status"] == "active" and r["exchange"] != "OTC" and is_valid_symbol(r["symbol"])
+        ]
+        return pa.Table.from_pylist(rows, schema=ASSET_SCHEMA)
+
     def close(self) -> None:
-        for name in (*_REGISTERED, "_audit_raw_empty"):
+        for name in (*_REGISTERED, "_audit_raw_empty", "_audit_alpaca_keys_empty"):
             try:
                 self.con.unregister(name)
             except duckdb.Error:
                 pass
-        self.con.execute(f"DROP VIEW IF EXISTS {_RAW}")
+        for name in _TEMP_VIEWS:
+            self.con.execute(f"DROP VIEW IF EXISTS {name}")
         for name in _TEMP_TABLES:
             self.con.execute(f"DROP TABLE IF EXISTS {name}")
 
@@ -1082,6 +1157,13 @@ class _Audit:
                     FROM {_NAMES} n
                 ) GROUP BY 1
             ),
+            ext AS (
+                SELECT year(r.session_date) AS year, count(*) AS ext_bars,
+                       count(*) FILTER (WHERE EXISTS (
+                           SELECT 1 FROM {_ALPACA_KEYS} k WHERE k.symbol = r.symbol AND k.t = r.t
+                       )) AS ext_overrides
+                FROM {_RAW} r WHERE r.source <> 'alpaca' GROUP BY 1
+            ),
             y AS (SELECT year FROM b UNION SELECT year FROM nc),
             liq AS (
                 SELECT y.year, count(DISTINCT m.symbol) AS liquid_symbols
@@ -1095,13 +1177,49 @@ class _Audit:
                    coalesce(b.bars, 0) AS bars, coalesce(b.symbols, 0) AS symbols,
                    coalesce(liq.liquid_symbols, 0) AS liquid_symbols,
                    coalesce(nc.name_changes, 0) AS name_changes,
-                   coalesce(nc.name_changes_linked, 0) AS name_changes_linked
+                   coalesce(nc.name_changes_linked, 0) AS name_changes_linked,
+                   coalesce(ext.ext_bars, 0) AS ext_bars,
+                   coalesce(ext.ext_overrides, 0) AS ext_overrides
             FROM y LEFT JOIN b USING (year) LEFT JOIN nc USING (year) LEFT JOIN liq USING (year)
+                   LEFT JOIN ext USING (year)
             """
         )
         notes = {
             "name_changes": sum(table.column("name_changes").to_pylist()),
             "name_changes_linked": sum(table.column("name_changes_linked").to_pylist()),
+        }
+        return table, notes
+
+    def c2(self) -> tuple[pa.Table, dict]:
+        """Listed (Alpaca active, not OTC) symbols whose last visible bar lies more than
+        ``STALE_SESSIONS`` sessions before the store's newest visible session: the backfill
+        stopped asking for them (NOBL, whose SEC window closed in 2020) or they halted. Listed
+        symbols with no visible bar at all are only counted (a listing of a few days old and a
+        warrant that never traded are not errors). "Last bar" is any stored bar, a volume-0
+        placeholder included: the question is whether the vendor is still asked for and still
+        serving the symbol, not whether it still trades."""
+        table = self._q(
+            f"""
+            WITH last AS (
+                SELECT symbol, max(session_date) AS last_bar FROM {_RAW} GROUP BY symbol
+            ),
+            newest AS (SELECT coalesce(max(idx), 0) AS idx FROM {_SESSIONS})
+            SELECT l.symbol AS key, {_liq_sym("l.symbol")} AS _liq, l.symbol, l.name,
+                   l.exchange, b.last_bar, CAST(newest.idx - s.idx AS BIGINT) AS sessions_behind
+            FROM {_LISTED} l
+            JOIN last b USING (symbol)
+            JOIN {_SESSIONS} s ON s.session_date = b.last_bar
+            CROSS JOIN newest
+            WHERE newest.idx - s.idx > {STALE_SESSIONS}
+            ORDER BY key
+            """
+        )
+        no_bars = self._scalar(
+            f"SELECT count(*) FROM {_LISTED} WHERE symbol NOT IN (SELECT symbol FROM {_RAW})"
+        )
+        notes = {
+            "no_bars": int(no_bars or 0),
+            "snapshot_date": self.snapshot_date.isoformat() if self.snapshot_date else None,
         }
         return table, notes
 

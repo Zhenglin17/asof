@@ -252,12 +252,20 @@ def root(tmp_path: Path) -> Path:
 
 
 def test_schemas_extend_the_bar_schema() -> None:
-    assert UNRESOLVED_BAR_SCHEMA.names == [*BAR_SCHEMA.names, "traded"]
-    assert RESOLVED_BAR_SCHEMA.names == [*BAR_SCHEMA.names, "traded", "security_id", "split_day"]
+    # ``source`` (2026-10-16): where a bar came from, 'alpaca' or an imported row's source
+    assert UNRESOLVED_BAR_SCHEMA.names == [*BAR_SCHEMA.names, "source", "traded"]
+    assert RESOLVED_BAR_SCHEMA.names == [
+        *BAR_SCHEMA.names,
+        "source",
+        "traded",
+        "security_id",
+        "split_day",
+    ]
     for schema in (UNRESOLVED_BAR_SCHEMA, RESOLVED_BAR_SCHEMA):
         for field in BAR_SCHEMA:
             assert schema.field(field.name).type == field.type
         assert schema.field("traded").type == pa.bool_()
+        assert schema.field("source").type == pa.string()
     assert RESOLVED_BAR_SCHEMA.field("security_id").type == pa.string()
     assert RESOLVED_BAR_SCHEMA.field("split_day").type == pa.bool_()
     assert MASTER_SCHEMA.names[-1] == "end_available_at"

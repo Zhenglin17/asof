@@ -367,9 +367,63 @@ def test_audit_numbers_that_must_hold(con: duckdb.DuckDBPyConnection) -> None:
     }
     for check in ("P1", "P2", "P3", "P4", "P5", "M1", "M4"):
         assert results[check].total == 0, check
-    assert results["I7"].notes["min_traded_symbols"] > 1_000
+    min_traded = results["I7"].notes["min_traded_symbols"]
+    assert isinstance(min_traded, int) and min_traded > 1_000
     i4 = {r["key"]: r["bars"] for r in results["I4"].rows.to_pylist()}
     assert i4["BBUC"] == 14
     s3 = {r["key"]: r for r in results["S3"].rows.to_pylist()}
     exeew = s3["EXEEW:2026-02-03"]
     assert (exeew["prev_close"], exeew["close"], exeew["next_close"]) == (105.0, 0.0101, 125.0)
+
+
+# -- the second bar source -----------------------------------------------------------------------
+
+
+def test_para_2022_2025_is_paramount_from_the_second_source(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # Alpaca rewrote PARA with Banzai's chain (VII -> BNZI -> PARA) after the 2026-08-07 reuse;
+    # Paramount Global's class B bars 2022-02-17 .. 2025-08-06 come from Yahoo (symbol SKYD),
+    # imported as the first bar_imports entry on 2026-10-16. Checked by hand: 2024-06-03 close
+    # 12.80 (Paramount), while Banzai's PARA row for that day closes at 0.1902.
+    as_of = ny(2026, 10, 16)
+    day = ny(2024, 6, 3)
+    window = {"start": day, "end": ny(2024, 6, 4)}
+    [row] = bars(con, as_of, ["PARA"], **window).to_pylist()
+    assert row["source"] == "yahoo"
+    assert row["close"] == pytest.approx(12.80, abs=1e-4)
+    assert row["close"] != pytest.approx(0.1902, abs=1e-4)
+    assert row["security_id"] == sid(con, "VIAC", date(2021, 6, 1))
+    # the imported bar obeys the daily availability rule like any other
+    assert bars(con, ny(2024, 6, 3, 19), ["PARA"], **window).num_rows == 0
+    assert bars(con, ny(2024, 6, 3, 20), ["PARA"], **window).num_rows == 1
+    # inside the imported range no Alpaca row for PARA is served any more
+    imported = bars(
+        con,
+        as_of,
+        ["PARA"],
+        start=ny(2022, 2, 17),
+        end=ny(2025, 8, 7),
+        resolve=False,
+        include_untraded=True,
+    )
+    assert imported.column("source").to_pylist().count("alpaca") == 0
+    assert imported.num_rows == 869
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="⑥-b: the relabel rule must compare against the acquirer's whole chain (VII + BNZI) "
+    "and end Paramount's PARA segment at the 2025-08-07 merger; until then Banzai's bars under "
+    "PARA resolve to Paramount (reviewer 2026-10-16 #2)",
+)
+def test_banzai_bars_under_para_do_not_resolve_to_paramount(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # Measured 2026-10-16: 251 Alpaca PARA bars 2025-08-07 .. 2026-08-06 (Banzai, close
+    # 0.22 .. 7.66) come back with Paramount's security_id. Audit I2 reports BNZI/PARA meanwhile.
+    rows = bars(
+        con, ny(2026, 10, 16), ["PARA"], start=ny(2025, 8, 7), end=ny(2026, 8, 7)
+    ).to_pylist()
+    paramount = sid(con, "VIAC", date(2021, 6, 1))
+    assert all(r["security_id"] != paramount for r in rows)

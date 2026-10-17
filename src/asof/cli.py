@@ -2,7 +2,7 @@
 
 import os
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -13,7 +13,8 @@ from sqlmodel import Session
 
 from asof import __version__
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
-from asof.ingest.bars import ET, Partition, backfill
+from asof.ingest.bar_imports import import_bars, load_bar_imports
+from asof.ingest.bars import ET, Partition, backfill, windows_for_requests
 from asof.ingest.corporate_actions import build_tables, download_all
 from asof.ingest.http import make_fetch
 from asof.ingest.instrument_class import (
@@ -52,10 +53,12 @@ from asof.ingest.universe import (
     load_assets,
     load_history,
     load_universe,
+    read_symbols_file,
     rename_chains,
     save_assets_snapshot,
 )
 from asof.ingest.watchlist import load_watchlist, resolve_watchlist
+from asof.ingest.yahoo import YahooClient, YahooError
 from asof.store.audit import (
     CHECKS,
     load_exceptions,
@@ -321,6 +324,13 @@ def market_backfill(
     symbols: Annotated[
         str | None, typer.Option(help="Comma-separated symbols instead of the stored universe.")
     ] = None,
+    symbols_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--symbols-file",
+            help="File with one symbol per line (# comments) instead of the stored universe.",
+        ),
+    ] = None,
     force: Annotated[bool, typer.Option("--force", help="Refetch complete partitions.")] = False,
     data_dir: Annotated[
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
@@ -328,14 +338,25 @@ def market_backfill(
 ) -> None:
     """Download bars into partitioned Parquet; reruns only fetch what is missing or open.
     Stored bars are never removed: a refetch adds to a partition file, and discarding one means
-    deleting the file."""
+    deleting the file. With --symbols or --symbols-file plus --force, only those symbols are
+    refetched into their partitions (a top-up after a universe fix)."""
     tf = _timeframe(timeframe)
     root = _market_root(data_dir)
-    universe = (
-        _parse_symbols(symbols) if symbols else load_universe(root, data_dir or default_data_dir())
-    )
-    windows = symbol_windows(load_history(root))
+    if symbols and symbols_file:
+        _fail("Pass either --symbols or --symbols-file, not both.")
+    if symbols:
+        universe = _parse_symbols(symbols)
+    elif symbols_file:
+        try:
+            universe = read_symbols_file(symbols_file)
+        except (OSError, ValueError) as error:
+            _fail(str(error))
+    else:
+        universe = load_universe(root, data_dir or default_data_dir())
     active = active_symbols(load_assets(root))
+    # an SEC window only limits symbols Alpaca no longer lists (NOBL's window closed in 2020
+    # while it kept trading; 197 listed symbols lost years of bars that way)
+    windows = windows_for_requests(symbol_windows(load_history(root)), active)
     if not universe:
         _fail("Universe is empty. Run `asof market universe` first or pass --symbols.")
     try:
@@ -371,6 +392,51 @@ def market_backfill(
         f"{len(report.written)} partitions written, {len(report.skipped)} skipped, "
         f"{report.rows:,} rows, {time.monotonic() - started:,.0f}s"
     )
+
+
+@market_app.command("import-bars")
+def market_import_bars(
+    manifest: Annotated[Path, typer.Option(help="Registered second-source imports.")] = Path(
+        "configs/bar_imports.yaml"
+    ),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Fetch every registered import from its source and file it under <market>/bars_1d_ext.
+    Rerunning adds nothing for keys already stored; the raw response is kept under
+    $ASOF_DATA_DIR/raw/<source>/."""
+    root = _market_root(data_dir)
+    raw_root = (data_dir or default_data_dir()) / "raw"
+    try:
+        entries = load_bar_imports(manifest)
+    except (OSError, ValueError) as error:
+        _fail(str(error))
+    if not entries:
+        typer.echo(f"{manifest}: nothing registered")
+        return
+    client = YahooClient()
+    for entry in entries:
+        fetched_at = datetime.now(UTC)
+        try:
+            bars, body = client.daily_bars(entry.source_symbol, entry.start, entry.end)
+        except (YahooError, httpx.HTTPError) as error:
+            _fail(f"{entry.symbol} <- {entry.source} {entry.source_symbol}: {error}")
+        archive = (
+            raw_root
+            / entry.source
+            / (f"{entry.source_symbol}_{entry.start}_{entry.end}_{fetched_at:%Y%m%dT%H%M%SZ}.json")
+        )
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(body)
+        report = import_bars(root, entry, bars, fetched_at)
+        typer.echo(
+            f"{entry.symbol} <- {entry.source} {entry.source_symbol} {entry.start}..{entry.end}: "
+            f"{report.rows_fetched:,} fetched, {report.rows_in_range:,} in range, "
+            f"{report.rows_added:,} added, {report.rows_existing:,} already stored"
+            + (f" ({report.first_session}..{report.last_session})" if report.first_session else "")
+        )
+        typer.echo(f"  raw -> {archive}")
 
 
 @market_app.command("status")
@@ -718,7 +784,11 @@ def market_audit(
         )
         if r.notes:
             notes = ", ".join(
-                f"{k}={v:,.4g}" if isinstance(v, float) else f"{k}={v:,}"
+                f"{k}={v:,.4g}"
+                if isinstance(v, float)
+                else f"{k}={v:,}"
+                if isinstance(v, int)
+                else f"{k}={v}"
                 for k, v in r.notes.items()
             )
             typer.echo(f"{'':13}{notes}")

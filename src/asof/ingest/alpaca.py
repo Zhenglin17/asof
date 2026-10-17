@@ -58,7 +58,7 @@ class Bar(BaseModel):
     low: float
     close: float
     volume: int
-    trade_count: int
+    trade_count: int | None  # None: the source has no trade count (a bar imported from Yahoo)
     vwap: float
 
     @field_validator("t")

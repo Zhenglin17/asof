@@ -30,13 +30,19 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from asof.ingest.alpaca import Timeframe
+from asof.ingest.bar_imports import EXT_BAR_SCHEMA, EXT_DIR
 from asof.ingest.bars import _DIRS, BAR_SCHEMA
 from asof.ingest.corporate_actions import SPLIT_SCHEMA
 from asof.ingest.security_master import MASTER_FILE, MASTER_SCHEMA
 
 _YEAR_DIR = re.compile(r"^year=(\d{4})$")
+_EXT_DIRS: dict[str, str] = {"1Day": EXT_DIR}  # imported bars exist for daily bars only
 
-UNRESOLVED_BAR_SCHEMA = BAR_SCHEMA.append(pa.field("traded", pa.bool_()))
+# ``source`` names where a bar came from: 'alpaca' for the Alpaca files (nothing on disk says
+# so; the read path adds it) or the stored source of an imported row ('yahoo').
+UNRESOLVED_BAR_SCHEMA = BAR_SCHEMA.append(pa.field("source", pa.string())).append(
+    pa.field("traded", pa.bool_())
+)
 RESOLVED_BAR_SCHEMA = UNRESOLVED_BAR_SCHEMA.append(pa.field("security_id", pa.string())).append(
     pa.field("split_day", pa.bool_())
 )
@@ -55,8 +61,7 @@ def _aware_utc(value: datetime, name: str) -> datetime:
     return value.astimezone(UTC)
 
 
-def _year_dirs(root: Path, timeframe: Timeframe) -> list[tuple[int, Path]]:
-    directory = root / _DIRS[timeframe]
+def _year_dirs_in(directory: Path) -> list[tuple[int, Path]]:
     if not directory.exists():
         return []
     found = []
@@ -67,17 +72,71 @@ def _year_dirs(root: Path, timeframe: Timeframe) -> list[tuple[int, Path]]:
     return found
 
 
+def _year_dirs(root: Path, timeframe: Timeframe) -> list[tuple[int, Path]]:
+    return _year_dirs_in(root / _DIRS[timeframe])
+
+
+def _parquet_files(year_dirs: Sequence[tuple[int, Path]]) -> list[Path]:
+    return [p for _, year_dir in year_dirs for p in sorted(year_dir.rglob("*.parquet"))]
+
+
+def _alpaca_files(root: Path, timeframe: Timeframe) -> list[Path]:
+    return _parquet_files(_year_dirs(root, timeframe))
+
+
+def _ext_files(root: Path, timeframe: Timeframe) -> list[Path]:
+    """Imported-bar files, each checked to carry the import schema: a file of another shape
+    would read as ``source`` NULL and pass for a vendor row."""
+    directory = _EXT_DIRS.get(timeframe)
+    if not directory:
+        return []
+    files = _parquet_files(_year_dirs_in(root / directory))
+    for path in files:
+        if not pq.read_schema(path).equals(EXT_BAR_SCHEMA, check_metadata=False):
+            raise ValueError(f"{path}: not an imported-bar file (columns differ from the schema)")
+    return files
+
+
 def _files(root: Path, timeframe: Timeframe) -> list[Path]:
-    return [
-        p
-        for _, year_dir in _year_dirs(root, timeframe)
-        for p in sorted(year_dir.rglob("*.parquet"))
-    ]
+    """Every bar file of ``timeframe``: the Alpaca partitions, then the imported ones."""
+    return [*_alpaca_files(root, timeframe), *_ext_files(root, timeframe)]
 
 
 def _source(files: Sequence[Path]) -> str:
     paths = ", ".join("'" + str(p).replace("'", "''") + "'" for p in files)
     return f"read_parquet([{paths}], hive_partitioning = true, union_by_name = true)"
+
+
+def bars_source_sql(
+    files: Sequence[Path], ext_files: Sequence[Path], as_of: str | None = None
+) -> str:
+    """A SELECT over the bar files yielding the bar columns, the hive ``year`` and ``source``.
+
+    ``files`` are Alpaca partitions (source 'alpaca'), ``ext_files`` imported bars with their
+    stored ``source``. When both hold the same ``(symbol, t)`` only the imported row is
+    returned: an import is the recorded decision that Alpaca's row for that key is wrong.
+    ``as_of`` is a SQL expression (``$as_of`` or a literal); when given, every branch keeps
+    only rows with ``available_at`` not after it, so an imported row that is not yet knowable
+    does not hide a vendor row that is. At least one list must be non-empty. Used as a subquery
+    by ``visible_bars`` and by the audit's raw view, so both see one bar per key.
+    """
+    columns = ", ".join(BAR_SCHEMA.names)
+    knowable = f"available_at <= {as_of}" if as_of else None
+    alpaca = f"SELECT {columns}, CAST(year AS BIGINT) AS year, 'alpaca' AS source FROM "
+    ext = f"SELECT {columns}, CAST(year AS BIGINT) AS year, source FROM {_source(ext_files)}"
+    if knowable:
+        ext += f" WHERE {knowable}"
+    if not ext_files:
+        return alpaca + _source(files) + (f" WHERE {knowable}" if knowable else "")
+    if not files:
+        return ext
+    not_overridden = (
+        f"NOT EXISTS (SELECT 1 FROM {_source(ext_files)} e WHERE "
+        + (f"{knowable.replace('available_at', 'e.available_at')} AND " if knowable else "")
+        + "e.symbol = a.symbol AND e.t = a.t)"
+    )
+    alpaca_where = f"{knowable.replace('available_at', 'a.available_at')} AND " if knowable else ""
+    return f"{alpaca}{_source(files)} a WHERE {alpaca_where}{not_overridden} UNION ALL {ext}"
 
 
 def visible_bars(
@@ -113,8 +172,9 @@ def visible_bars(
     start_utc = _aware_utc(start, "start") if start is not None else None
     end_utc = _aware_utc(end, "end") if end is not None else None
     master = visible_master(con, root, as_of_utc) if resolve else None
-    files = _files(root, timeframe)
-    if not files:
+    files = _alpaca_files(root, timeframe)
+    ext_files = _ext_files(root, timeframe)
+    if not files and not ext_files:
         return (RESOLVED_BAR_SCHEMA if resolve else UNRESOLVED_BAR_SCHEMA).empty_table()
 
     clauses = ["available_at <= $as_of"]
@@ -132,8 +192,11 @@ def visible_bars(
         clauses.append("volume > 0")
 
     con.execute("SET TimeZone = 'UTC'")
-    columns = ", ".join(f"b.{name}" for name in BAR_SCHEMA.names)
-    bars = f"(SELECT * FROM {_source(files)} WHERE {' AND '.join(clauses)}) b"
+    columns = ", ".join(f"b.{name}" for name in (*BAR_SCHEMA.names, "source"))
+    bars = (
+        f"(SELECT * FROM ({bars_source_sql(files, ext_files, '$as_of')}) "
+        f"WHERE {' AND '.join(clauses)}) b"
+    )
     if master is None:
         query = f"SELECT {columns}, b.volume > 0 AS traded FROM {bars} ORDER BY b.symbol, b.t"
         return con.execute(query, params).to_arrow_table().cast(UNRESOLVED_BAR_SCHEMA)

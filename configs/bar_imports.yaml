@@ -1,0 +1,31 @@
+# Bars imported from a second source, filed under <market>/bars_1d_ext by
+# `asof market import-bars`. Each entry needs every field; an imported row replaces the Alpaca
+# row of the same (symbol, t) on read, so an entry is the recorded decision that Alpaca's rows
+# for that symbol and range are wrong or missing.
+#
+# Yahoo's chart prices and volumes are split-adjusted (NVDA 2024-06-07: 120.89 there, 1208.88
+# raw). The store keeps raw prices, so a lineage with a split after `start` cannot be imported
+# from it; `import_bars` refuses such an entry.
+#
+#   - symbol: PARA              # the symbol the bars are stored under (as traded at the time)
+#     source: yahoo             # the only source so far (chart API, one-off recoveries)
+#     source_symbol: SKYD       # the symbol the source files the series under
+#     start: 2022-02-17         # first and last session to import, inclusive
+#     end: 2025-08-06
+#     reason: "..."
+#     added: 2026-10-16
+#     by: greyson
+
+- symbol: PARA
+  source: yahoo
+  source_symbol: SKYD
+  start: 2022-02-17
+  end: 2025-08-06
+  reason: >-
+    Paramount Global class B. Alpaca filed the ticker's whole history under its 2026-08-07
+    holder (Banzai: VII -> BNZI -> PARA), so the Paramount bars between the VIAC -> PARA rename
+    and the Skydance merger (PSKY from 2025-08-07) no longer exist there. Yahoo keeps the
+    Viacom/CBS/Paramount lineage under SKYD; on the 85 VIAC days and the 300 SKYD days both
+    vendors have, open and close agree to the cent and Yahoo's volume runs about 5% lower.
+  added: 2026-10-16
+  by: greyson
