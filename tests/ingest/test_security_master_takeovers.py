@@ -833,3 +833,65 @@ def test_r_previous_piece_that_chains_to_another_name_is_left_for_a_human() -> N
     assert old["cik"] == CH_Y
     [row] = touching(conflicts, "LBL", CH_CUT)
     assert row["resolution"] == "unresolved"
+
+
+# --- guards on R called directly: shapes the full build does not produce today ---------------
+# Constructed pieces (no real case in the store on 2026-10-19). The taker trades nothing in the
+# span, so without the guard R would merge; each test pins that the row stays unresolved and
+# nothing is moved, clipped or dropped.
+
+GD_V, GD_CUT = date(2022, 3, 1), date(2022, 6, 1)
+GD_KNOWN = et_midnight(GD_CUT)
+
+
+def _guard_case(extra: list[sm._Segment]) -> tuple[list[sm._Segment], sm._Union, list[dict], set]:
+    before = sm._Segment("LBL", GD_V, GD_CUT, cik=8001, available_at=et_midnight(GD_V))
+    after = sm._Segment("LBL", GD_CUT, None, cik=8002, available_at=GD_KNOWN)
+    pieces = [before, after, *extra]
+    for i, p in enumerate(pieces):
+        p.key = i
+    uf = sm._Union(len(pieces))
+    for p in extra:
+        if p.symbol != "LBL":
+            uf.union(after.key, p.key)  # a parallel name of the taker's security
+    conflicts = [{"detail": "constructed", "resolution": "unresolved"}]
+    con = duckdb.connect()
+    try:
+        con.register("_bars", bars_table(bar_rows("LBL", GD_V, GD_CUT - timedelta(days=1), 20.0)))
+        dropped = sm._settle_takeovers(con, pieces, uf, [(0, before, after, GD_CUT)], conflicts)
+    finally:
+        con.close()
+    return pieces, uf, conflicts, dropped
+
+
+def test_r_taker_piece_running_past_the_cut_is_not_clipped() -> None:
+    # A piece of the taker's chain starts inside the span and runs on past the cut (an open
+    # parallel name, no traded bar in the span). Clipping it to the span's start would orphan
+    # its bars after the cut, so R must not merge.
+    parallel = sm._Segment("TKRB", date(2022, 4, 1), None, cik=8002, available_at=GD_KNOWN)
+    pieces, uf, conflicts, dropped = _guard_case([parallel])
+    before, after = pieces[0], pieces[1]
+
+    assert conflicts[0]["resolution"] == "unresolved"
+    assert dropped == set()
+    assert (parallel.valid_from, parallel.valid_to) == (date(2022, 4, 1), None)
+    assert uf.find(before.key) != uf.find(after.key)
+    assert (before.cik, before.evidence) == (8001, "bars_only")
+
+
+def test_r_previous_piece_following_another_on_the_label_is_not_moved() -> None:
+    # The label had an earlier piece ending where the previous holder's begins. That piece's
+    # end is knowable when the previous holder's start was; moving the previous holder's
+    # available_at to the takeover would break the pair (check_master refuses it), so R must
+    # not merge.
+    earlier = sm._Segment(
+        "LBL", date(2020, 1, 2), GD_V, cik=8000, available_at=et_midnight(date(2020, 1, 2))
+    )
+    earlier.end_available_at = et_midnight(GD_V)
+    pieces, uf, conflicts, dropped = _guard_case([earlier])
+    before, after = pieces[0], pieces[1]
+
+    assert conflicts[0]["resolution"] == "unresolved"
+    assert dropped == set()
+    assert before.available_at == et_midnight(GD_V)
+    assert uf.find(before.key) != uf.find(after.key)
