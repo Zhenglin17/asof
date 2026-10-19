@@ -46,7 +46,7 @@ from asof.ingest import sec_ticker_history as sth
 from asof.store import audit as audit_mod
 from asof.store.audit import CHECKS, CheckResult, run_audit
 from asof.store.market import market_root
-from tests.store.test_audit import (
+from tests.store.audit_world import (
     DAYS,
     LATE,
     SID_D1,

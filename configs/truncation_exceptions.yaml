@@ -1,0 +1,7 @@
+# Leaks `asof market truncation` reported that a human reviewed and accepted. Each entry needs a
+# key (SYMBOL:YYYY-MM-DD:reason, as printed), a reason and the date it was reviewed.
+#
+#   - key: CYCN:2020-01-02:fields_differ
+#     reason: "..."
+#     date: 2026-10-19
+[]

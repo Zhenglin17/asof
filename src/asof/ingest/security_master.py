@@ -39,7 +39,10 @@ other table. A segment's end is a fact of its own with its own instant, ``end_av
 (the rename, takeover or CIK switch that closed it; null while the segment is open): a reader in
 2022 must see BK as open although the file says it ends 2026-05-21, so ``visible_master`` masks
 ``valid_to`` until that instant. A closed segment and the one that replaces it become knowable
-together, at the same instant, because they are two sides of one event.
+together, at the same instant, because they are two sides of one event. The CIK is a third fact
+with its own instant, ``cik_available_at``: the SEC table may list a label months after it starts
+trading (AAAU: bars from 2020-01-02, listed from 2020-07-10), and ``visible_master`` hides the
+CIK until then.
 """
 
 import os
@@ -80,6 +83,7 @@ MASTER_SCHEMA = pa.schema(
         ("valid_from", pa.date32()),
         ("valid_to", pa.date32()),
         ("cik", pa.int64()),
+        ("cik_available_at", TS_UTC),  # when the CIK became knowable; null iff cik is
         ("cusip", pa.string()),
         ("evidence", pa.string()),
         ("available_at", TS_UTC),
@@ -436,6 +440,7 @@ class _Segment:
     cik_cut: bool = False  # created by a CIK switch inside one symbol
     resumed: bool = False  # opened by bars resuming under a closed label (a new holder)
     cik: int | None = None
+    cik_since: datetime | None = None  # the snapshot that first showed the CIK
     cusip: str | None = None
     evidence: str = "bars_only"
     available_at: datetime | None = None
@@ -1652,7 +1657,8 @@ def _settle_takeovers(
             continue  # stays unresolved
         lost = before.cik
         uf.union(before.key, after.key)
-        before.cik, before.evidence = after.cik, "relabelled"
+        # the taker's CIK is known no earlier on its relabelled history than on its own piece
+        before.cik, before.cik_since, before.evidence = after.cik, after.cik_since, "relabelled"
         before.available_at = before.end_available_at = after.available_at
         for q in inside:
             if q.valid_from >= before.valid_from:  # type: ignore[operator]
@@ -1671,7 +1677,9 @@ def _closes_around(
     con: duckdb.DuckDBPyConnection, cuts: list[tuple[str, date]]
 ) -> dict[tuple[str, date], tuple[date | None, float | None, date | None, float | None]]:
     """Last traded (date, close) before each cut and first at or after it. Volume-0 filler bars
-    (frozen close) would make any delisted label look continuous with its next holder."""
+    (frozen close) would make any delisted label look continuous with its next holder. Every cut
+    gets an answer, all None when its label has no traded bar at all (BMR at 2022-10-21: filler
+    only until 2023-02-28)."""
     if not cuts:
         return {}
     con.register(
@@ -1692,7 +1700,10 @@ def _closes_around(
         """
     ).fetchall()
     con.unregister("_cuts")
-    return {(s, cut): (d0, c0, d1, c1) for s, cut, d0, c0, d1, c1 in rows}
+    out: dict[tuple[str, date], tuple[date | None, float | None, date | None, float | None]]
+    out = dict.fromkeys(cuts, (None, None, None, None))
+    out.update({(s, cut): (d0, c0, d1, c1) for s, cut, d0, c0, d1, c1 in rows})
+    return out
 
 
 def _continuous(around: tuple[date | None, float | None, date | None, float | None]) -> bool:
@@ -1706,27 +1717,45 @@ def _continuous(around: tuple[date | None, float | None, date | None, float | No
 
 def _segment_cik(
     seg: _Segment, presence: list[tuple[date, int]], left: int | None = None
-) -> int | None:
-    """``left``: the CIK of the holder that vacated this label by a rename on the day this
+) -> tuple[int | None, datetime | None]:
+    """The segment's CIK and the snapshot instant that first showed it (00:00 New York).
+
+    ``left``: the CIK of the holder that vacated this label by a rename on the day this
     segment starts (rule L). Its rows still sit on the label for a snapshot or two of SEC lag
     (XPER under Adeia's 1803696 on 2022-10-03, ARNC under Arconic Inc's 4281 until 07-10) and
     are not the new holder's."""
     inside = [
-        cik
+        (day, cik)
         for day, cik in presence
         if (seg.valid_from is None or day >= seg.valid_from)
         and (seg.valid_to is None or day < seg.valid_to)
         and cik != left
     ]
+    # Known from the first snapshot inside the segment, even when an earlier one listed the CIK:
+    # matching that earlier row to the label may need a later spelling (BRKB until 2020, BRK.B
+    # after; normalize_spelling joins them only once both are in the table).
     if inside:
-        return inside[-1]
-    before = [cik for day, cik in presence if seg.valid_from is not None and day < seg.valid_from]
+        cik = inside[-1][1]
+        return cik, _midnight(min(day for day, c in inside if c == cik))
+    before = [
+        (day, cik) for day, cik in presence if seg.valid_from is not None and day < seg.valid_from
+    ]
     # A label's opening segment may predate our bars; its SEC rows then sit before valid_from.
     # Only trust them when nothing says the label changed hands since (no start edge, not a
     # resumption: the ETF that took INTL is not StoneX, whose rows sit before it).
     if before and seg.start is None and not seg.cik_cut and not seg.resumed:
-        return before[-1]
-    return None
+        return before[-1][1], _midnight(before[-1][0])
+    return None, None
+
+
+def _cik_available_at(seg: _Segment) -> datetime | None:
+    """Never before the segment itself is known: a CIK listed before the first bar is learned
+    with the segment."""
+    if seg.cik is None:
+        return None
+    if seg.cik_since is None or seg.available_at is None:
+        return seg.available_at
+    return max(seg.cik_since, seg.available_at)
 
 
 def apply_overrides(
@@ -1863,7 +1892,7 @@ def build_security_master(
             # let a reader who may not yet know the end see that one is coming.
             leaver = leavers.get((p.symbol, p.valid_from)) if p.start is not None else None  # type: ignore[arg-type]
             left = leaver.cik if leaver is not None and not _round_trip(leaver, p) else None
-            p.cik = _segment_cik(p, presence.get(p.symbol, []), left)
+            p.cik, p.cik_since = _segment_cik(p, presence.get(p.symbol, []), left)
             if p.end is not None and p.valid_to is not None:
                 leavers[(p.symbol, p.valid_to)] = p
             p.cusip = p.start.new_cusip if p.start else None
@@ -2052,7 +2081,8 @@ def build_security_master(
                     and q.available_at <= p.available_at
                 ]
                 if known:
-                    p.cik = min(known, key=lambda q: abs((q.valid_from - p.valid_from).days)).cik  # type: ignore[operator]
+                    donor = min(known, key=lambda q: abs((q.valid_from - p.valid_from).days))  # type: ignore[operator]
+                    p.cik, p.cik_since = donor.cik, donor.cik_since
 
         # Stable, content-derived ids: chains ordered by their earliest segment.
         order = sorted(
@@ -2101,6 +2131,7 @@ def build_security_master(
                 "valid_from": p.valid_from,
                 "valid_to": p.valid_to,
                 "cik": p.cik,
+                "cik_available_at": _cik_available_at(p),
                 "cusip": p.cusip,
                 "evidence": p.evidence,
                 "available_at": p.available_at,
@@ -2133,13 +2164,23 @@ def load_overrides(path: Path) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict) or "reason" not in item:
             raise ValueError(f"{path}: every override needs a reason: {item!r}")
+        if item.get("date") is None:
+            raise ValueError(f"{path}: every override needs the date it was decided: {item!r}")
     return raw
 
 
 def build_from_store(
-    market_root: Path, overrides: Sequence[Mapping[str, Any]] = ()
+    market_root: Path,
+    overrides: Sequence[Mapping[str, Any]] = (),
+    *,
+    as_of: datetime | None = None,
 ) -> tuple[pa.Table, pa.Table]:
-    """Build from the daily bars, the SEC history and the Alpaca name changes on disk."""
+    """Build from the daily bars, the SEC history and the Alpaca name changes on disk.
+
+    With ``as_of``, only the inputs knowable then (``master_truncation.truncate_inputs``): the
+    master a build at that instant would have produced, for the truncation test."""
+    if as_of is not None and as_of.tzinfo is None:
+        raise ValueError("as_of must be timezone-aware")
     # Imported bars override the vendor's row of the same (symbol, t), exactly as the read path
     # serves them (PARA 2022-02..2025-08 is Paramount from Yahoo, not Alpaca's Banzai copies):
     # a master built on the vendor's rows alone would judge Paramount's piece on Banzai's bars.
@@ -2179,6 +2220,12 @@ def build_from_store(
         )
     finally:
         con.close()
+    if as_of is not None:
+        from asof.ingest.master_truncation import truncate_inputs  # noqa: PLC0415  (imports us)
+
+        bars, sec, name_changes, overrides = truncate_inputs(
+            bars=bars, sec_history=sec, name_changes=name_changes, overrides=overrides, as_of=as_of
+        )
     return build_security_master(
         bars=bars,
         sec_history=sec,
@@ -2215,6 +2262,12 @@ _MASTER_RULES: dict[str, str] = {
         "SELECT count(*) FROM {v} a JOIN {v} b ON a.symbol = b.symbol "
         "AND a.valid_to = b.valid_from "
         "WHERE a.end_available_at IS DISTINCT FROM b.available_at"
+    ),
+    "cik without cik_available_at or the reverse": (
+        "SELECT count(*) FROM {v} WHERE (cik IS NULL) <> (cik_available_at IS NULL)"
+    ),
+    "cik_available_at before available_at": (
+        "SELECT count(*) FROM {v} WHERE cik_available_at < available_at"
     ),
 }
 

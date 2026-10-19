@@ -48,9 +48,8 @@ from asof.ingest.universe import save_assets_snapshot
 from asof.store.audit import CHECKS, STALE_SESSIONS, AuditException, CheckResult, run_audit
 from asof.store.market import market_root
 from tests.ingest.fakes import make_asset
-from tests.store.test_audit import (
+from tests.store.audit_world import (
     DAYS,
-    HEAD,
     LATE,
     SID_AAA,
     World,
@@ -60,6 +59,7 @@ from tests.store.test_audit import (
     rows,
     series,
 )
+from tests.store.test_audit import HEAD
 from tests.store.test_market import avail
 from tests.store.test_market_ext import ext_row, write_ext
 

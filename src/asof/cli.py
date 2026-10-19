@@ -8,6 +8,7 @@ from typing import Annotated, NoReturn
 
 import duckdb
 import httpx
+import pyarrow.parquet as pq
 import typer
 from sqlmodel import Session
 
@@ -24,6 +25,12 @@ from asof.ingest.instrument_class import (
     write_instrument_class,
 )
 from asof.ingest.instrument_class import build_from_store as build_classes_from_store
+from asof.ingest.master_truncation import (
+    compare,
+    default_instants,
+    diff_key,
+    load_truncation_exceptions,
+)
 from asof.ingest.sec_ticker_history import (
     EXCHANGE_HISTORY_PATH,
     EXCHANGE_TARGET,
@@ -806,3 +813,81 @@ def market_audit(
         typer.echo(f"gated checks not clean at tier {tier}: {', '.join(failed)}")
         raise typer.Exit(code=2)
     typer.echo(f"all gated checks clean at tier {tier} ({len(CHECKS)} checks known)")
+
+
+@market_app.command("truncation")
+def market_truncation(
+    as_of: Annotated[
+        list[datetime] | None,
+        typer.Option(
+            "--as-of",
+            help="Instant to rebuild at (date = 00:00 New York); repeatable. "
+            "Default: the named instants plus each evidence kind's spread.",
+        ),
+    ] = None,
+    overrides: Annotated[Path, typer.Option(help="Human decisions applied last.")] = Path(
+        "configs/security_overrides.yaml"
+    ),
+    exceptions: Annotated[Path, typer.Option(help="Reviewed leaks.")] = Path(
+        "configs/truncation_exceptions.yaml"
+    ),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Rebuild the security master from the inputs knowable at each instant and diff it with the
+    full master as seen then. Exit 0 when every leak is excepted, 2 when not; rows go to
+    <market>/audit/truncation/<UTC instant>.parquet."""
+    root = _market_root(data_dir)
+    if not overrides.exists():
+        _fail(f"{overrides}: overrides file not found (run from the repo root or pass --overrides)")
+    try:
+        decisions = load_overrides(overrides)
+        reviewed = load_truncation_exceptions(exceptions)
+    except ValueError as error:
+        _fail(str(error))
+    started = time.monotonic()
+    full, _ = build_from_store(root, decisions)
+    instants = (
+        sorted({_as_of_option(t).astimezone(UTC) for t in as_of})
+        if as_of
+        else default_instants(full)
+    )
+    out_dir = root / "audit" / "truncation"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    typer.echo(f"full master {full.num_rows:,} segments; {len(instants)} instants")
+    open_leaks: dict[str, str] = {}
+    matched: set[str] = set()
+    for t in instants:
+        step = time.monotonic()
+        try:
+            truncated, _ = build_from_store(root, decisions, as_of=t)
+        except ValueError as error:
+            _fail(str(error))
+        diff = compare(full, truncated, t)
+        path = out_dir / f"{t:%Y%m%dT%H%M%S%f}.parquet"
+        tmp = path.with_name(path.name + ".tmp")
+        pq.write_table(diff, tmp)
+        os.replace(tmp, path)
+        leaks = [r for r in diff.to_pylist() if r["kind"] == "leak"]
+        excepted = [r for r in leaks if diff_key(r) in reviewed]
+        matched.update(diff_key(r) for r in excepted)
+        for r in leaks:
+            if diff_key(r) not in reviewed:
+                open_leaks.setdefault(
+                    diff_key(r), f"{t.astimezone(ET):%Y-%m-%d %H:%M} {r['detail']}"
+                )
+        typer.echo(
+            f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leaks {len(leaks):>5,} "
+            f"(excepted {len(excepted):,})  delays {diff.num_rows - len(leaks):>5,}  "
+            f"{time.monotonic() - step:,.0f}s"
+        )
+    for key in sorted(set(reviewed) - matched):
+        typer.echo(f"stale exception: {key} ({reviewed[key]})")
+    typer.echo(f"rows -> {out_dir}/<instant>.parquet; {time.monotonic() - started:,.0f}s")
+    if open_leaks:
+        typer.echo(f"{len(open_leaks):,} leak keys not excepted:")
+        for key, where in sorted(open_leaks.items())[:50]:
+            typer.echo(f"  {key}  first at {where}")
+        raise typer.Exit(code=2)
+    typer.echo("no leak outside the exceptions")

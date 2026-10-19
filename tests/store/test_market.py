@@ -149,6 +149,7 @@ def write_master(root: Path, segs: Sequence[Seg]) -> Path:
             "valid_from": pa.array([s.valid_from for s in segs], pa.date32()),
             "valid_to": pa.array([s.valid_to for s in segs], pa.date32()),
             "cik": pa.array([None for _ in segs], pa.int64()),
+            "cik_available_at": pa.array([None for _ in segs], pa.timestamp("us", tz="UTC")),
             "cusip": pa.array([None for _ in segs], pa.string()),
             "evidence": pa.array(["bars" for _ in segs], pa.string()),
             "available_at": pa.array([s.available_at for s in segs], TS_UTC),
@@ -1290,3 +1291,18 @@ def test_visible_sessions_empty_store_and_bad_arguments(
         visible_sessions(con, root, "1Day", datetime(2026, 10, 2))  # naive
     with pytest.raises(ValueError):
         visible_sessions(con, root, "1Day", datetime(2026, 10, 2, tzinfo=UTC), last=0)
+
+
+def test_master_with_a_cik_but_no_cik_instant_is_rejected(
+    con: duckdb.DuckDBPyConnection, root: Path
+) -> None:
+    # Leakage guard: a CIK without its instant would be hidden forever (or, read without the
+    # mask, shown from the segment's start); the file must be rebuilt
+    write_master(root, [Seg("S_A", "A")])
+    table = pq.read_table(root / MASTER_FILE)
+    table = table.set_column(
+        table.schema.get_field_index("cik"), "cik", pa.array([1234], pa.int64())
+    )
+    pq.write_table(table, root / MASTER_FILE)
+    with pytest.raises(ValueError, match="rebuild"):
+        visible_master(con, root, datetime(2026, 10, 1, tzinfo=UTC))

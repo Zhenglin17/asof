@@ -39,6 +39,9 @@ Any violation is look-ahead leakage and is treated as a bug.
       and the vendor's volume-0 filler bars are gone by default
 - [x] Data audit: 33 checks over the real store with reviewed exceptions, clean in the
       liquid tier, and hand-checked reference histories asserted as tests against it
+- [x] Truncation test: the security master rebuilt from only the inputs knowable at an
+      instant and compared with what the full master shows then; every identity fact (a
+      segment, its end, its CIK) carries the instant it became knowable
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
@@ -95,6 +98,7 @@ uv run asof market instruments           # instrument class of every security-ma
 uv run asof market liquid --as-of 2021-03-01            # the liquid tier that morning
 uv run asof market liquid --from 2020-01-01 --to 2026-10-01   # one tier per month start, and the union
 uv run asof market audit                 # count every kind of data error found so far
+uv run asof market truncation            # rebuild the security master as of past instants and diff
 ```
 
 The universe is the union of every symbol Alpaca lists, every ticker that appeared in an SEC
@@ -210,6 +214,23 @@ outside the exceptions. Next to it, `tests/store/test_golden_cases.py` asserts a
 hand-checked histories through the same read path: SIVB's last day, BBBY's two companies,
 BK in 2022, NKLA appearing only once its rename was filed, HCTI's three reverse splits
 compounding to TradingView's price.
+
+Several identity rules read data after the event they judge: whether a rename was really a
+conversion depends on SEC snapshots up to six months later, whether a takeover was a
+relabelled copy depends on the bars on both sides. A segment stamped knowable at the event
+may carry what they found. `asof market truncation` rebuilds the master from only the bars,
+snapshots, rename records and dated human decisions knowable at an instant and compares it
+with the full master as a reader at that instant sees it. A segment, field or grouping the
+full master shows but the rebuild cannot produce is a **leak**; something the rebuild guesses
+on days the full master leaves open, or a CIK it still withholds, is a **delay**. The first run
+found that a segment's CIK came from SEC snapshots months after it started trading (AAAU
+trades from 2020-01-02, the SEC lists it from 2020-07-10), so the CIK now has its own
+`cik_available_at` and stays hidden until then. Diffs go to
+`$ASOF_DATA_DIR/market/audit/truncation/<instant>.parquet`; reviewed leaks go into
+`configs/truncation_exceptions.yaml`, and the command exits 2 while any other leak remains.
+The same comparison runs in the test suite on every hand-built identity scenario at every
+instant at which its master or its inputs change, against a baseline of known leaks that
+may only shrink.
 
 ## Layout
 

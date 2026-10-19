@@ -136,6 +136,9 @@ def master_table(rows: Sequence[Seg]) -> pa.Table:
             "valid_from": pa.array([r[2] for r in rows], pa.date32()),
             "valid_to": pa.array([r[3] for r in rows], pa.date32()),
             "cik": pa.array([r[4] for r in rows], pa.int64()),
+            "cik_available_at": pa.array(
+                [None if r[4] is None else AVAILABLE for r in rows], TS_UTC
+            ),
             "cusip": pa.array([None for _ in rows], pa.string()),
             "evidence": pa.array(["bars" for _ in rows], pa.string()),
             "available_at": pa.array([AVAILABLE for _ in rows], TS_UTC),

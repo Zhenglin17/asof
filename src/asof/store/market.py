@@ -33,6 +33,7 @@ from asof.ingest.alpaca import Timeframe
 from asof.ingest.bar_imports import EXT_BAR_SCHEMA, EXT_DIR
 from asof.ingest.bars import _DIRS, BAR_SCHEMA
 from asof.ingest.corporate_actions import SPLIT_SCHEMA
+from asof.ingest.master_truncation import mask_master
 from asof.ingest.security_master import MASTER_FILE, MASTER_SCHEMA
 
 _YEAR_DIR = re.compile(r"^year=(\d{4})$")
@@ -261,32 +262,19 @@ def visible_master(con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime) 
             f"SELECT count(*) FROM {_MASTER_VIEW} WHERE available_at IS NULL "
             "OR (valid_to IS NULL) <> (end_available_at IS NULL) "
             "OR valid_to <= valid_from "
-            "OR end_available_at < (valid_to::TIMESTAMP AT TIME ZONE 'America/New_York')",
+            "OR end_available_at < (valid_to::TIMESTAMP AT TIME ZONE 'America/New_York') "
+            "OR (cik IS NULL) <> (cik_available_at IS NULL)",
         )
         if broken:
             raise ValueError(
                 f"{path}: {broken} segments have no available_at, a valid_to without an "
-                "end_available_at (or the reverse), a valid_to not after valid_from, or an end "
-                "knowable before its day; rebuild the master with `asof market identity`"
+                "end_available_at (or the reverse), a valid_to not after valid_from, an end "
+                "knowable before its day, or a cik without its cik_available_at (or the "
+                "reverse); rebuild the master with `asof market identity`"
             )
-        columns = ", ".join(
-            name for name in MASTER_SCHEMA.names if name not in ("valid_to", "end_available_at")
-        )
-        visible = con.execute(
-            f"""
-            SELECT {columns},
-                   CASE WHEN end_available_at <= $as_of THEN valid_to END AS valid_to,
-                   CASE WHEN end_available_at <= $as_of THEN end_available_at END
-                       AS end_available_at
-            FROM {_MASTER_VIEW}
-            WHERE available_at <= $as_of
-            ORDER BY security_id, valid_from, symbol
-            """,
-            {"as_of": as_of_utc},
-        ).to_arrow_table()
     finally:
         con.unregister(_MASTER_VIEW)
-    visible = visible.select(MASTER_SCHEMA.names).cast(MASTER_SCHEMA)
+    visible = mask_master(on_disk, as_of_utc)
 
     con.register(_MASTER_VIEW, visible)
     try:

@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -77,6 +78,7 @@ MASTER_COLUMNS = [
     "valid_from",
     "valid_to",
     "cik",
+    "cik_available_at",
     "cusip",
     "evidence",
     "available_at",
@@ -3192,19 +3194,25 @@ def seg_row(
     available_at: datetime | None = None,
     end_available_at: datetime | None = None,
     cik: int | None = None,
+    cik_available_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """A master row; instants default to midnight New York of the day (the rename rule)."""
+    """A master row; instants default to midnight New York of the day (the rename rule), and a
+    CIK is known with its segment unless ``cik_available_at`` says later."""
     if end_available_at is None and valid_to is not None:
         end_available_at = et_midnight(valid_to)
+    known = et_midnight(valid_from) if available_at is None else available_at
+    if cik is not None and cik_available_at is None:
+        cik_available_at = known
     return {
         "security_id": security_id,
         "symbol": symbol,
         "valid_from": valid_from,
         "valid_to": valid_to,
         "cik": cik,
+        "cik_available_at": cik_available_at,
         "cusip": None,
         "evidence": "bars",
-        "available_at": et_midnight(valid_from) if available_at is None else available_at,
+        "available_at": known,
         "end_available_at": end_available_at,
     }
 
@@ -3262,6 +3270,13 @@ def cm_violation(name: str) -> list[dict[str, Any]]:
             seg_row("S5", "E", CM_D0, CM_LATER),
             seg_row("S6", "E", CM_CUT, date(2020, 12, 31)),
         ]
+    if name == "cik_without_known":
+        return [*good, {**seg_row("S5", "E", CM_D0, cik=7), "cik_available_at": None}]
+    if name == "known_without_cik":
+        return [*good, {**seg_row("S5", "E", CM_D0), "cik_available_at": et_midnight(CM_D0)}]
+    if name == "cik_known_before_segment":
+        early = et_midnight(CM_D0) - timedelta(microseconds=1)
+        return [*good, seg_row("S5", "E", CM_D0, cik=7, cik_available_at=early)]
     if name == "adjacent_instants_disagree":
         return [
             *good,
@@ -3385,3 +3400,79 @@ def test_write_master_refuses_a_broken_master_and_leaves_the_old_file_alone(
         sm.write_master(master_table(cm_violation("duplicate_key")), conflicts, tmp_path)
     assert pq.read_table(master_path).equals(good)
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_g2_cut_on_a_label_with_no_traded_bar_on_either_side_is_not_continuous() -> None:
+    # Real: BMR is volume-0 filler (close frozen at 23.81) from 2020 until its first trade on
+    # 2023-02-28, and the SEC moves it to a new CIK on 2022-03-01. A build at 2022-10-21 sees the
+    # cut but no traded bar at all; it crashed looking the cut up. A cut must always be answered.
+    filler = [
+        {**b, "volume": 0} for b in bar_rows("BMR", date(2022, 1, 3), date(2022, 6, 30), 23.81)
+    ]
+    con = duckdb.connect()
+    try:
+        con.register("_bars", bars_table(filler))
+        around = sm._closes_around(con, [("BMR", date(2022, 3, 1))])
+    finally:
+        con.close()
+    assert around == {("BMR", date(2022, 3, 1)): (None, None, None, None)}
+    assert not sm._continuous(around[("BMR", date(2022, 3, 1))])
+
+
+# CIK knowable later than its segment (truncation test, 2026-10-19). A segment's CIK comes from
+# the SEC snapshots; real: AAAU trades from 2020-01-02 but the SEC table first lists it on
+# 2020-07-10 (CIK 1708646). A reader in January 2020 must not see that CIK. Rule pinned:
+# ``cik_available_at`` = 00:00 New York of the first snapshot listing the chosen CIK inside the
+# segment, never before the segment's own ``available_at`` -- even when an earlier snapshot
+# listed it, because matching that row to the label may need a later spelling (BRKB -> BRK.B).
+# A CIK read only off snapshots before the segment starts is known with the segment.
+
+CK_SNAPSHOTS = [date(2019, 12, 2), date(2020, 3, 2), date(2020, 7, 10), date(2020, 10, 1)]
+
+
+def test_cik_is_known_from_the_first_snapshot_that_lists_it() -> None:
+    bars = bars_table(
+        bar_rows("LATE", date(2020, 1, 2), date(2020, 12, 31), 20.0)
+        + bar_rows("EARLY", date(2020, 1, 2), date(2020, 12, 31), 40.0)
+        + bar_rows("BOTH", date(2020, 1, 2), date(2020, 12, 31), 60.0)
+    )
+    sec = sec_table(
+        CK_SNAPSHOTS,
+        [
+            ("LATE", 1708646, date(2020, 7, 10), None),
+            ("EARLY", 4321, date(2019, 12, 2), date(2019, 12, 2)),  # listed only before its bars
+            ("BOTH", 5555, date(2019, 12, 2), None),  # before its bars and inside
+        ],
+    )
+    master, _ = sm.build_security_master(
+        bars=bars, sec_history=sec, name_changes=name_changes_table([])
+    )
+    by = {r["symbol"]: r for r in master.to_pylist()}
+
+    assert by["LATE"]["cik"] == 1708646
+    assert by["LATE"]["cik_available_at"] == et_midnight(date(2020, 7, 10))
+    assert by["LATE"]["available_at"] < by["LATE"]["cik_available_at"]
+    # listed only before its first bar: the CIK is known as soon as the segment is
+    assert by["EARLY"]["cik"] == 4321
+    assert by["EARLY"]["cik_available_at"] == by["EARLY"]["available_at"]
+    # listed before and inside: known from the first snapshot inside
+    assert by["BOTH"]["cik"] == 5555
+    assert by["BOTH"]["cik_available_at"] == et_midnight(date(2020, 3, 2))
+    sm.check_master(master)
+
+
+def test_master_schema_puts_cik_available_at_after_cik() -> None:
+    names = sm.MASTER_SCHEMA.names
+    assert names[names.index("cik") + 1] == "cik_available_at"
+    assert sm.MASTER_SCHEMA.field("cik_available_at").type == pa.timestamp("us", tz="UTC")
+
+
+def test_load_overrides_requires_a_date(tmp_path: Path) -> None:
+    # The truncation test needs the instant of every human decision; without one an override
+    # would rewrite history from the beginning of time.
+    path = tmp_path / "overrides.yaml"
+    path.write_text("- merge: [CYCN, KRSA]\n  reason: identical history\n")
+    with pytest.raises(ValueError, match="date"):
+        sm.load_overrides(path)
+    path.write_text("- merge: [CYCN, KRSA]\n  reason: identical history\n  date: 2026-10-07\n")
+    assert sm.load_overrides(path)[0]["merge"] == ["CYCN", "KRSA"]

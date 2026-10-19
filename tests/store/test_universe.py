@@ -179,6 +179,7 @@ def write_master(root: Path, segs: Sequence[Seg]) -> Path:
             "valid_from": pa.array([s.valid_from for s in segs], pa.date32()),
             "valid_to": pa.array([s.valid_to for s in segs], pa.date32()),
             "cik": pa.array([None for _ in segs], pa.int64()),
+            "cik_available_at": pa.array([None for _ in segs], pa.timestamp("us", tz="UTC")),
             "cusip": pa.array([None for _ in segs], pa.string()),
             "evidence": pa.array(["bars" for _ in segs], pa.string()),
             "available_at": pa.array(
