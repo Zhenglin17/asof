@@ -249,7 +249,9 @@ def test_copy_rule_constants() -> None:
     assert sm.CONVERSION_MIN_DIFFERING_DAYS == 5
     assert sm.CONVERSION_WINDOW == 5
     assert sm.TAIL_GAP_SESSIONS == 10
-    assert sm.RESOLUTIONS == ("new_security", "bridged", "ignored", "unresolved")
+    # 6-c rule R adds "relabelled" (tests/ingest/test_security_master_takeovers.py)
+    assert set(sm.RESOLUTIONS) == {"new_security", "bridged", "ignored", "unresolved", "relabelled"}
+    assert len(sm.RESOLUTIONS) == 5
     assert sm.CONFLICT_SCHEMA.names == ["kind", "symbols", "dates", "detail", "resolution"]
     assert sm.CONFLICT_SCHEMA.field("resolution").type == pa.string()
     assert sm.IDENT_SCHEMA.names == ["symbol_a", "symbol_b", "session_date"]
@@ -414,9 +416,10 @@ def test_b1_new_label_changing_filer_across_the_record_is_a_rename() -> None:
     assert barnes["security_id"] != barrick["security_id"]
     assert (barnes["cik"], barrick["cik"]) == (B_BARNES, B_BARRICK)
     assert one(master, "GOLD")["valid_to"] == B_GOLD_RECORD
-    # the reuse is reported for a human (G: unresolved), not bridged
+    # the reuse is reported, not bridged; since 6-c rule R decides it: GOLD (the taker's chain)
+    # traded bars of its own inside the old B piece's span, so the old B is a previous holder
     [row] = [r for r in conflicts_of(conflicts, "reuse_looks_continuous") if "B" in r["symbols"]]
-    assert row["resolution"] == "unresolved"
+    assert row["resolution"] == "new_security"
 
 
 def test_b1_reads_the_new_labels_cik_at_least_183_days_after_the_record() -> None:
@@ -1294,7 +1297,8 @@ def g_built() -> tuple[pa.Table, pa.Table]:
 def test_g_every_conflict_kind_carries_its_resolution(g_built: tuple[pa.Table, pa.Table]) -> None:
     # G. One row per value: a discontinuous CIK switch is a new security by construction; a
     # bridged one is now written down (new kind); a record V dropped is written down (new kind);
-    # a continuous reuse and an unlinked duplicate stay for a human.
+    # a continuous reuse whose taker traded its own bars in the span is a new security (6-c rule
+    # R); an unlinked duplicate stays for a human.
     master, conflicts = g_built
 
     assert conflicts.schema.equals(sm.CONFLICT_SCHEMA)
@@ -1310,7 +1314,7 @@ def test_g_every_conflict_kind_carries_its_resolution(g_built: tuple[pa.Table, p
         "cik_switch_discontinuous": "new_security",
         "cik_switch_bridged": "bridged",
         "record_without_taker": "ignored",
-        "reuse_looks_continuous": "unresolved",
+        "reuse_looks_continuous": "new_security",  # 6-c rule R: TAKR traded its own bars
         "dup_unlinked": "unresolved",
     }
     assert set(conflicts.column("resolution").to_pylist()) <= set(sm.RESOLUTIONS)

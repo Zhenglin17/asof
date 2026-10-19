@@ -126,6 +126,7 @@ GATES: dict[str, str | None] = {
     "I7": "all",
     "I8": None,
     "I9": None,
+    "I10": None,  # exchange-listed ticker with no bars of its own (6-c, information)
     "S1": "liquid",
     "S2": "liquid",
     "S3": "liquid",
@@ -510,6 +511,7 @@ SAMPLE_KEYS = {
     "I7": "2020-01-31",
     "I8": "S000003:2020-01-24",
     "I9": "S000005:2020-01-16",
+    "I10": "INBX:1739614",
     "S1": "BRK.B:2020-01-11",
     "S2": "AAA:2020-01-16",
     "S3": "AAA:2020-01-16",
@@ -543,6 +545,7 @@ def test_key_pattern_accepts_the_documented_key_shape(check_id: str) -> None:
         ("M7", "LBL:2020-01-02"),  # the security id is part of the key
         ("M7", "S000008:LBL"),
         ("M8", "PPP:cik_switch_discontinuous"),  # dates missing
+        ("I10", "INBX"),  # the CIK is part of the key
     ],
 )
 def test_key_pattern_rejects_other_shapes(check_id: str, bad: str) -> None:
@@ -2227,7 +2230,7 @@ def test_s1_split_records_without_a_bar_on_the_ex_date(
             "reason": "symbol_never_stored",
         },
     ]
-    assert result.notes == {"symbol_never_stored": 1, "no_bar_that_day": 1}
+    assert result.notes == {"symbol_never_stored": 1, "no_bar_that_day": 1, "not_traded_around": 0}
     assert result.fails("liquid") is True
     excepted = world.audit(con, checks=["S1"], exceptions=[exc("S1", f"AAA:{iso(saturday)}")])["S1"]
     assert (excepted.liquid, excepted.total, excepted.excepted) == (0, 1, 1)

@@ -98,7 +98,7 @@ CONFLICT_SCHEMA = pa.schema(
 # new_security: the build kept two securities (a CIK switch with a price break); bridged: the
 # build joined them; ignored: a record that is not an event; unresolved: for a human (the
 # audit's M6 gates only these)
-RESOLUTIONS = ("new_security", "bridged", "ignored", "unresolved")
+RESOLUTIONS = ("new_security", "bridged", "ignored", "unresolved", "relabelled")
 IDENT_SCHEMA = pa.schema(
     [("symbol_a", pa.string()), ("symbol_b", pa.string()), ("session_date", pa.date32())]
 )
@@ -1556,6 +1556,117 @@ def _drop_copied_pieces(
     return dropped
 
 
+def _round_trip(leaver: _Segment, taker: _Segment) -> bool:
+    """The label is taken back from where its holder just went (ORIC -> 1ORIC -> ORIC)."""
+    return leaver.end is not None and taker.start is not None and taker.start.old == leaver.end.new
+
+
+def _taker_traded_own_bars(
+    con: duckdb.DuckDBPyConnection, before: _Segment, members: Sequence[_Segment], cut: date
+) -> bool:
+    """Whether a piece of the taker's chain traded inside [before.valid_from, cut) on a day
+    whose bar is not ``before``'s bar of that day (OHLC; volumes are revised after 20:00)."""
+    spans = [
+        (q.symbol, max(q.valid_from, before.valid_from), min(q.valid_to or cut, cut))  # type: ignore[type-var]
+        for q in members
+        if q.valid_from is not None and before.valid_from is not None
+    ]
+    spans = [s for s in spans if s[1] < s[2]]
+    if not spans:
+        return False
+    con.register(
+        "_taker_spans",
+        pa.table(
+            {
+                "symbol": [s for s, _, _ in spans],
+                "lo": pa.array([lo for _, lo, _ in spans], pa.date32()),
+                "hi": pa.array([hi for _, _, hi in spans], pa.date32()),
+            }
+        ),
+    )
+    try:
+        hit = con.execute(
+            """
+            SELECT 1 FROM _taker_spans w
+            JOIN _bars t ON t.symbol = w.symbol AND t.session_date >= w.lo
+                 AND t.session_date < w.hi
+            LEFT JOIN _bars p ON p.symbol = ? AND p.session_date = t.session_date
+            WHERE t.volume > 0
+              AND (p.symbol IS NULL OR p.open <> t.open OR p.high <> t.high OR p.low <> t.low
+                   OR p.close <> t.close)
+            LIMIT 1
+            """,
+            [before.symbol],
+        ).fetchone()
+    finally:
+        con.unregister("_taker_spans")
+    return hit is not None
+
+
+def _settle_takeovers(
+    con: duckdb.DuckDBPyConnection,
+    pieces: list[_Segment],
+    uf: _Union,
+    takeovers: Sequence[tuple[int, _Segment, _Segment, date]],
+    conflicts: list[dict[str, Any]],
+) -> set[int]:
+    """Rule R, after the copy rules: a label taken at a continuous price by a filer other than
+    its previous holder. If the taker's chain traded no bar of its own inside the previous
+    piece's span, that piece is the taker's history filed under the label (Alpaca rewrote B
+    with Barrick's past when GOLD -> B; Barnes Group's own bars are gone): it joins the taker,
+    knowable only from the takeover's record, and the taker's pieces inside the span end where
+    it begins. Otherwise two securities. The absence of the taker's bars is weak evidence, so a
+    merge is written ``relabelled`` and the audit (M6) has a human read it once.
+
+    Shapes the merge cannot handle cleanly stay ``unresolved``: a previous piece that already
+    chains to other pieces (merging it would carry that company's earlier history along), a
+    taker piece in the span that runs past the cut (clipping would orphan its later bars), and
+    a previous piece that follows another on the same label (whose end is knowable when the
+    previous piece was, not at the takeover). Returns the keys of taker pieces clipped away.
+    """
+    dropped: set[int] = set()
+    for index, before, after, cut in takeovers:
+        root, own = uf.find(after.key), uf.find(before.key)
+        if own == root:  # a same-day round trip already chained them (L -> 1L -> L)
+            conflicts[index]["resolution"] = "bridged"
+            continue
+        members = [
+            q for q in pieces if q.key not in dropped and q is not before and uf.find(q.key) == root
+        ]
+        if _taker_traded_own_bars(con, before, members, cut):
+            conflicts[index]["resolution"] = "new_security"
+            continue
+        inside = [
+            q
+            for q in members
+            if q is not after
+            and q.valid_from is not None
+            and q.valid_from < cut
+            and (q.valid_to is None or q.valid_to > before.valid_from)  # type: ignore[operator]
+        ]
+        if (
+            any(q is not before and uf.find(q.key) == own for q in pieces)
+            or any(q.valid_to is None or q.valid_to > cut for q in inside)
+            or any(q.symbol == before.symbol and q.valid_to == before.valid_from for q in pieces)
+        ):
+            continue  # stays unresolved
+        lost = before.cik
+        uf.union(before.key, after.key)
+        before.cik, before.evidence = after.cik, "relabelled"
+        before.available_at = before.end_available_at = after.available_at
+        for q in inside:
+            if q.valid_from >= before.valid_from:  # type: ignore[operator]
+                dropped.add(q.key)
+            else:
+                q.valid_to, q.end_available_at = before.valid_from, after.available_at
+        conflicts[index]["resolution"] = "relabelled"
+        conflicts[index]["detail"] += (
+            f"; {before.symbol} {before.valid_from}..{cut} is the taker's history, "
+            f"holder cik {lost} has no bars of its own here"
+        )
+    return dropped
+
+
 def _closes_around(
     con: duckdb.DuckDBPyConnection, cuts: list[tuple[str, date]]
 ) -> dict[tuple[str, date], tuple[date | None, float | None, date | None, float | None]]:
@@ -1593,12 +1704,19 @@ def _continuous(around: tuple[date | None, float | None, date | None, float | No
     return CONTINUOUS[0] <= c1 / c0 <= CONTINUOUS[1]
 
 
-def _segment_cik(seg: _Segment, presence: list[tuple[date, int]]) -> int | None:
+def _segment_cik(
+    seg: _Segment, presence: list[tuple[date, int]], left: int | None = None
+) -> int | None:
+    """``left``: the CIK of the holder that vacated this label by a rename on the day this
+    segment starts (rule L). Its rows still sit on the label for a snapshot or two of SEC lag
+    (XPER under Adeia's 1803696 on 2022-10-03, ARNC under Arconic Inc's 4281 until 07-10) and
+    are not the new holder's."""
     inside = [
         cik
         for day, cik in presence
         if (seg.valid_from is None or day >= seg.valid_from)
         and (seg.valid_to is None or day < seg.valid_to)
+        and cik != left
     ]
     if inside:
         return inside[-1]
@@ -1733,12 +1851,21 @@ def build_security_master(
                 p_key = relabelled[p_key]
             handed_on.append((start, by_key[p_key]))
         pieces = [p for p in pieces if p.key not in relabelled]
+        # L: the holder that renamed off a label takes its CIK along (pieces of one symbol are in
+        # time order, so the leaver's CIK is known before the piece that follows it)
+        # -- unless the label comes straight back from where the leaver went (ORIC -> 1ORIC ->
+        # ORIC on one day: the same filer)
+        leavers: dict[tuple[str, date], _Segment] = {}
         for i, p in enumerate(pieces):
             p.key = i
             # Attributes describe how the segment STARTED only. The event that ends it is
             # recorded on the segment it creates; copying it here (its cusip, its evidence) would
             # let a reader who may not yet know the end see that one is coming.
-            p.cik = _segment_cik(p, presence.get(p.symbol, []))
+            leaver = leavers.get((p.symbol, p.valid_from)) if p.start is not None else None  # type: ignore[arg-type]
+            left = leaver.cik if leaver is not None and not _round_trip(leaver, p) else None
+            p.cik = _segment_cik(p, presence.get(p.symbol, []), left)
+            if p.end is not None and p.valid_to is not None:
+                leavers[(p.symbol, p.valid_to)] = p
             p.cusip = p.start.new_cusip if p.start else None
             if p.start is not None:
                 p.evidence = p.start.evidence
@@ -1771,8 +1898,9 @@ def build_security_master(
             if e.evidence == "bars"
         ]
         # reuse_looks_continuous rows are only true while the previous holder's piece still
-        # ends at the cut; the copy rules below may end or drop it (index, piece, cut)
-        reuses: list[tuple[int, _Segment, date]] = []
+        # ends at the cut; the copy rules below may end or drop it. Rule R then settles the
+        # takeovers among them (index, previous piece, taker's piece or None, cut).
+        reuses: list[tuple[int, _Segment, _Segment | None, date]] = []
         for e in edges:
             a, b = by_end.get((e.old, e.date)), by_start.get((e.new, e.date))
             # Two edges may start one label on one day (HWM.WI -> HWM and ARNC -> HWM, both
@@ -1802,15 +1930,15 @@ def build_security_master(
                 # is another filer however close the prices: never bridged, reported if close.
                 if _continuous(around[(symbol, cut)]):
                     d0, c0, d1, c1 = around[(symbol, cut)]
-                    reuses.append((len(conflicts), before, cut))
+                    reuses.append((len(conflicts), before, None, cut))
                     conflicts.append(
                         {
                             "kind": "reuse_looks_continuous",
                             "symbols": [symbol],
                             "dates": [d for d in (d0, cut, d1) if d is not None],
                             "detail": f"cik {before.cik} -> {after.cik} after {symbol} -> "
-                            f"{before.end.new}, close {c0} -> {c1}: relabelled?",
-                            "resolution": "unresolved",
+                            f"{before.end.new}, close {c0} -> {c1}: previous holder renamed away",
+                            "resolution": "new_security",
                         }
                     )
                 continue
@@ -1841,18 +1969,31 @@ def build_security_master(
             if not _continuous(around[(symbol, cut)]):
                 continue  # a plain reuse: two securities, nothing to say
             d0, c0, d1, c1 = around[(symbol, cut)]
-            if before.cik is not None and before.cik == after.cik:
-                uf.union(before.key, after.key)  # temporary ticker, SPAC completion, ...
-            else:
-                reuses.append((len(conflicts), before, cut))
+            if before.end is not None and not _round_trip(before, after):
+                # the previous holder renamed away the day the label was taken (XPER -> ADEA,
+                # XPER.WI -> XPER): two filers, however close the prices
+                reuses.append((len(conflicts), before, None, cut))
                 conflicts.append(
                     {
                         "kind": "reuse_looks_continuous",
                         "symbols": [after.start.old if after.start else symbol, symbol],
                         "dates": [d for d in (d0, cut, d1) if d is not None],
                         "detail": f"cik {before.cik} -> {after.cik}, close {c0} -> {c1}: "
-                        "relabelled?",
-                        "resolution": "unresolved",
+                        f"previous holder renamed to {before.end.new}",
+                        "resolution": "new_security",
+                    }
+                )
+            elif before.cik is not None and before.cik == after.cik:
+                uf.union(before.key, after.key)  # temporary ticker, SPAC completion, ...
+            else:
+                reuses.append((len(conflicts), before, after, cut))
+                conflicts.append(
+                    {
+                        "kind": "reuse_looks_continuous",
+                        "symbols": [after.start.old if after.start else symbol, symbol],
+                        "dates": [d for d in (d0, cut, d1) if d is not None],
+                        "detail": f"cik {before.cik} -> {after.cik}, close {c0} -> {c1}",
+                        "resolution": "unresolved",  # rule R below settles it
                     }
                 )
 
@@ -1867,9 +2008,17 @@ def build_security_master(
         # C clips inside one chain, so the price comparison at the takeover still stands
         stale = {
             index
-            for index, before, cut in reuses
+            for index, before, _, cut in reuses
             if before.key in gone or (before.key in tails_cut and before.valid_to != cut)
         }
+        dropped = _settle_takeovers(
+            con,
+            pieces,
+            uf,
+            [(i, b, a, cut) for i, b, a, cut in reuses if a is not None and i not in stale],
+            conflicts,
+        )
+        pieces = [p for p in pieces if p.key not in dropped]
         conflicts = [c for i, c in enumerate(conflicts) if i not in stale]
 
         overridden: set[int] = set()

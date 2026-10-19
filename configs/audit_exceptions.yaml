@@ -51,3 +51,61 @@
   reason: "warrant of UCFI; same history as the common"
   added: 2026-10-16
   by: greyson
+
+# S1 / S2 left after date scoping (2026-10-19): a split record the vendor's prices do not bear
+# out. S1 looks the bar up under every name of the security; S2 accepts the move up to two
+# sessions late. Ratios are open / previous close against 1 / factor.
+- check: S1
+  key: "AMRH:2020-12-31"
+  reason: "Ameri -> Enveric (ENVB) merger close with a 1:4 record; no bar under either name that day (AMRH last 12-30 at 1.48, ENVB first 2021-01-04 at 3.90)"
+  added: 2026-10-19
+  by: greyson
+- check: S2
+  key: "AIIO:2026-06-03"
+  reason: "10:1 reverse record; opens 0.95, 0.98, 1.08 of the previous close over three sessions, no move"
+  added: 2026-10-19
+  by: greyson
+- check: S2
+  key: "HON:2026-06-29"
+  reason: "2:1 reverse record; opens 1.04, 1.00, 0.98 of the previous close over three sessions, no move"
+  added: 2026-10-19
+  by: greyson
+- check: S2
+  key: "RGC:2025-06-16"
+  reason: "38:1 forward record; opens 0.044, 0.125, 0.101 of the previous close against 0.026 expected"
+  added: 2026-10-19
+  by: greyson
+- check: S2
+  key: "TAOP:2020-07-30"
+  reason: "6:1 reverse record; opens 12.2x, 18.0x, 10.1x the previous close against 6x expected"
+  added: 2026-10-19
+  by: greyson
+- check: S2
+  key: "TTOO:2023-10-13"
+  reason: "100:1 reverse record; opens 59x, 47x, 41x the previous close against 100x expected"
+  added: 2026-10-19
+  by: greyson
+- check: S1
+  key: "CYBR:2026-02-11"
+  reason: "CyberArk bought by Palo Alto Networks (2.2005 PANW per share, filed by the vendor as a unit_split); last bar 2026-02-10; no merger record, so the segment is still open (I8 class)"
+  added: 2026-10-19
+  by: greyson
+
+# M6 relabelled (rule R, 2026-10-19): the build merged an earlier holder's segment into the
+# filer that took the label, because the taker traded nothing of its own while it ran. Each
+# merge was checked against the bars by hand before it was excepted.
+- check: M6
+  key: "GOLD/B:reuse_looks_continuous:2025-05-08,2025-05-09,2025-05-09"
+  reason: "B 2020-2025 is Barrick (about 100 bn USD a year, close 17.45 on 2023-06-01; Barnes Group was cash-merged at 47.50 on 2025-01-27 yet B kept trading near 19); Barnes's own bars are gone"
+  added: 2026-10-19
+  by: greyson
+- check: M6
+  key: "FGMC/ICCT:reuse_looks_continuous:2023-10-02,2023-10-03,2023-10-03"
+  reason: "FG Merger Corp + iCoreConnect closed 2023-08-28 (stock_merger record); FGMC is volume-0 filler at 4.82 after 08-25 and ICCT trades from 08-28; the SEC moved ICCT to the SPAC's CIK only on 10-03"
+  added: 2026-10-19
+  by: greyson
+- check: M6
+  key: "INXB/INBX:reuse_looks_continuous:2024-05-30,2024-05-31,2024-05-31"
+  reason: "INBX 05-29 / 05-30 bars equal INXBV's / INXB's (Inhibrx Biosciences when-issued, 13.92 / 15.86; the old Inhibrx traded near 31 as INBXV); old Inhibrx's 2020-2024 history is not in the store"
+  added: 2026-10-19
+  by: greyson

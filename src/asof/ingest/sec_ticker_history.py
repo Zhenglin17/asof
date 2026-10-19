@@ -208,6 +208,46 @@ def _exchange_rows(raw: bytes) -> list[tuple[str, str]]:
     return rows
 
 
+EXCHANGE_HISTORY_SCHEMA = pa.schema(
+    [
+        ("snapshot_date", pa.date32()),
+        ("ticker", pa.string()),
+        ("cik", pa.int64()),
+        ("exchange", pa.string()),  # upper-case as filed ("NASDAQ", "CBOE US"); "" when none
+    ]
+)
+EXCHANGE_HISTORY_PATH = "symbols/sec_exchange_history.parquet"  # under the market root
+
+
+def build_exchange_history(directory: Path) -> pa.Table:
+    """Every ``<YYYYMMDD>.json`` exchange snapshot in ``directory`` as one table, sorted by date
+    then ticker. The audit's I10 reads it to find listed companies the store has no bars for."""
+    rows: list[tuple[date, str, int, str]] = []
+    if directory.exists():
+        for path in sorted(directory.iterdir()):
+            if not _DATED.match(path.name):
+                continue
+            day = date(int(path.name[:4]), int(path.name[4:6]), int(path.name[6:8]))
+            data = json.loads(path.read_bytes())
+            fields = data["fields"]
+            ci, ti, ei = fields.index("cik"), fields.index("ticker"), fields.index("exchange")
+            for row in data["data"]:
+                if not row[ti] or row[ci] is None:
+                    continue
+                try:
+                    ticker = normalize_ticker(str(row[ti]))
+                except ValueError:
+                    continue
+                if is_valid_symbol(ticker):
+                    exchange = str(row[ei] or "").strip().upper()
+                    rows.append((day, ticker, int(row[ci]), exchange))
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    return pa.table(
+        {name: [r[i] for r in rows] for i, name in enumerate(EXCHANGE_HISTORY_SCHEMA.names)},
+        schema=EXCHANGE_HISTORY_SCHEMA,
+    )
+
+
 def otc_only_symbols(directory: Path) -> set[str]:
     """Tickers the SEC exchange snapshots only ever place on OTC (or nowhere)."""
     seen: dict[str, set[str]] = {}

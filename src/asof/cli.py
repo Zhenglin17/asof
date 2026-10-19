@@ -25,8 +25,10 @@ from asof.ingest.instrument_class import (
 )
 from asof.ingest.instrument_class import build_from_store as build_classes_from_store
 from asof.ingest.sec_ticker_history import (
+    EXCHANGE_HISTORY_PATH,
     EXCHANGE_TARGET,
     SNAPSHOT_TARGET,
+    build_exchange_history,
     build_history,
     download_snapshot,
     list_snapshots,
@@ -313,6 +315,10 @@ def market_universe(
         table = build_history(targets[0][1])
         write_history(table, root / HISTORY_PATH)
         typer.echo(f"{table.num_rows} ticker-history rows -> {root / HISTORY_PATH}")
+        listings = build_exchange_history(targets[1][1])
+        if listings.num_rows:  # never replace a usable table with an empty one
+            write_history(listings, root / EXCHANGE_HISTORY_PATH)
+        typer.echo(f"{listings.num_rows} exchange-listing rows -> {root / EXCHANGE_HISTORY_PATH}")
     typer.echo(f"Universe: {len(load_universe(root, base))} symbols")
 
 
@@ -760,6 +766,7 @@ def market_audit(
             qualified_ids=qualified_ids,
             exceptions=reviewed,
             checks=wanted,
+            liquid_tier=qualified,  # split records are gated by the tier around their ex-date
         )
     except (FileNotFoundError, ValueError) as error:
         _fail(str(error))

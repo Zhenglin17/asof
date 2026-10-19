@@ -9,8 +9,10 @@ rename filed weeks after the old name stopped trading -- and counts them.
 Every check yields rows keyed by a short string (``AAA:2020-01-07``, ``S000730``, ``AAA/BBB``)
 so a human can except one in ``configs/audit_exceptions.yaml`` with a reason. A row is *in the
 liquid scope* when the security, or any segment of the symbol, belongs to the liquid-tier union
-the caller passes in. Gated checks fail the run when rows are left outside the exceptions:
-``gate="all"`` anywhere, ``gate="liquid"`` inside the liquid scope (or anywhere with
+the caller passes in; split records (S1 / S2) are scoped by date instead when the caller passes
+the monthly tier itself: the security that owned the record on its ex-date must be in the tier
+within ``SPLIT_LIQUID_DAYS`` of it. Gated checks fail the run when rows are left outside the
+exceptions: ``gate="all"`` anywhere, ``gate="liquid"`` inside the liquid scope (or anywhere with
 ``tier="all"``). Ungated checks are information: they are read before deciding whether to gate.
 
 Three readings of the store are used, all as of ``as_of``:
@@ -40,7 +42,11 @@ import yaml
 from asof.ingest.bars import BAR_SCHEMA
 from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA
 from asof.ingest.instrument_class import CLASS_FILE
-from asof.ingest.sec_ticker_history import HISTORY_SCHEMA
+from asof.ingest.sec_ticker_history import (
+    EXCHANGE_HISTORY_PATH,
+    EXCHANGE_HISTORY_SCHEMA,
+    HISTORY_SCHEMA,
+)
 from asof.ingest.security_master import (
     CONFLICT_SCHEMA,
     CONFLICTS_FILE,
@@ -64,6 +70,7 @@ from asof.store.market import (
     visible_master,
     visible_splits,
 )
+from asof.store.universe import LIQUID_CLASSES
 
 ET = ZoneInfo("America/New_York")
 
@@ -94,6 +101,13 @@ RENAME_LAG_DAYS = 30  # N1: rows beyond this many days between last old bar and 
 RELABEL_BAND = (0.1, 0.9)  # N3: identical-day share between "accident" and "relabelled"
 STALE_SESSIONS = 10  # C2: a listed symbol whose last bar is further behind the store's end
 COPY_SHARE_WARN = 0.10  # M7: share of an old-holder segment's days copied from the latest holder
+SPLIT_LIQUID_DAYS = 92  # S1, S2: tier as_of this many days either side of the ex-date gates it
+SPLIT_TRADED_SESSIONS = 20  # S1: no traded bar this many sessions before (or after, if it ended)
+SPLIT_LATE_SESSIONS = 2  # S2: the move may land this many sessions after the ex-date (ULTY: 1)
+REVIEWED_RESOLUTIONS = ("unresolved", "relabelled")  # M6: conflicts a human reads once
+I10_MIN_SNAPSHOTS = 3  # I10: exchange snapshots that make a listing (fewer: stale or not started)
+# I10: the SEC exchange table's spellings of a listing; "OTC" and "" are none
+LISTING_EXCHANGES = ("NASDAQ", "NYSE", "CBOE", "CBOE US", "NAS")
 
 
 @dataclass(frozen=True)
@@ -133,7 +147,7 @@ CHECKS: dict[str, CheckSpec] = dict(
         _spec("M5", "instrument class unknown", "liquid", f"{_SYM}:{_DATE}"),
         _spec(
             "M6",
-            "identity conflicts the build could not settle",
+            "identity conflicts awaiting a human (unresolved, relabelled)",
             "liquid",
             f"{_SYM}(/{_SYM})*:{_KIND}:{_DATE}(,{_DATE})*",
         ),  # fmt: skip
@@ -158,6 +172,7 @@ CHECKS: dict[str, CheckSpec] = dict(
         _spec("I7", "session with almost nothing traded", "all", _DATE),
         _spec("I8", "security silent for more than 10 sessions", None, f"{_SID}:{_DATE}"),
         _spec("I9", "price discontinuity across a segment change", None, f"{_SID}:{_DATE}"),
+        _spec("I10", "exchange-listed ticker with no bars of its own", None, rf"{_SYM}:\d+"),
         _spec("S1", "split record with no bar on its ex-date", "liquid", f"{_SYM}:{_DATE}"),
         _spec("S2", "split record without the price move", "liquid", f"{_SYM}:{_DATE}"),
         _spec("S3", "one-day thin-volume spike, no split", "liquid", f"{_SYM}:{_DATE}"),
@@ -311,6 +326,9 @@ _TRADED = "_audit_traded"
 _ORPHANS = "_audit_orphans"
 _ALPACA_KEYS = "_audit_alpaca_keys"  # (symbol, t) of every Alpaca row, imported rows aside
 _LISTED = "_audit_listed"  # the Alpaca listing as of the audit (C2)
+_TIER = "_audit_tier"  # (security_id, day): liquid-tier rows knowable at as_of (S1, S2)
+_EXCHANGES = "_audit_exchanges"  # SEC exchange snapshots knowable at as_of (I10)
+_SPLIT_OWNERS = "_audit_split_owners"  # split record -> security owning its symbol that day
 
 _REGISTERED = (
     _RES,
@@ -323,8 +341,10 @@ _REGISTERED = (
     _LIQ_IDS,
     _QUAL_IDS,
     _LISTED,
+    _TIER,
+    _EXCHANGES,
 )
-_TEMP_TABLES = (_LIQ_SYMS, _SESSIONS, _TRADED, _ORPHANS, _SPLIT_DAYS)
+_TEMP_TABLES = (_LIQ_SYMS, _SESSIONS, _TRADED, _ORPHANS, _SPLIT_DAYS, _SPLIT_OWNERS)
 _TEMP_VIEWS = (_RAW, _ALPACA_KEYS)
 
 
@@ -354,7 +374,12 @@ class _Audit:
 
     # -- setup -----------------------------------------------------------------------------------
 
-    def load(self, liquid_ids: Collection[str], qualified_ids: Collection[str]) -> None:
+    def load(
+        self,
+        liquid_ids: Collection[str],
+        qualified_ids: Collection[str],
+        liquid_tier: pa.Table | None = None,
+    ) -> None:
         con, root, as_of = self.con, self.root, self.as_of
         # DuckDB caches file contents by path and mtime; a file rewritten within the same second
         # (a rebuild right before the audit) would be read stale
@@ -408,6 +433,20 @@ class _Audit:
                 "SELECT * FROM _audit_alpaca_keys_empty"
             )
         con.register(_LISTED, self._listed())
+        con.register(_EXCHANGES, self._exchanges())
+        # a tier row computed after as_of is not knowable yet
+        self.dated_tier = liquid_tier is not None
+        tier = [
+            {"security_id": r["security_id"], "day": r["as_of"].astimezone(ET).date()}
+            for r in (liquid_tier.to_pylist() if liquid_tier is not None else [])
+            if r["class"] in LIQUID_CLASSES and r["as_of"] <= as_of
+        ]
+        con.register(
+            _TIER,
+            pa.Table.from_pylist(
+                tier, schema=pa.schema([("security_id", pa.string()), ("day", pa.date32())])
+            ),
+        )
 
         con.execute(
             f"CREATE OR REPLACE TEMP TABLE {_LIQ_SYMS} AS SELECT DISTINCT symbol FROM {_MASTER} "
@@ -431,6 +470,35 @@ class _Audit:
         self.liquid_symbols = {
             row[0] for row in con.execute(f"SELECT symbol FROM {_LIQ_SYMS}").fetchall()
         }
+        # The security owning a split record's symbol on its ex-date: the segment covering the
+        # day, else the one ending that day (UTX's record of 2020-04-03, the day it became RTX).
+        # The session index is the first session on or after the ex-date.
+        con.execute(
+            f"""
+            CREATE OR REPLACE TEMP TABLE {_SPLIT_OWNERS} AS
+            SELECT sp.symbol, sp.ex_date,
+                   (SELECT m.security_id FROM {_MASTER} m
+                    WHERE m.symbol = sp.symbol AND m.valid_from <= sp.ex_date
+                      AND (m.valid_to IS NULL OR sp.ex_date <= m.valid_to)
+                    ORDER BY (m.valid_to = sp.ex_date) NULLS FIRST, m.valid_from DESC
+                    LIMIT 1) AS security_id,
+                   (SELECT min(idx) FROM {_SESSIONS} s WHERE s.session_date >= sp.ex_date)
+                       AS ex_idx
+            FROM {_SPLIT_DAYS} sp
+            """
+        )
+
+    def _exchanges(self) -> pa.Table:
+        """SEC exchange snapshots knowable at ``as_of`` (from 00:00 New York of their date)."""
+        path = self.root / EXCHANGE_HISTORY_PATH
+        if not path.exists():
+            return EXCHANGE_HISTORY_SCHEMA.empty_table()
+        table = pq.read_table(path)
+        keep = [
+            datetime(d.year, d.month, d.day, tzinfo=ET) <= self.as_of
+            for d in table.column("snapshot_date").to_pylist()
+        ]
+        return table.filter(pa.array(keep, pa.bool_()))
 
     def _names(self) -> pa.Table:
         path = self.root / "corporate_actions" / "name_changes.parquet"
@@ -685,15 +753,18 @@ class _Audit:
         return table, notes
 
     def _conflict_rows(self, *, unresolved: bool) -> pa.Table:
-        """The build's conflict table as audit rows: the unresolved ones (M6) or the ones the
-        build settled (M8, carrying the resolution). A conflicts file written before the
-        ``resolution`` column existed reads as all unresolved."""
+        """The build's conflict table as audit rows: the ones awaiting a human (M6) or the ones
+        the build settled (M8, carrying the resolution). ``relabelled`` waits for a human too:
+        rule R merges two filers on the absence of the taker's own bars, which a coincidence of
+        prices can also produce, so each case is read once and excepted with a reason. A
+        conflicts file written before the ``resolution`` column existed reads as all
+        unresolved."""
         path = self.root / CONFLICTS_FILE
         conflicts = pq.read_table(path) if path.exists() else CONFLICT_SCHEMA.empty_table()
         rows = []
         for c in conflicts.to_pylist():
             resolution = c.get("resolution") or "unresolved"
-            if (resolution == "unresolved") != unresolved:
+            if (resolution in REVIEWED_RESOLUTIONS) != unresolved:
                 continue
             symbols = list(c["symbols"] or [])
             row = {
@@ -1023,26 +1094,117 @@ class _Audit:
             """
         ), {}
 
+    def i10(self) -> tuple[pa.Table, dict]:
+        """A company the SEC lists on an exchange that owns no traded bar of its listed span:
+        its history is not in the store (Inhibrx's INBX, dropped by the vendor when the label
+        was reused; Barnes's B, overwritten with Barrick's). Information for a second source."""
+        listing = ", ".join(f"'{e}'" for e in LISTING_EXCHANGES)
+        table = self._q(
+            f"""
+            WITH listed AS (
+                SELECT ticker, cik, min(snapshot_date) AS first_listed,
+                       max(snapshot_date) AS last_listed,
+                       count(DISTINCT snapshot_date) AS snapshots
+                FROM {_EXCHANGES}
+                WHERE exchange IN ({listing})
+                  AND regexp_full_match(ticker, '[A-Z]{{1,5}}')
+                  AND NOT regexp_full_match(ticker, '[A-Z]{{4}}X')  -- mutual fund tickers
+                GROUP BY ticker, cik
+                HAVING count(DISTINCT snapshot_date) >= {I10_MIN_SNAPSHOTS}
+            )
+            SELECT l.ticker || ':' || CAST(l.cik AS VARCHAR) AS key, false AS _liq,
+                   l.ticker, l.cik, l.first_listed, l.last_listed, l.snapshots
+            FROM listed l
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {_MASTER} m
+                JOIN {_RAW} r ON r.symbol = m.symbol AND r.volume > 0
+                     AND r.session_date >= m.valid_from
+                     AND (m.valid_to IS NULL OR r.session_date < m.valid_to)
+                WHERE m.symbol = l.ticker AND m.cik = l.cik
+                  AND r.session_date BETWEEN l.first_listed AND l.last_listed
+            )
+            """
+        )
+        return table, {}
+
     # -- S: splits and price jumps ---------------------------------------------------------------
 
+    def _split_liq(self, owner: str, record: str) -> str:
+        """Liquid scope of a split record: with the monthly tier, the owning security in the
+        tier within ``SPLIT_LIQUID_DAYS`` of the ex-date; without it, the all-years union."""
+        if not self.dated_tier:
+            return _liq_sym(f"{record}.symbol")
+        return (
+            f"coalesce(EXISTS (SELECT 1 FROM {_TIER} l WHERE l.security_id = {owner}.security_id "
+            f"AND abs(date_diff('day', l.day, {record}.ex_date)) <= {SPLIT_LIQUID_DAYS}), false)"
+        )
+
     def s1(self) -> tuple[pa.Table, dict]:
+        n = SPLIT_TRADED_SESSIONS
         table = self._q(
             f"""
             WITH stored AS (SELECT DISTINCT symbol FROM {_RAW}),
-            sp AS (SELECT DISTINCT symbol, ex_date, kind, factor FROM {_SPLITS})
-            SELECT sp.symbol || ':' || {_day("sp.ex_date")} AS key, {_liq_sym("sp.symbol")} AS _liq,
-                   sp.symbol, sp.ex_date, sp.kind, sp.factor,
-                   CASE WHEN sp.symbol IN (SELECT symbol FROM stored) THEN 'no_bar_that_day'
-                        ELSE 'symbol_never_stored' END AS reason
-            FROM sp ANTI JOIN {_RAW} r ON r.symbol = sp.symbol AND r.session_date = sp.ex_date
-            -- a split is known from 00:00 of its ex-date, its bar only from 20:00
-            WHERE sp.ex_date <= (SELECT max(session_date) FROM {_SESSIONS})
+            sp AS (
+                SELECT DISTINCT symbol, ex_date, kind, factor FROM {_SPLITS}
+                -- a split is known from 00:00 of its ex-date, its bar only from 20:00
+                WHERE ex_date <= (SELECT max(session_date) FROM {_SESSIONS})
+            ),
+            own AS (SELECT sp.*, o.security_id, o.ex_idx FROM sp JOIN {_SPLIT_OWNERS} o
+                    USING (symbol, ex_date)),
+            -- bars around the ex-date under any name of the owning security, or of the record's
+            -- own symbol when no segment owns it
+            near AS (
+                SELECT o.symbol, o.ex_date, r.session_date, r.volume, s.idx
+                FROM own o JOIN {_MASTER} m ON m.security_id = o.security_id
+                JOIN {_RAW} r ON r.symbol = m.symbol AND r.session_date >= m.valid_from
+                     AND (m.valid_to IS NULL OR r.session_date < m.valid_to)
+                JOIN {_SESSIONS} s ON s.session_date = r.session_date
+                WHERE s.idx BETWEEN o.ex_idx - {n} AND o.ex_idx + {n}
+                UNION ALL
+                SELECT o.symbol, o.ex_date, r.session_date, r.volume, s.idx
+                FROM own o JOIN {_RAW} r ON r.symbol = o.symbol
+                JOIN {_SESSIONS} s ON s.session_date = r.session_date
+                WHERE o.security_id IS NULL AND s.idx BETWEEN o.ex_idx - {n} AND o.ex_idx + {n}
+            ),
+            judged AS (
+                SELECT o.*,
+                       EXISTS (SELECT 1 FROM near b WHERE b.symbol = o.symbol
+                               AND b.ex_date = o.ex_date AND b.session_date = o.ex_date) AS has_bar,
+                       -- a side is judged only when the store holds all its sessions (the newest
+                       -- records have no "after" yet)
+                       o.ex_idx > {n} AND NOT EXISTS (
+                           SELECT 1 FROM near b WHERE b.symbol = o.symbol AND b.ex_date = o.ex_date
+                           AND b.volume > 0 AND b.idx < o.ex_idx) AS silent_before,
+                       o.ex_idx + {n} <= (SELECT max(idx) FROM {_SESSIONS}) AND NOT EXISTS (
+                           SELECT 1 FROM near b WHERE b.symbol = o.symbol AND b.ex_date = o.ex_date
+                           AND b.volume > 0 AND b.idx > o.ex_idx)
+                       -- silence after the record excuses it only when the security ended
+                       -- (bought, delisted); an open security gone quiet may have lost its bars
+                       AND NOT EXISTS (
+                           SELECT 1 FROM {_MASTER} m WHERE m.security_id = o.security_id
+                           AND (m.valid_to IS NULL OR m.valid_to > (
+                               SELECT session_date FROM {_SESSIONS}
+                               WHERE idx = o.ex_idx + {n}))) AS silent_after
+                FROM own o
+            ),
+            rows AS (
+                SELECT j.*,
+                       CASE WHEN j.symbol NOT IN (SELECT symbol FROM stored)
+                                THEN 'symbol_never_stored'
+                            WHEN j.silent_before OR j.silent_after THEN 'not_traded_around'
+                            ELSE 'no_bar_that_day' END AS reason
+                FROM judged j WHERE NOT j.has_bar
+            )
+            SELECT x.symbol || ':' || {_day("x.ex_date")} AS key,
+                   x.reason <> 'not_traded_around' AND {self._split_liq("x", "x")} AS _liq,
+                   x.symbol, x.ex_date, x.kind, x.factor, x.reason
+            FROM rows x
             """
         )
         reasons = table.column("reason").to_pylist()
         notes = {
-            "symbol_never_stored": reasons.count("symbol_never_stored"),
-            "no_bar_that_day": reasons.count("no_bar_that_day"),
+            r: reasons.count(r)
+            for r in ("symbol_never_stored", "no_bar_that_day", "not_traded_around")
         }
         return table, notes
 
@@ -1057,16 +1219,37 @@ class _Audit:
 
     def s2(self) -> tuple[pa.Table, dict]:
         traded = self._traded()
+        tol, late = SPLIT_TOLERANCE, SPLIT_LATE_SESSIONS
+
+        def off(open_: str) -> str:  # this open, against the close before the ex-date
+            return f"abs(({open_} / t.prev_close) * sp.factor - 1) > {tol}"
+
         table = self._q(
             f"""
-            SELECT sp.symbol || ':' || {_day("sp.ex_date")} AS key, {_liq_sym("sp.symbol")} AS _liq,
+            WITH ahead AS (
+                SELECT *, lead(open, 1) OVER w AS open1, lead(idx, 1) OVER w AS idx1,
+                       lead(open, 2) OVER w AS open2, lead(idx, 2) OVER w AS idx2
+                FROM {traded} WINDOW w AS (PARTITION BY symbol ORDER BY t)
+            )
+            SELECT sp.symbol || ':' || {_day("sp.ex_date")} AS key,
+                   {self._split_liq("o", "sp")} AS _liq,
                    sp.symbol, sp.ex_date, sp.kind, sp.factor, t.prev_close, t.open,
                    t.open / t.prev_close AS observed, 1.0 / sp.factor AS expected
             FROM (SELECT DISTINCT symbol, ex_date, kind, factor FROM {_SPLITS}
                   WHERE kind <> 'unit_split' AND factor > 0) sp
-            JOIN {traded} t ON t.symbol = sp.symbol AND t.session_date = sp.ex_date
+            JOIN ahead t ON t.symbol = sp.symbol AND t.session_date = sp.ex_date
+            LEFT JOIN {_SPLIT_OWNERS} o ON o.symbol = sp.symbol AND o.ex_date = sp.ex_date
+            JOIN {_SESSIONS} ps ON ps.idx = t.prev_idx
             WHERE {self._has_prev()}
-              AND abs((t.open / t.prev_close) * sp.factor - 1) > {SPLIT_TOLERANCE}
+              -- the previous close must be the same security's (ARNC changed holder that day)
+              AND (SELECT m.security_id FROM {_MASTER} m
+                   WHERE m.symbol = t.symbol AND m.valid_from <= ps.session_date
+                     AND (m.valid_to IS NULL OR ps.session_date < m.valid_to)
+                   LIMIT 1) IS NOT DISTINCT FROM o.security_id
+              -- the move may land up to SPLIT_LATE_SESSIONS after the record (ULTY)
+              AND {off("t.open")}
+              AND (t.open1 IS NULL OR t.idx1 - t.idx > {late} OR {off("t.open1")})
+              AND (t.open2 IS NULL OR t.idx2 - t.idx > {late} OR {off("t.open2")})
             """
         )
         # records S2 cannot test, so a clean S2 is not read as "every split moved the price"
@@ -1327,6 +1510,7 @@ def run_audit(
     qualified_ids: Collection[str] | None = None,
     exceptions: Sequence[AuditException] = (),
     checks: Sequence[str] | None = None,
+    liquid_tier: pa.Table | None = None,
 ) -> list[CheckResult]:
     """Run ``checks`` (all by default) over the store under ``root`` as known at ``as_of``, in
     ``CHECKS`` order. ``liquid_ids`` is the liquid-tier union (``tier_union``).
@@ -1334,7 +1518,10 @@ def run_audit(
     ``qualified_ids`` is the same union taken over every instrument class (``classes=None``)
     and scopes M5 only: a security whose class is unknown can never be in the liquid tier, so
     judged against ``liquid_ids`` an unknown class would never fail the liquid gate. Defaults
-    to ``liquid_ids``."""
+    to ``liquid_ids``.
+
+    ``liquid_tier`` is the monthly tier itself (``tier_union`` rows); when given, split records
+    are scoped by date (``SPLIT_LIQUID_DAYS``) rather than by the union."""
     if as_of.tzinfo is None:
         raise ValueError("as_of must be timezone-aware")
     wanted = list(CHECKS) if checks is None else list(checks)
@@ -1347,7 +1534,7 @@ def run_audit(
 
     audit = _Audit(con, root, as_of.astimezone(UTC))
     try:
-        audit.load(liquid_ids, liquid_ids if qualified_ids is None else qualified_ids)
+        audit.load(liquid_ids, liquid_ids if qualified_ids is None else qualified_ids, liquid_tier)
         results = []
         for check_id in selected:
             method: Callable[[], tuple[pa.Table, dict]] = getattr(audit, check_id.lower())

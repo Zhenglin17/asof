@@ -2618,7 +2618,10 @@ def test_f11_inbx_new_filer_segment_runs_from_alpacas_date(
     assert len(segments(master, "INBX")) == 2
     first, later = segments(master, "INBX")
     assert (first["valid_from"], first["valid_to"]) == (date(2024, 5, 29), F11_RENAME_DAY)
-    assert first["cik"] == F11_OLD_CIK  # what the SEC rows before 05-31 say about the label
+    # 6-c rule R: the 05-29 / 05-30 INBX bars are the new filer's when-issued days (no bar of
+    # INXB's own differs from them), so the piece joins the new filer under its CIK
+    assert first["cik"] == F11_NEW_CIK
+    assert first["evidence"] == "relabelled"
     assert (later["valid_from"], later["valid_to"]) == (F11_RENAME_DAY, None)
     assert later["cik"] == F11_NEW_CIK
     assert later["evidence"] == "name_change"
@@ -2630,21 +2633,22 @@ def test_f11_inbx_new_filer_segment_runs_from_alpacas_date(
         date(2025, 12, 31),
     ):
         assert segment_at(master, "INBX", day) == later, day
-    # Old filer vs new filer: two securities. INXB (the temporary ticker) belongs to the new one.
-    assert first["security_id"] != later["security_id"]
-    assert only_sid(master, "INXB") == later["security_id"]
+    # One security; INXB (the temporary ticker) has no segment of another one (rule R clips its
+    # one-day piece, which lies inside the relabelled span, away).
+    assert first["security_id"] == later["security_id"]
+    assert {s["security_id"] for s in segments(master, "INXB")} <= {later["security_id"]}
     assert not any(s["valid_from"] == F11_SEC_DATE for s in segments(master, "INBX"))
     # No CIK-cut event is left (the switch is explained by INXB -> INBX), so no conflict about
     # INBX is a CIK-switch report and none is dated at the 06-06 snapshot. The takeover check
-    # may still report the 05-31 cut as reuse_looks_continuous (real: 15.86 -> 16.25 across
-    # CIKs 1739614 -> 2007919) -- that report is a correct question for a human (the 05-29/30
-    # INBX bars are INXB's when-issued days), not a leftover of the snapshot-dated vacate.
+    # reports the 05-31 cut as reuse_looks_continuous (real: 15.86 -> 16.25 across CIKs
+    # 1739614 -> 2007919), settled by rule R as relabelled, not left for a human.
     assert conflicts_of(conflicts, "cik_switch_discontinuous") == []
     for r in conflicts.to_pylist():
         if "INBX" in r["symbols"]:
             assert r["kind"] == "reuse_looks_continuous", r
             assert F11_SEC_DATE not in r["dates"], r
             assert F11_RENAME_DAY in r["dates"], r
+            assert r["resolution"] == "relabelled", r
     assert conflicts_of(conflicts, "dup_unlinked") == []  # INXB's bar sits in the same chain
 
 
@@ -2668,9 +2672,9 @@ def test_f11_new_filer_segment_is_knowable_at_alpacas_record_not_the_snapshot(
     before_record = [
         r for r in visible_at(master, et_midnight(date(2024, 5, 30))) if r["symbol"] == "INBX"
     ]
-    assert [(r["valid_from"], r["valid_to"]) for r in before_record] == [
-        (date(2024, 5, 29), F11_RENAME_DAY)
-    ]
+    # 6-c rule R: that the 05-29 / 05-30 bars are the new filer's is only known with the 05-31
+    # record, so before it no INBX segment is visible at all
+    assert before_record == []
     at_record = [
         r for r in visible_at(master, et_midnight(F11_RENAME_DAY)) if r["symbol"] == "INBX"
     ]

@@ -261,11 +261,14 @@ def test_arnc_two_events_on_one_day_leave_no_overlap(con: duckdb.DuckDBPyConnect
         (arconic_inc, "HWM", date(2020, 4, 1), None),
         (arconic_corp, "ARNC", date(2020, 4, 1), None),
     ]
-    # known imprecision: the SEC kept ARNC under Arconic Inc's CIK until 2020-07-10, and so does
-    # the master; no check can see it because both sides agree
+    # The SEC kept ARNC under Arconic Inc's CIK until 2020-07-10 (lag). Until 6-c the master
+    # copied it onto Arconic Corp's first piece; rule L (the leaver's CIK does not follow its
+    # old label, tests/ingest/test_security_master_takeovers.py) removes it.
     master = visible_master(con, ROOT, NOW).to_pylist()
     arnc = [(r["valid_from"], r["cik"]) for r in master if r["security_id"] == arconic_corp]
-    assert arnc == [(date(2020, 4, 1), 4281), (date(2020, 7, 10), 1790982)]
+    assert arnc[0][0] == date(2020, 4, 1)
+    assert arnc[0][1] != 4281
+    assert arnc[-1] == (date(2020, 7, 10), 1790982)
 
 
 # -- splits --------------------------------------------------------------------------------------
@@ -657,3 +660,68 @@ def test_para_2023_bar_is_paramounts_through_a_build_that_reads_the_imports(
     assert row["close"] == pytest.approx(15.39, abs=1e-4)
     assert row["security_id"] == paramount
     assert (paramount, "PARA", date(2022, 2, 17), date(2025, 8, 7)) in segments(con, NOW, "PARA")
+
+
+# -- step 6-c rules (L: the leaver's CIK stays behind; R: a takeover's relabelled history),
+# written 2026-10-19 to FAIL on the store built before them --
+# Fake-world tests: tests/ingest/test_security_master_takeovers.py. Values below were read off
+# the store on 2026-10-19; the master rows they contradict are quoted in each case.
+
+
+def test_b_before_2025_05_09_is_barricks_history_known_only_from_the_rename(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # R. B's 2023-06-01 bar closes 17.45 (Barrick; A-Mark's copy under GOLD that day is 34.48).
+    # Master before the rule: B [2020-01-02, 2025-05-09) S000702 cik 9984 (Barnes) 'sec' and B
+    # [2025-05-09, None) cik 756894, conflict reuse_looks_continuous GOLD/B unresolved.
+    barrick = sid(con, "B", date(2025, 6, 2))
+    window = {"start": ny(2023, 6, 1), "end": ny(2023, 6, 2)}
+    [row] = bars(con, NOW, ["B"], **window).to_pylist()
+    assert row["close"] == pytest.approx(17.45, abs=1e-4)
+    assert row["security_id"] == barrick
+    master = visible_master(con, ROOT, NOW).to_pylist()
+    [seg] = [
+        r
+        for r in master
+        if r["symbol"] == "B"
+        and r["valid_from"] <= date(2023, 6, 1)
+        and (r["valid_to"] is None or date(2023, 6, 1) < r["valid_to"])
+    ]
+    assert seg["security_id"] == barrick
+    assert seg["cik"] == 756894
+    assert seg["evidence"] == "relabelled"
+    # knowable only with the GOLD -> B record (2025-05-09), not in 2023
+    early = visible_master(con, ROOT, ny(2023, 6, 2)).to_pylist()
+    assert not [r for r in early if r["symbol"] == "B" and r["security_id"] == barrick]
+    assert not [r for r in early if r["symbol"] == "B" and r["cik"] == 756894]
+
+
+def test_xper_from_2022_10_03_is_xperi_inc_and_adea_is_the_old_xper(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # L. Xperi Holding (1803696) renamed itself Adeia on 2022-10-03; the spun-off Xperi Inc
+    # (1788999) took XPER the same day. Master before the rule: XPER 2020..2022-10-03, ADEA from
+    # 10-03 and XPER from 10-03 all S008468 -- the new XPER piece read 1803696 off the
+    # 2022-10-03 snapshot and the same-CIK takeover rule bridged it.
+    adeia = sid(con, "ADEA", date(2023, 1, 3))
+    assert sid(con, "XPER", date(2022, 9, 30)) == adeia
+    assert sid(con, "XPER", date(2023, 1, 3)) != adeia
+    assert sid(con, "XPER", date(2022, 10, 3)) != adeia
+    master = visible_master(con, ROOT, NOW).to_pylist()
+    [first] = [r for r in master if r["symbol"] == "XPER" and r["valid_from"] == date(2022, 10, 3)]
+    assert first["cik"] != 1803696
+
+
+def test_inbx_last_days_of_may_2024_belong_to_inhibrx_biosciences(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # R. INBX's 2024-05-29 bar equals INXBV's and its 05-30 bar equals INXB's (Inhibrx
+    # Biosciences trading when-issued, then regular, before the 05-31 rename). Master before
+    # the rule: INBX [05-29, 05-31) S015203 cik 1739614 (old Inhibrx), INXB [05-30, 05-31) and
+    # INBX [05-31, None) S015208 cik 2007919, conflict INXB/INBX unresolved.
+    biosciences = sid(con, "INBX", date(2024, 6, 3))
+    assert sid(con, "INBX", date(2024, 5, 29)) == biosciences
+    master = visible_master(con, ROOT, NOW).to_pylist()
+    inbx = [r for r in master if r["symbol"] == "INBX" and r["security_id"] == biosciences]
+    assert {r["cik"] for r in inbx} == {2007919}
+    assert date(2024, 5, 29) in {r["valid_from"] for r in inbx}

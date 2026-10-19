@@ -37,8 +37,8 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Resolved read path: every bar read carries the permanent id of the security that owned
       its symbol that day, as the security master was known at the time; relabelled copies
       and the vendor's volume-0 filler bars are gone by default
-- [x] Data audit: 32 checks over the real store with reviewed exceptions, and hand-checked
-      reference histories asserted as tests against it
+- [x] Data audit: 33 checks over the real store with reviewed exceptions, clean in the
+      liquid tier, and hand-checked reference histories asserted as tests against it
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
@@ -134,9 +134,18 @@ another's and then stop while the other trades on was renamed into it even thoug
 filed it (Cyclerion into Kalaris); and a segment whose trailing bars, after a gap or after
 its filer left the SEC table, are copies of another security's (Axonics after its buyout,
 Voxeljet after its delisting) ends where the copies begin, as does a label whose whole history
-under an earlier holder is the current holder's history rewritten. Every conflict the build
-reports carries a `resolution` (`new_security`, `bridged`, `ignored`, `unresolved`); only the
-unresolved ones wait for a human. `asof market instruments` then tags each segment with an
+under an earlier holder is the current holder's history rewritten. When a label is taken at a
+continuous price by a different filer, the bars decide: if the taker traded nothing of its own
+while the earlier holder's segment ran, that segment is the taker's history rewritten under
+the label (Barrick's 2020-2025 prices sit under B, the ticker Barnes Group held until Barrick
+took it in 2025) and joins the taker, knowable only from the takeover record, so a reader in
+2023 sees no segment for those bars rather than Barrick under a ticker it did not yet have;
+otherwise the two stay separate securities. A filer that renamed off a label takes its CIK
+along, however long the SEC table keeps listing it there (Xperi Holding became Adeia the day
+the spun-off Xperi Inc. took XPER). Every conflict the build reports carries a `resolution`
+(`new_security`, `bridged`, `ignored`, `relabelled`, `unresolved`); the unresolved ones wait
+for a human, and so does each relabelled merge, once, since a coincidence of prices could
+produce the same absence of bars. `asof market instruments` then tags each segment with an
 instrument class from the name it carried in that era, using the ordered rules in
 `configs/instrument_class_rules.yaml`; the scanner will only look at common stocks and
 unleveraged ETFs. A segment nobody ever named (an ETF's old ticker) inherits the class of a
@@ -180,13 +189,18 @@ a line.
 
 Tests on fake data only show that the code does what its author imagined; they stay green when
 the imagined vendor differs from the real one. `asof market audit` therefore reads the real
-store as of an instant and counts each kind of accident met so far, 32 checks in all:
+store as of an instant and counts each kind of accident met so far, 33 checks in all:
 duplicate or impossible bars, segments of one security that overlap, two securities sharing
 an identical bar (a relabelled history the master did not catch), an earlier holder's segment
 partly made of the current holder's bars, a split record with no price
 move, a one-day thin-volume print far from the previous close with no split to explain it, a
 price jump across a rename, traded bars that no segment owns, a listed symbol whose bars
-stopped although the vendor still serves it. Each finding is a row with a
+stopped although the vendor still serves it, and a company the SEC lists on an exchange that
+owns no bar at all (the vendor dropped Inhibrx's history when its ticker was reused; read from
+the SEC exchange tables archived since 2021-07, so earlier losses stay invisible). A split
+record counts against the liquid tier only when its security was in the tier within three
+months of the ex-date, its ex-date bar is looked up under every name of the security, and a
+move that lands one or two sessions late is the move. Each finding is a row with a
 short key (`AAA:2020-01-07`, `S000730`, `AAA/BBB`) written to
 `$ASOF_DATA_DIR/market/audit/<check>.parquet`. Gated checks must be clean inside the liquid
 tier, the rest are reported for a human to read. A reviewed finding goes into
