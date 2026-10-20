@@ -342,7 +342,8 @@ def test_d_handover_within_five_calendar_days_moves_the_cut(gap_days: int, moved
     cut = D_OLD_LAST + timedelta(days=1) if moved else D_RECORD
     assert new["valid_from"] == old["valid_to"] == cut
     assert new["security_id"] == old["security_id"]
-    assert new["available_at"] == et_midnight(D_RECORD)
+    # first-bar rule: unmoved, NEW's first own bar is on the record day
+    assert new["available_at"] == (et_midnight(D_RECORD) if moved else bar_available_at(D_RECORD))
     assert old["end_available_at"] == et_midnight(D_RECORD)
     assert_end_knowability_invariant(master)
 
@@ -528,7 +529,9 @@ def test_v_when_issued_old_name_without_bars_still_cuts_the_label(old: str) -> N
     after = segment_at(master, "ARNC", date(2020, 5, 1))
     assert before["valid_to"] == after["valid_from"] == V_ARNC_DAY
     assert before["security_id"] != after["security_id"]
-    assert before["end_available_at"] == after["available_at"] == et_midnight(V_ARNC_DAY)
+    # first-bar rule: the end stays at the record, the new holder waits for its first bar
+    assert before["end_available_at"] == et_midnight(V_ARNC_DAY)
+    assert after["available_at"] == bar_available_at(V_ARNC_DAY)
     assert old not in set(master.column("symbol").to_pylist())
     assert_end_knowability_invariant(master)
 
@@ -552,7 +555,8 @@ def test_v_old_name_without_bars_and_new_name_not_traded_before_is_an_ordinary_s
     assert (newc["valid_from"], newc["valid_to"]) == (record, None)
     assert newc["evidence"] == "name_change"
     assert newc["cusip"] == "000400200"
-    assert newc["available_at"] == et_midnight(record)
+    # first-bar rule: not before NEWC's first own bar (FSLF shape when after it)
+    assert newc["available_at"] == bar_available_at(first_bar)
     assert "OLDC" not in set(master.column("symbol").to_pylist())
 
 
@@ -780,7 +784,9 @@ def test_o_resumed_piece_ends_where_the_next_piece_of_the_label_starts() -> None
     assert (middle["valid_from"], middle["valid_to"]) == (resumed, taken)
     assert middle["evidence"] == "bars_only"
     assert middle["available_at"] == bar_available_at(resumed)
-    assert middle["end_available_at"] == last["available_at"] == et_midnight(taken)
+    # first-bar rule: the end stays at the takeover, the taker waits for its first bar
+    assert middle["end_available_at"] == et_midnight(taken)
+    assert last["available_at"] == bar_available_at(taken)
     assert (last["valid_from"], last["valid_to"]) == (taken, None)
     assert last["security_id"] == only_sid(master, "TAKR")
     assert len({first["security_id"], middle["security_id"], last["security_id"]}) == 3
@@ -872,18 +878,22 @@ def test_a_when_issued_pair_is_not_reported_as_an_unlinked_duplicate(
 def test_a_hona_segment_is_knowable_at_the_record_and_honav_ends_then(
     a_hona_built: tuple[pa.Table, pa.Table],
 ) -> None:
-    # Leakage: a reader on 06-20 sees HONAV open and no HONA; at midnight 06-29 HONA appears
-    # and HONAV's end becomes knowable, at the same instant.
+    # Leakage: a reader on 06-20 sees HONAV open and no HONA; at midnight 06-29 HONAV's end
+    # becomes knowable, HONA at its first bar that evening (first-bar rule, 2026-10-19).
     master, _ = a_hona_built
 
     [hona] = segments(master, "HONA")
     [honav] = segments(master, "HONAV")
-    assert hona["available_at"] == honav["end_available_at"] == et_midnight(A_HONA_DAY)
+    # first-bar rule: the end stays at the record, HONA waits for its first bar
+    assert honav["end_available_at"] == et_midnight(A_HONA_DAY)
+    assert hona["available_at"] == bar_available_at(A_HONA_DAY)
     seen = visible_at(master, et_midnight(date(2026, 6, 20)))
     assert "HONA" not in {r["symbol"] for r in seen}
     [honav_seen] = [r for r in seen if r["symbol"] == "HONAV"]
     assert honav_seen["end_available_at"] > et_midnight(date(2026, 6, 20))
-    assert "HONA" in {r["symbol"] for r in visible_at(master, et_midnight(A_HONA_DAY))}
+    # first-bar rule: HONA appears with its first bar, not at the record's midnight
+    assert "HONA" not in {r["symbol"] for r in visible_at(master, et_midnight(A_HONA_DAY))}
+    assert "HONA" in {r["symbol"] for r in visible_at(master, bar_available_at(A_HONA_DAY))}
     assert_nothing_known_before_its_valid_from(master)
     assert_end_knowability_invariant(master)
 
@@ -942,7 +952,9 @@ def test_a_aan_spin_off_cuts_the_label_but_chains_neither_when_issued_symbol(
     assert new["cik"] == A_NEW_AAN_CIK
     assert new["security_id"] != old["security_id"]
     assert segment_at(master, "AAN", A_AAN_DAY)["security_id"] == new["security_id"]
-    assert old["end_available_at"] == new["available_at"] == et_midnight(A_AAN_DAY)
+    # first-bar rule: the end stays at the records, the new holder waits for a bar
+    assert old["end_available_at"] == et_midnight(A_AAN_DAY)
+    assert new["available_at"] == bar_available_at(A_AAN_DAY)
 
     [aan_wi] = segments(master, "AAN.WI")
     [prg_wi] = segments(master, "PRG.WI")
@@ -996,7 +1008,9 @@ def test_a_rename_routed_through_a_when_issued_name_is_one_security() -> None:
     assert rbs["security_id"] == nwg["security_id"]
     assert rbs["valid_to"] == nwg["valid_from"] == A_NWG_OUT
     assert nwg["evidence"] == "both" and nwg["cusip"] == "639081108"  # the SEC saw it too
-    assert nwg["available_at"] == rbs["end_available_at"] == et_midnight(A_NWG_OUT)
+    # first-bar rule: the end stays at the record, NWG waits for its first bar
+    assert rbs["end_available_at"] == et_midnight(A_NWG_OUT)
+    assert nwg["available_at"] == bar_available_at(A_NWG_OUT)
     assert segment_at(master, "RBS", date(2022, 8, 31)) == rbs  # not vacated by the edge in
     assert (wi["valid_from"], wi["valid_to"]) == (A_NWG_IN, A_NWG_OUT)
     assert wi["security_id"] != rbs["security_id"]

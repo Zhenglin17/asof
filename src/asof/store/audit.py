@@ -137,7 +137,7 @@ CHECKS: dict[str, CheckSpec] = dict(
         ),  # fmt: skip
         _spec(
             "M1",
-            "back-to-back segments of a symbol known at two instants",
+            "a symbol's next segment known before its previous one's end",
             "all",
             f"{_SYM}:{_DATE}",
         ),  # fmt: skip
@@ -651,8 +651,8 @@ class _Audit:
                    a.symbol, a.security_id AS old_security_id, b.security_id AS new_security_id,
                    b.valid_from, a.end_available_at, b.available_at
             FROM {_MASTER} a JOIN {_MASTER} b
-              ON a.symbol = b.symbol AND a.valid_to = b.valid_from
-            WHERE a.end_available_at IS DISTINCT FROM b.available_at
+              ON a.symbol = b.symbol AND a.valid_to <= b.valid_from  -- also across a gap
+            WHERE b.available_at < a.end_available_at  -- a gap until the first bar is fine
             """
         ), {}
 

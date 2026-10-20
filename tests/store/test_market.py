@@ -43,8 +43,9 @@ Real-data checks for the ASSUMPTIONS (audit / standard cases):
 - `SELECT * FROM security_master WHERE symbol = 'BBUC'`: cut 2026-03-31, end_available_at
   2026-04-21 04:00 UTC. visible_bars(as_of=2026-04-10, symbols=['BBUC']) must return BBUC's
   04-01 .. 04-09 bars under BBUC's security_id; at as_of 2026-04-22 they are gone.
-- Store-wide: every back-to-back pair of segments of one symbol has old.end_available_at ==
-  new.available_at (723 pairs, 0 mismatches on 2026-10-08).
+- Store-wide: every back-to-back pair of segments of one symbol has old.end_available_at <=
+  new.available_at (2026-10-19: 542 pairs with a gap until the successor's first bar, median
+  20 hours; 0 the other way).
 - BK at as_of 2022-03-01: visible_master shows BK with valid_to NULL; visible_bars(symbols=['BK',
   'BNY']) returns only BK rows, security_id S000730.
 - NKLA at as_of 2020-06-06 00:00 UTC: no NKLA bars; at 2020-06-08 04:00 UTC VTIQ's and NKLA's
@@ -763,7 +764,8 @@ def test_overlap_created_by_masking_an_unknowable_end_is_rejected(
 ) -> None:
     # On disk the two X segments are back to back, but the taker's row is knowable (06-04) before
     # the previous holder's end is (06-08): at an as_of in between the first row is masked open
-    # and both own X. A consistent master ties the two instants together; this file is broken.
+    # and both own X. A consistent master never shows the taker before that end; this file is
+    # broken.
     write_master(
         root,
         [

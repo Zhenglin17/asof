@@ -435,7 +435,7 @@ MASTER_BROKEN: dict[str, str] = {
     "end_available_at before 00:00 New York of valid_to": "end_known_before_its_day",
     "duplicate segment keys": "duplicate_key",
     "overlapping segments of one symbol": "overlap_two_securities",
-    "adjacent segments of one symbol disagree on the instant": "adjacent_instants_disagree",
+    "adjacent segment knowable before the previous one's end": "adjacent_instants_disagree",
     "cik without cik_available_at or the reverse": "cik_without_known",
     "cik_available_at before available_at": "cik_known_before_segment",
 }

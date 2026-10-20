@@ -231,6 +231,31 @@ def default_instants(full_master: pa.Table) -> list[datetime]:
     return sorted({t.astimezone(UTC) for p in picked for t in (p, p - MICRO)})
 
 
+def load_instants(path: Path) -> list[datetime]:
+    """``configs/truncation_instants.txt``: the instants a default run checks, one ISO timestamp
+    with its offset per line, ``#`` comments. Fixed by hand rather than recomputed per run: the
+    computed spread moves whenever the master does, and a leak seen only at an instant that
+    drifted away would look fixed. Sorted, UTC; a missing file is empty."""
+    if not path.exists():
+        return []
+    seen: set[datetime] = set()
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            t = datetime.fromisoformat(line)
+        except ValueError:
+            raise ValueError(f"{path}: not an ISO timestamp: {line!r}") from None
+        if t.tzinfo is None:
+            raise ValueError(f"{path}: {line!r} has no UTC offset")
+        t = t.astimezone(UTC)
+        if t in seen:
+            raise ValueError(f"{path}: duplicated instant {line}")
+        seen.add(t)
+    return sorted(seen)
+
+
 def diff_key(row: Mapping[str, Any]) -> str:
     """``SYMBOL:YYYY-MM-DD:reason[:field+field]``, the shape of an entry in the exceptions file.
     The fields are part of the key: an excepted row that starts differing in one more field is

@@ -733,8 +733,9 @@ def test_segment_created_by_a_rename_is_known_at_midnight_new_york_of_that_day(
     [bny] = segments(master, "BNY")
     [bk] = segments(master, "BK")
 
-    assert bny["available_at"] == datetime(2026, 5, 21, 4, 0, tzinfo=UTC)  # 00:00 EDT
-    assert bny["available_at"] == et_midnight(date(2026, 5, 21))
+    # first-bar rule: known at its first own bar (05-21 20:00 EDT), not at midnight
+    assert bny["available_at"] == datetime(2026, 5, 22, 0, 0, tzinfo=UTC)
+    assert bny["available_at"] == bar_available_at(date(2026, 5, 21))
     assert bk["available_at"] == bar_available_at(date(2020, 1, 2))  # first bar, 20:00 ET
     assert bk["available_at"] == datetime(2020, 1, 3, 1, 0, tzinfo=UTC)
 
@@ -1653,7 +1654,8 @@ def test_f3_new_holders_segment_is_not_knowable_before_its_snapshot(
 
     assert len(segments(master, "ARNC")) == 2
     _, new = segments(master, "ARNC")
-    assert new["available_at"] == et_midnight(F3_NEW_CIK_SNAPSHOT)
+    # first-bar rule: its first own bar is on the snapshot day
+    assert new["available_at"] == bar_available_at(F3_NEW_CIK_SNAPSHOT)
     seen = [r for r in visible_at(master, et_midnight(date(2020, 5, 1))) if r["symbol"] == "ARNC"]
     assert [r["valid_from"] for r in seen] == [date(2020, 1, 2)]
     assert_nothing_known_before_its_valid_from(master)
@@ -1825,7 +1827,8 @@ def test_f6_relabelled_mags_history_is_in_no_segment_and_nothing_leaks() -> None
     assert early == []
     assert len(segments(master, "MAGS")) == 1
     [mags] = segments(master, "MAGS")
-    assert mags["available_at"] == et_midnight(F6_FIRST)
+    # first-bar rule: MAGS's first own bar is on the first record's day
+    assert mags["available_at"] == bar_available_at(F6_FIRST)
     assert "MAGS" in {r["symbol"] for r in visible_at(master, et_midnight(date(2024, 1, 2)))}
     assert_nothing_known_before_its_valid_from(master)
 
@@ -2275,7 +2278,8 @@ def test_f10_new_holders_piece_is_not_knowable_before_the_switch_snapshot(
     master, _ = f10_built
 
     later = segment_at(master, "INBX", date(2024, 8, 1))
-    assert later["available_at"] == et_midnight(F10_SWITCH_SNAPSHOT)
+    # first-bar rule: its first own bar is on the switch snapshot's day
+    assert later["available_at"] == bar_available_at(F10_SWITCH_SNAPSHOT)
     seen = [r for r in visible_at(master, et_midnight(date(2024, 6, 1))) if r["symbol"] == "INBX"]
     assert [r["valid_from"] for r in seen] == [F10_RENAME_DAY]
     assert_nothing_known_before_its_valid_from(master)
@@ -2657,15 +2661,16 @@ def test_f11_inbx_new_filer_segment_runs_from_alpacas_date(
 def test_f11_new_filer_segment_is_knowable_at_alpacas_record_not_the_snapshot(
     f11_built: tuple[pa.Table, pa.Table],
 ) -> None:
-    # Leakage. The open-ended INBX segment exists because of Alpaca's 05-31 record, so it is
-    # knowable at midnight 05-31 -- not earlier (05-30: only the pre-rename row, whose end the
-    # reader must treat as open) and not later (the 06-06 snapshot adds no event). On 05-15
-    # INBX has no bar yet and no row is visible at all.
+    # Leakage. The open-ended INBX segment exists because of Alpaca's 05-31 record and its
+    # first bar that day, so it is knowable at 20:00 New York of 05-31 -- not earlier (05-30:
+    # only the pre-rename row, whose end the reader must treat as open) and not at the 06-06
+    # snapshot, which adds no event. On 05-15 INBX has no bar yet and no row is visible at all.
     master, _ = f11_built
 
     [later] = [s for s in segments(master, "INBX") if s["valid_from"] == F11_RENAME_DAY]
     assert later["valid_to"] is None
-    assert later["available_at"] == et_midnight(F11_RENAME_DAY)
+    # first-bar rule: its first own bar is on the record's day
+    assert later["available_at"] == bar_available_at(F11_RENAME_DAY)
     assert later["available_at"] < et_midnight(F11_SEC_DATE)
 
     assert [
@@ -2680,7 +2685,13 @@ def test_f11_new_filer_segment_is_knowable_at_alpacas_record_not_the_snapshot(
     at_record = [
         r for r in visible_at(master, et_midnight(F11_RENAME_DAY)) if r["symbol"] == "INBX"
     ]
-    assert sorted(r["valid_from"] for r in at_record) == [date(2024, 5, 29), F11_RENAME_DAY]
+    # first-bar rule: the relabelled piece is judged on the taker's bars after the cut, so it
+    # appears with the new piece, at its first bar
+    assert at_record == []
+    at_bar = [
+        r for r in visible_at(master, bar_available_at(F11_RENAME_DAY)) if r["symbol"] == "INBX"
+    ]
+    assert sorted(r["valid_from"] for r in at_bar) == [date(2024, 5, 29), F11_RENAME_DAY]
     assert_nothing_known_before_its_valid_from(master)
 
 
@@ -2763,7 +2774,8 @@ def test_g1_end_to_end_mags_segment_starts_at_the_first_record_with_sec_backing(
         set(r["symbols"]) == {"BIGT", "MAGS"} for r in conflicts_of(conflicts, "dup_unlinked")
     )
     # Leakage: the segment is knowable at the first record's midnight, not the duplicate's.
-    assert mags["available_at"] == et_midnight(F6_FIRST)
+    # first-bar rule: MAGS's first own bar is on the first record's day
+    assert mags["available_at"] == bar_available_at(F6_FIRST)
     assert "MAGS" in {r["symbol"] for r in visible_at(master, et_midnight(date(2024, 1, 2)))}
     assert_nothing_known_before_its_valid_from(master)
 
@@ -2850,7 +2862,8 @@ def test_g2_filler_days_are_in_the_old_holders_piece_and_nothing_leaks() -> None
     old, new = segments(master, "L")
     assert covering(master, "L", date(2020, 5, 15)) == [old]
     assert covering(master, "L", G2_CUT) == [new]
-    assert new["available_at"] == et_midnight(G2_CUT)
+    # first-bar rule: its first own bar is on the cut day
+    assert new["available_at"] == bar_available_at(G2_CUT)
     seen = [r for r in visible_at(master, et_midnight(date(2020, 5, 1))) if r["symbol"] == "L"]
     assert [(r["valid_from"], r["cik"]) for r in seen] == [(date(2020, 1, 2), G2_OLD_CIK)]
     assert_nothing_known_before_its_valid_from(master)
@@ -2947,7 +2960,8 @@ def test_g3_nothing_about_the_trip_is_knowable_before_its_day(
     assert not any(r["valid_from"] == G3_DAY for r in visible)
     for seg in segments(master, "ORIC") + segments(master, "1ORIC"):
         if seg["valid_from"] == G3_DAY:
-            assert seg["available_at"] == et_midnight(G3_DAY)
+            # first-bar rule: both trip pieces trade from the trip day
+            assert seg["available_at"] == bar_available_at(G3_DAY)
     assert_nothing_known_before_its_valid_from(master)
 
 
@@ -2993,13 +3007,15 @@ def test_h_master_schema_ends_with_a_utc_end_available_at(master: pa.Table) -> N
 def test_h_segment_ended_by_a_rename_away_knows_its_end_when_the_rename_was_filed(
     master: pa.Table,
 ) -> None:
-    # BK -> BNY 2026-05-21 (real): BK's end and BNY's start are one event, knowable at the same
-    # instant, 00:00 New York of the rename day. Until then BK is open from the reader's view.
+    # BK -> BNY 2026-05-21 (real): BK's end is knowable at 00:00 New York of the rename day, BNY
+    # at its first bar that evening. Until the end BK is open from the reader's view.
     [bk] = segments(master, "BK")
     [bny] = segments(master, "BNY")
 
     assert bk["valid_to"] == date(2026, 5, 21)
-    assert bk["end_available_at"] == bny["available_at"] == et_midnight(date(2026, 5, 21))
+    # first-bar rule: the end stays at the rename, BNY waits for its first bar
+    assert bk["end_available_at"] == et_midnight(date(2026, 5, 21))
+    assert bny["available_at"] == bar_available_at(date(2026, 5, 21))
     assert bk["end_available_at"] == datetime(2026, 5, 21, 4, 0, tzinfo=UTC)
     assert bk["end_available_at"] > bk["available_at"]
     # the same event seen through the SEC alone (GMGI -> MRDN): both sides share the instant
@@ -3035,7 +3051,9 @@ def test_h_previous_holder_of_a_taken_label_knows_its_end_when_the_takeover_was_
     new = segment_at(master, "BBBY", date(2026, 1, 5))
 
     assert old["valid_to"] == new["valid_from"] == date(2025, 8, 29)
-    assert old["end_available_at"] == new["available_at"] == et_midnight(date(2025, 8, 29))
+    # first-bar rule: the end stays at the takeover, the taker waits for its first bar
+    assert old["end_available_at"] == et_midnight(date(2025, 8, 29))
+    assert new["available_at"] == bar_available_at(date(2025, 8, 29))
     # FFR (real): vacated 2022-10-03, retaken by AIXC 2026-09-30. The first piece ends by its
     # own rename away, so its end is knowable at that rename, not at the much later takeover.
     first = segment_at(master, "FFR", date(2021, 6, 1))
@@ -3052,12 +3070,14 @@ def test_h_segment_cut_by_a_cik_switch_knows_its_end_at_midnight_of_the_cut_day(
     goog = segments(master, "GOOG")
     assert goog[0]["valid_to"] == date(2019, 7, 1)
     assert goog[0]["end_available_at"] == et_midnight(date(2019, 7, 1))
-    assert goog[0]["end_available_at"] == goog[1]["available_at"]
+    # first-bar rule: the next piece waits for its first bar
+    assert goog[1]["available_at"] == bar_available_at(date(2019, 7, 1))
 
     disc = segments(master, "DISC")
     assert disc[0]["valid_to"] == date(2024, 6, 3)
     assert disc[0]["end_available_at"] == et_midnight(date(2024, 6, 3))
-    assert disc[0]["end_available_at"] == disc[1]["available_at"]
+    # first-bar rule: the next piece waits for its first bar
+    assert disc[1]["available_at"] == bar_available_at(date(2024, 6, 3))
     assert disc[0]["security_id"] != disc[1]["security_id"]  # not bridged, still the same rule
 
 
@@ -3089,16 +3109,17 @@ def test_h_end_knowability_invariant_holds_on_every_world(
 def test_h_reader_in_2022_sees_bk_open_and_learns_the_end_with_bny(master: pa.Table) -> None:
     # Leakage, the reader's rule spelled out on the master alone: at as_of 2022-03-01 BK's row is
     # visible (available 2020-01-03) but its end is not (knowable 2026-05-21 04:00 UTC), so the
-    # reader must present valid_to as NULL; BNY's row is invisible. At 2026-05-21 04:00 UTC both
-    # facts appear together -- there is no instant at which BK is closed and BNY unknown.
+    # reader must present valid_to as NULL; BNY's row is invisible. At 2026-05-21 04:00 UTC BK's
+    # end appears, BNY only with its first bar (2026-05-22 00:00 UTC; first-bar rule).
     as_of = datetime(2022, 3, 1, tzinfo=UTC)
     [bk] = segments(master, "BK")
     [bny] = segments(master, "BNY")
 
     assert bk["available_at"] <= as_of < bk["end_available_at"]
     assert bny["available_at"] > as_of
-    assert bk["end_available_at"] == bny["available_at"]
-    both_known = bk["end_available_at"]
+    # first-bar rule: a gap between BK's end and BNY's start is allowed
+    assert bny["available_at"] == bar_available_at(date(2026, 5, 21)) > bk["end_available_at"]
+    both_known = bny["available_at"]
     assert {r["symbol"] for r in visible_at(master, both_known)} >= {"BK", "BNY"}
     assert {r["symbol"] for r in visible_at(master, both_known - timedelta(microseconds=1))} & {
         "BNY"
@@ -3156,14 +3177,17 @@ def test_h2_old_holder_ends_at_the_earliest_same_day_record_not_at_the_sec_snaps
     assert (old["valid_to"], old["evidence"]) == (H2_DAY, "sec")  # ended by the SEC-seen vacate
     assert new["valid_from"] == H2_DAY and new["security_id"] != old["security_id"]
     # the SEC edge alone would say 06-01; the takeover record says 04-01, and that is the instant
-    assert old["end_available_at"] == new["available_at"] == et_midnight(H2_DAY)
+    # first-bar rule: the end stays at the record, the new holder waits for its first bar
+    assert old["end_available_at"] == et_midnight(H2_DAY)
+    assert new["available_at"] == bar_available_at(H2_DAY)
     assert old["end_available_at"] < et_midnight(H2_SEC_DATE)
     assert_end_knowability_invariant(master)
-    # no instant exists at which both are knowable owners of ARNC, nor at which neither is
+    # no instant exists at which both are knowable owners of ARNC
     for row in master.to_pylist():
         if row["symbol"] == "ARNC" and row["valid_to"] is not None:
             successor = segment_at(master, "ARNC", row["valid_to"])
-            assert row["end_available_at"] == successor["available_at"]
+            # first-bar rule: a gap (neither knowable) is allowed, an overlap never
+            assert row["end_available_at"] <= successor["available_at"]
 
 
 # =============================================================================================
@@ -3177,7 +3201,8 @@ def test_h2_old_holder_ends_at_the_earliest_same_day_record_not_at_the_sec_snaps
 #       <=> end_available_at null; valid_to strictly after valid_from; end_available_at not
 #       before 00:00 New York of valid_to; no duplicate (security_id, symbol, valid_from);
 #       segments of one symbol never overlap; adjacent same-symbol segments (old.valid_to ==
-#       new.valid_from) agree on the instant (old.end_available_at == new.available_at).
+#       new.valid_from): the new one is not knowable before the old one's end
+#       (new.available_at >= old.end_available_at; a gap is allowed, first-bar rule).
 #   write_master(master, conflicts, market_root) calls it first and writes nothing on failure.
 #
 # Real (2026-10-08): 723 adjacent same-symbol pairs, all equal after the H2 rule; before it
@@ -3348,9 +3373,10 @@ def test_check_master_adjacent_rule_on_real_shaped_pairs() -> None:
     with pytest.raises(ValueError, match=r"instant|adjacent"):
         sm.check_master(master_table(arnc))
     # and the other direction: an end knowable before the successor
-    arnc[0]["end_available_at"] = et_midnight(date(2020, 3, 2))
-    with pytest.raises(ValueError, match=r"instant|adjacent"):
-        sm.check_master(master_table(arnc))
+    # first-bar rule: a gap is allowed (Arconic Corp's first bar, 04-01 20:00 ET)
+    arnc[0]["end_available_at"] = et_midnight(date(2020, 4, 1))
+    arnc[1]["available_at"] = bar_available_at(date(2020, 4, 1))
+    assert sm.check_master(master_table(arnc)) is None
 
 
 def test_check_master_gap_pairs_and_cross_symbol_pairs_are_not_constrained() -> None:

@@ -34,15 +34,19 @@ Three things the first real build (2026-10-07) taught, now rules:
 
 Every segment carries ``available_at``: the moment the event that created it became knowable
 (00:00 New York of the rename's effective day, of the SEC snapshot, or the first bar's
-availability for a symbol's opening segment). A reader at ``as_of`` filters on it like on any
-other table. A segment's end is a fact of its own with its own instant, ``end_available_at``
-(the rename, takeover or CIK switch that closed it; null while the segment is open): a reader in
-2022 must see BK as open although the file says it ends 2026-05-21, so ``visible_master`` masks
-``valid_to`` until that instant. A closed segment and the one that replaces it become knowable
-together, at the same instant, because they are two sides of one event. The CIK is a third fact
-with its own instant, ``cik_available_at``: the SEC table may list a label months after it starts
-trading (AAAU: bars from 2020-01-02, listed from 2020-07-10), and ``visible_master`` hides the
-CIK until then.
+availability for a symbol's opening segment), and never before its own first bar: a segment
+that carries bars is made only from them, so a build at 00:00 of the event cannot yet produce
+it (CXAIV -> CXAI is filed for 2023-03-15, CXAI's first bar is knowable at 20:00 that day). A
+reader at ``as_of`` filters on it like on any other table. A segment's end is a fact of its own
+with its own instant, ``end_available_at`` (the rename, takeover or CIK switch that closed it;
+null while the segment is open): a reader in 2022 must see BK as open although the file says it
+ends 2026-05-21, so ``visible_master`` masks ``valid_to`` until that instant. A closed segment's
+end is knowable at the event; the segment that replaces it is knowable at the same instant or
+later, at its first bar. In between a reader sees the old segment closed and the new one not at
+all (ABAT: the SEC snapshot of 2023-10-03 shows the label under a new CIK, the new piece's first
+bar is knowable that evening). The CIK is a third fact with its own instant,
+``cik_available_at``: the SEC table may list a label months after it starts trading (AAAU: bars
+from 2020-01-02, listed from 2020-07-10), and ``visible_master`` hides the CIK until then.
 """
 
 import os
@@ -448,6 +452,10 @@ class _Segment:
     n_bars: int = 0
     chain: int = -1
     key: int = field(default=-1)
+    # Instants decided from another piece (rule R's relabelled history, rule C's clipped end):
+    # they follow that piece's final available_at, which the first-bar pass may still raise.
+    known_with: "_Segment | None" = field(default=None, compare=False, repr=False)
+    end_known_with: "_Segment | None" = field(default=None, compare=False, repr=False)
 
 
 class _Union:
@@ -1098,7 +1106,11 @@ def _pieces_for(
     return pieces
 
 
-def _fill_bar_stats(con: duckdb.DuckDBPyConnection, pieces: list[_Segment]) -> None:
+def _first_own_bars(
+    con: duckdb.DuckDBPyConnection, pieces: Sequence[_Segment]
+) -> dict[int, tuple[int, date, datetime]]:
+    """key -> (bars, first session, first bar's available_at) over each piece's own days
+    ``[valid_from, valid_to)``; pieces without a bar are absent."""
     con.register(
         "_pieces",
         pa.table(
@@ -1124,7 +1136,11 @@ def _fill_bar_stats(con: duckdb.DuckDBPyConnection, pieces: list[_Segment]) -> N
         .to_pylist()
     )
     con.unregister("_pieces")
-    stats = {r["key"]: tuple(r.values())[1:] for r in rows}
+    return {r["key"]: tuple(r.values())[1:] for r in rows}  # type: ignore[misc]
+
+
+def _fill_bar_stats(con: duckdb.DuckDBPyConnection, pieces: list[_Segment]) -> None:
+    stats = _first_own_bars(con, pieces)
     for p in pieces:
         n, first, avail = stats.get(p.key, (0, None, None))
         p.n_bars = n
@@ -1362,6 +1378,7 @@ def _clip_identical_overlaps(
             continue  # already clipped at an earlier overlap
         if _is_copy(*shares.get(key, (0, 0))):
             a.valid_to, a.end, a.end_available_at = b.valid_from, None, b.available_at
+            a.end_known_with = b
 
 
 def _cut_copied_tails(
@@ -1659,12 +1676,15 @@ def _settle_takeovers(
         uf.union(before.key, after.key)
         # the taker's CIK is known no earlier on its relabelled history than on its own piece
         before.cik, before.cik_since, before.evidence = after.cik, after.cik_since, "relabelled"
+        # judged on the taker's bars after the cut: knowable no earlier than the taker's piece
         before.available_at = before.end_available_at = after.available_at
+        before.known_with = before.end_known_with = after
         for q in inside:
             if q.valid_from >= before.valid_from:  # type: ignore[operator]
                 dropped.add(q.key)
             else:
                 q.valid_to, q.end_available_at = before.valid_from, after.available_at
+                q.end_known_with = after
         conflicts[index]["resolution"] = "relabelled"
         conflicts[index]["detail"] += (
             f"; {before.symbol} {before.valid_from}..{cut} is the taker's history, "
@@ -2062,6 +2082,35 @@ def build_security_master(
             if p.key in overridden:
                 p.evidence = "override"
 
+        # A segment is no earlier than its first own bar: the build makes none without one.
+        # Before the chain fill below, which compares these instants.
+        current = {p.key: p for p in pieces}
+        # a piece may follow one dropped later (rule C ran before rules Z / R): raise it too
+        followed = {
+            r.key: r
+            for p in pieces
+            for r in (p.known_with, p.end_known_with)
+            if r is not None and r.key not in current
+        }
+        current |= followed
+        for key, (_, _, avail) in _first_own_bars(con, list(current.values())).items():
+            p = current[key]
+            avail = avail.replace(tzinfo=UTC) if avail.tzinfo is None else avail
+            if p.available_at is None or p.available_at < avail:
+                p.available_at = avail
+        settled = False
+        while not settled:  # a piece may follow one that follows another
+            settled = True
+            for p in pieces:
+                ref = p.known_with
+                if ref is not None and ref.available_at is not None:
+                    if p.available_at is None or p.available_at < ref.available_at:
+                        p.available_at, settled = ref.available_at, False
+                ref = p.end_known_with
+                if ref is not None and ref.available_at is not None:
+                    if p.end_available_at is not None and p.end_available_at < ref.available_at:
+                        p.end_available_at, settled = ref.available_at, False
+
         # Fill a segment's CIK from its chain when its own label never reached the SEC table --
         # only from members knowable no later than the segment itself, or a reader would learn
         # the filer from a future rename.
@@ -2258,10 +2307,10 @@ _MASTER_RULES: dict[str, str] = {
         "     OR (a.valid_from = b.valid_from AND a.security_id < b.security_id)) "
         "AND (a.valid_to IS NULL OR b.valid_from < a.valid_to)"
     ),
-    "adjacent segments of one symbol disagree on the instant": (
+    "adjacent segment knowable before the previous one's end": (
         "SELECT count(*) FROM {v} a JOIN {v} b ON a.symbol = b.symbol "
-        "AND a.valid_to = b.valid_from "
-        "WHERE a.end_available_at IS DISTINCT FROM b.available_at"
+        "AND a.valid_to <= b.valid_from "
+        "WHERE b.available_at < a.end_available_at"
     ),
     "cik without cik_available_at or the reverse": (
         "SELECT count(*) FROM {v} WHERE (cik IS NULL) <> (cik_available_at IS NULL)"
@@ -2278,10 +2327,11 @@ def check_master(master: pa.Table) -> None:
     Checked over the whole table, not the part visible at one instant: an overlap among
     segments nobody can see before 2030 is still an overlap. The last rule is the one a reader
     would only meet at a particular instant: when a label passes from one segment to the next on
-    one day (BBBY 2025-08-29), the old end and the new start must become knowable at the same
-    moment, or between the two instants the label is owned twice or by nobody (ARNC before the
-    "earliest instant of the day" rule). Raises ``ValueError`` naming every broken rule with its
-    count.
+    one day (BBBY 2025-08-29), the new start must not become knowable before the old end, or
+    between the two instants the label is owned twice (ARNC before the "earliest instant of the
+    day" rule). The other way round is a gap, not an error: the new segment waits for its first
+    bar while the old end is known at the event. Raises ``ValueError`` naming every broken rule
+    with its count.
     """
     if master.num_rows == 0:
         return

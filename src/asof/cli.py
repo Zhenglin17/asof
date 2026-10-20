@@ -33,6 +33,7 @@ from asof.ingest.master_truncation import (
     diff_key,
     gate,
     load_baseline,
+    load_instants,
     load_truncation_exceptions,
     prune_baseline,
 )
@@ -827,7 +828,8 @@ def market_truncation(
         typer.Option(
             "--as-of",
             help="Instant to rebuild at (date = 00:00 New York); repeatable. "
-            "Default: the named instants plus each evidence kind's spread.",
+            "Default: the instants in --instants, else the named instants plus each "
+            "evidence kind's spread.",
         ),
     ] = None,
     overrides: Annotated[Path, typer.Option(help="Human decisions applied last.")] = Path(
@@ -842,6 +844,16 @@ def market_truncation(
     prune: Annotated[
         bool,
         typer.Option("--prune-baseline", help="Delete baseline keys that no longer occur."),
+    ] = False,
+    instants_file: Annotated[
+        Path, typer.Option("--instants", help="Instants of a default run (fixed by hand).")
+    ] = Path("configs/truncation_instants.txt"),
+    computed: Annotated[
+        bool,
+        typer.Option(
+            "--computed-instants",
+            help="Use the computed spread instead of --instants (a partial run: no pruning).",
+        ),
     ] = False,
     data_dir: Annotated[
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
@@ -858,18 +870,31 @@ def market_truncation(
         decisions = load_overrides(overrides)
         reviewed = load_truncation_exceptions(exceptions)
         known = load_baseline(baseline)
+        fixed_instants = load_instants(instants_file)
         gate([], baseline=known, exceptions=reviewed, full_run=False)  # overlap, before 26 min
     except ValueError as error:
         _fail(str(error))
-    if prune and as_of:
-        _fail("--prune-baseline needs the default instants: a partial run cannot tell fixed")
+    if as_of and computed:
+        _fail("--as-of and --computed-instants exclude each other")
+    if prune and (as_of or computed):
+        _fail("--prune-baseline needs the fixed instants: a partial run cannot tell fixed")
+    if not as_of and not computed and not fixed_instants:
+        _fail(f"{instants_file}: no instants (pass --instants, --as-of or --computed-instants)")
     started = time.monotonic()
     full, _ = build_from_store(root, decisions)
-    instants = (
-        sorted({_as_of_option(t).astimezone(UTC) for t in as_of})
-        if as_of
-        else default_instants(full)
-    )
+    if as_of:
+        instants = sorted({_as_of_option(t).astimezone(UTC) for t in as_of})
+    elif not computed:
+        instants = fixed_instants
+        unlisted = sorted(set(default_instants(full)) - set(fixed_instants))
+        if unlisted:  # the data moved: worth a look, never added on its own
+            typer.echo(
+                f"{len(unlisted)} computed instants not in {instants_file} (not checked): "
+                + ", ".join(f"{t.isoformat()}" for t in unlisted[:5])
+                + (" ..." if len(unlisted) > 5 else "")
+            )
+    else:
+        instants = default_instants(full)
     out_dir = root / "audit" / "truncation"
     out_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"full master {full.num_rows:,} segments; {len(instants)} instants")
@@ -892,7 +917,9 @@ def market_truncation(
             f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leaks {len(leaks):>5,}  "
             f"delays {diff.num_rows - len(leaks):>5,}  {time.monotonic() - step:,.0f}s"
         )
-    verdict = gate(first_at, baseline=known, exceptions=reviewed, full_run=not as_of)
+    # only the fixed list stands for every instant: the computed one drifts with the master
+    full_run = not as_of and not computed
+    verdict = gate(first_at, baseline=known, exceptions=reviewed, full_run=full_run)
     # default instants follow the data: a key gone from them may still occur elsewhere
     fingerprint = hashlib.sha256("|".join(t.isoformat() for t in instants).encode()).hexdigest()
     typer.echo(f"{len(instants)} instants, fingerprint {fingerprint[:12]}")
@@ -900,6 +927,8 @@ def market_truncation(
     for key in verdict.stale_exceptions:
         typer.echo(f"stale exception: {key} ({reviewed[key]})")
     if prune and verdict.new:
+        for key in verdict.new[:50]:
+            typer.echo(f"  new leak: {key}  first at {first_at[key]}")
         _fail(f"{len(verdict.new):,} new leaks: review them before pruning the baseline")
     if prune and verdict.fixed:
         try:
@@ -911,7 +940,7 @@ def market_truncation(
     typer.echo(
         f"{len(known):,} baseline keys, {len(reviewed):,} exceptions; "
         f"{len(verdict.new):,} new, {len(verdict.fixed):,} no longer occurring"
-        + (" (partial run: not checked)" if as_of else "")
+        + ("" if full_run else " (partial run: not checked)")
     )
     for key in verdict.fixed[:50]:
         typer.echo(f"  no longer occurs at these instants (--prune-baseline): {key}")

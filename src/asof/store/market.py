@@ -236,8 +236,9 @@ def visible_master(con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime) 
     A segment is listed once its ``available_at`` is not after ``as_of``. Its end is a separate
     fact: while ``end_available_at`` lies after ``as_of`` the segment is returned open, with
     ``valid_to`` and ``end_available_at`` both null -- a reader in 2022 must not learn that BK
-    ends in 2026. The two sides of one event (BK's end, BNY's start) share one instant, so there
-    is never a moment at which a label is owned twice or by nobody because of this masking.
+    ends in 2026. A successor is never knowable before its predecessor's end (BNY appears with
+    its first bar, after BK's end is known), so this masking never shows a label owned twice; a
+    label may be owned by nobody until the successor's first bar, when it has no bar to read.
 
     The file is checked before use: a closed segment without an end instant (or the reverse)
     means the master predates this column and must be rebuilt; duplicate segment keys and

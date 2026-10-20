@@ -6,6 +6,8 @@ stay green.
 
 Runs on the real store under ``$ASOF_DATA_DIR/market`` (default /data/asof) and skips when it is
 absent, so CI does not run it. Values were read off the store on 2026-10-08 and checked by hand.
+A case says which of its facts are hand-checked (filings, notices, charts) and which are store
+reads pinned as a regression guard (instants a rule derives, values not checked outside).
 """
 
 from datetime import UTC, date, datetime, timedelta
@@ -256,7 +258,12 @@ def test_arnc_two_events_on_one_day_leave_no_overlap(con: duckdb.DuckDBPyConnect
     assert segments(con, ny(2020, 3, 31, 12), "ARNC", "HWM") == [
         (arconic_inc, "ARNC", date(2020, 1, 2), None)
     ]
+    # Store read / rule: both events are known at 00:00 of 04-01, the two new segments only with
+    # their first bars that evening (a segment is never knowable before its first own bar)
     assert segments(con, datetime(2020, 4, 1, 5, tzinfo=UTC), "ARNC", "HWM") == [
+        (arconic_inc, "ARNC", date(2020, 1, 2), date(2020, 4, 1)),
+    ]
+    assert segments(con, datetime(2020, 4, 2, 0, 1, tzinfo=UTC), "ARNC", "HWM") == [
         (arconic_inc, "ARNC", date(2020, 1, 2), date(2020, 4, 1)),
         (arconic_inc, "HWM", date(2020, 4, 1), None),
         (arconic_corp, "ARNC", date(2020, 4, 1), None),
@@ -269,6 +276,33 @@ def test_arnc_two_events_on_one_day_leave_no_overlap(con: duckdb.DuckDBPyConnect
     assert arnc[0][0] == date(2020, 4, 1)
     assert arnc[0][1] != 4281
     assert arnc[-1] == (date(2020, 7, 10), 1790982)
+
+
+def test_abat_new_cik_piece_appears_with_its_first_bar(con: duckdb.DuckDBPyConnection) -> None:
+    # Store reads 2026-10-20, a regression guard for the first-bar rule only: the SEC snapshot of
+    # 2023-10-03 lists ABAT under CIK 1576873 (American Battery Technology, ex-ABML); the
+    # 2023-10-03 bar is knowable at 20:00 New York. Not asserted, and wrong: the 2023-09-21 piece
+    # carries CIK 745651, Advanced Battery Technologies, last listed under ABAT on 2020-06-01 --
+    # a stale SEC row, open in PROGRESS.
+    old = sid(con, "ABAT", date(2023, 9, 22))
+    assert segments(con, ny(2023, 10, 3, 8), "ABAT") == [
+        (old, "ABAT", date(2023, 9, 21), date(2023, 10, 3))
+    ]
+    evening = segments(con, ny(2023, 10, 3, 20), "ABAT")
+    assert [(s, f, t) for _, s, f, t in evening] == [
+        ("ABAT", date(2023, 9, 21), date(2023, 10, 3)),
+        ("ABAT", date(2023, 10, 3), None),
+    ]
+
+
+def test_cxai_appears_with_its_first_bar_not_the_rename_record(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # Store reads 2026-10-20, a regression guard: Alpaca filed CXAIV -> CXAI effective 2023-03-15
+    # (knowable 00:00 New York); CXAI's 2023-03-15 bar is knowable at 20:00 New York that day.
+    assert segments(con, ny(2023, 3, 15, 12), "CXAI") == []
+    [(_, _, start, end)] = segments(con, ny(2023, 3, 15, 20), "CXAI")
+    assert (start, end) == (date(2023, 3, 15), None)
 
 
 # -- splits --------------------------------------------------------------------------------------

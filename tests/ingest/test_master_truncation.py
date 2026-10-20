@@ -918,12 +918,17 @@ def run_truncation(
     exceptions: Any = (),
     baseline: Sequence[str] = (),
     prune: bool = False,
+    instants: Sequence[str] | None = None,
 ) -> Any:
     overrides_path = write_yaml(tmp_path / "overrides.yaml", list(overrides))
     exceptions_path = write_yaml(tmp_path / "exceptions.yaml", list(exceptions))
     # always a file of the test's own: never the repo's configs/truncation_baseline.txt
     baseline_path = tmp_path / "baseline.txt"
     baseline_path.write_text("".join(f"{k}\n" for k in baseline))
+    # likewise never the repo's configs/truncation_instants.txt; None = --computed-instants
+    instants_path = tmp_path / "instants.txt"
+    if instants is not None:
+        instants_path.write_text("".join(f"{t}\n" for t in instants))
     args = ["market", "truncation"]
     for value in as_of:
         args += ["--as-of", value]
@@ -934,6 +939,9 @@ def run_truncation(
         str(exceptions_path),
         "--baseline",
         str(baseline_path),
+        "--instants",
+        str(instants_path),
+        *(["--computed-instants"] if instants is None and not as_of else []),
         *(["--prune-baseline"] if prune else []),
         "--data-dir",
         str(tmp_path),
@@ -942,6 +950,8 @@ def run_truncation(
 
 
 MERGE = {"merge": ["CYCN", "KRSA"], "reason": "identical history", "date": CLI_DECIDED.isoformat()}
+# a fixed instant list for default runs: before the merge decision (the leak) and at it
+CLI_INSTANTS = [et_midnight(date(2024, 3, 1)).isoformat(), et_midnight(CLI_DECIDED).isoformat()]
 # the merge's one leak: KRSA joins CYCN's security (CYCN itself only gets an evidence note)
 LEAK_KEYS = [f"KRSA:{CLI_DAYS[0].isoformat()}:grouping_differs"]
 OTHER_KEY = f"CYCN:{CLI_DAYS[0].isoformat()}:grouping_differs"  # matches no row
@@ -1007,7 +1017,9 @@ def test_cli_baseline_leaks_do_not_fail(tmp_path: Path) -> None:
 def test_cli_default_run_fails_on_a_baseline_key_that_no_longer_occurs(tmp_path: Path) -> None:
     write_cli_store(market_root(tmp_path))
     # the ratchet: OTHER_KEY matches no row, so its line must go
-    result = run_truncation(tmp_path, overrides=[MERGE], baseline=[*LEAK_KEYS, OTHER_KEY])
+    result = run_truncation(
+        tmp_path, overrides=[MERGE], baseline=[*LEAK_KEYS, OTHER_KEY], instants=CLI_INSTANTS
+    )
     assert result.exit_code == LEAK_EXIT, result.output
     assert f"(--prune-baseline): {OTHER_KEY}" in result.output
 
@@ -1015,9 +1027,11 @@ def test_cli_default_run_fails_on_a_baseline_key_that_no_longer_occurs(tmp_path:
 def test_cli_prune_baseline_refuses_while_a_new_leak_is_open(tmp_path: Path) -> None:
     write_cli_store(market_root(tmp_path))
     # KRSA's leak is new and OTHER_KEY is gone: deleting one must wait for reviewing the other
-    result = run_truncation(tmp_path, overrides=[MERGE], baseline=[OTHER_KEY], prune=True)
+    result = run_truncation(
+        tmp_path, overrides=[MERGE], baseline=[OTHER_KEY], prune=True, instants=CLI_INSTANTS
+    )
     assert result.exit_code != 0
-    assert "new leak" in result.output
+    assert f"new leak: {LEAK_KEYS[0]}" in result.output  # listed, not only counted
     assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
 
 
@@ -1029,15 +1043,37 @@ def test_repo_baseline_and_exceptions_load_and_do_not_overlap() -> None:
     reviewed = load_truncation_exceptions(repo / "truncation_exceptions.yaml")
     assert known
     assert mt.gate([], baseline=known, exceptions=reviewed, full_run=False).ok
+    assert mt.load_instants(repo / "truncation_instants.txt")
 
 
 def test_cli_prune_baseline_deletes_the_fixed_keys_and_passes(tmp_path: Path) -> None:
     write_cli_store(market_root(tmp_path))
     result = run_truncation(
-        tmp_path, overrides=[MERGE], baseline=[*LEAK_KEYS, OTHER_KEY], prune=True
+        tmp_path,
+        overrides=[MERGE],
+        baseline=[*LEAK_KEYS, OTHER_KEY],
+        prune=True,
+        instants=CLI_INSTANTS,
     )
     assert result.exit_code == 0, result.output
     assert load_baseline(tmp_path / "baseline.txt") == LEAK_KEYS
+
+
+def test_cli_prune_baseline_refuses_the_computed_instants(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    # the computed spread drifts with the master: a key gone from it may still occur
+    result = run_truncation(tmp_path, overrides=[MERGE], baseline=[OTHER_KEY], prune=True)
+    assert result.exit_code != 0
+    assert "--prune-baseline" in result.output
+    assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
+
+
+def test_cli_without_an_instants_file_refuses_to_guess(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(tmp_path, overrides=[MERGE], instants=[])  # header-less, empty
+    assert result.exit_code != 0
+    assert "no instants" in result.output
+    assert not report_dir(tmp_path).exists() or not list(report_dir(tmp_path).glob("*"))
 
 
 def test_cli_prune_baseline_refuses_a_partial_run(tmp_path: Path) -> None:
@@ -1048,6 +1084,52 @@ def test_cli_prune_baseline_refuses_a_partial_run(tmp_path: Path) -> None:
     assert result.exit_code != 0
     assert "--prune-baseline" in result.output
     assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
+
+
+def test_cli_default_run_checks_exactly_the_listed_instants(tmp_path: Path) -> None:
+    root = write_cli_store(market_root(tmp_path))
+    full, _ = sm.build_from_store(root, [MERGE])
+    listed = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
+    result = run_truncation(
+        tmp_path, overrides=[MERGE], baseline=LEAK_KEYS, instants=[t.isoformat() for t in listed]
+    )
+    assert {p.name for p in report_dir(tmp_path).glob("*.parquet")} == {
+        f"{stamp(t)}.parquet" for t in listed
+    }
+    # a full run: the listed instants stand for every instant, so fixed keys are checked
+    assert result.exit_code == 0, result.output
+    assert "0 no longer occurring" in result.output
+    # the computed spread is reported, not checked
+    assert len(set(default_instants(full)) - set(listed)) > 0
+    assert "computed instants not in" in result.output
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "2024-03-01T05:00:00",  # no offset
+        "2024-03-01",  # a date has no offset either
+        "yesterday",
+    ],
+)
+def test_load_instants_refuses_a_bad_line(tmp_path: Path, line: str) -> None:
+    path = tmp_path / "instants.txt"
+    path.write_text(f"# header\n2024-03-01T05:00:00+00:00\n{line}\n")
+    with pytest.raises(ValueError, match="instants.txt"):
+        mt.load_instants(path)
+
+
+def test_load_instants_reads_utc_sorted_and_refuses_duplicates(tmp_path: Path) -> None:
+    path = tmp_path / "instants.txt"
+    path.write_text("# h\n\n2024-06-03T00:00:00-04:00\n2024-03-01T05:00:00.000000+00:00\n")
+    assert mt.load_instants(path) == [
+        datetime(2024, 3, 1, 5, tzinfo=UTC),
+        datetime(2024, 6, 3, 4, tzinfo=UTC),
+    ]
+    assert mt.load_instants(tmp_path / "absent.txt") == []
+    path.write_text("2024-03-01T05:00:00+00:00\n2024-03-01T00:00:00-05:00\n")
+    with pytest.raises(ValueError, match="duplicated"):
+        mt.load_instants(path)
 
 
 @pytest.mark.parametrize("missing", ["reason", "date"])
@@ -1096,16 +1178,12 @@ def test_a_relabelled_piece_never_shows_the_takers_cik_before_the_taker_does(
     for r in rows:
         if r["evidence"] != "relabelled" or r["cik"] is None:
             continue
-        own = [
-            q["cik_available_at"]
-            for q in rows
-            if q is not r
-            and q["security_id"] == r["security_id"]
-            and q["cik"] == r["cik"]
-            and q["evidence"] != "relabelled"
+        # the taker's own piece: the same label from the relabelled piece's end
+        [taker] = [
+            q for q in rows if q["symbol"] == r["symbol"] and q["valid_from"] == r["valid_to"]
         ]
-        if own:
-            assert r["cik_available_at"] >= min(own), (r["symbol"], r["valid_from"])
+        assert taker["cik"] == r["cik"], (r["symbol"], r["valid_from"])
+        assert r["cik_available_at"] == taker["cik_available_at"], (r["symbol"], r["valid_from"])
 
 
 # =============================================================================================

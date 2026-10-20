@@ -225,7 +225,14 @@ full master shows but the rebuild cannot produce is a **leak**; something the re
 on days the full master leaves open, or a CIK it still withholds, is a **delay**. The first run
 found that a segment's CIK came from SEC snapshots months after it started trading (AAAU
 trades from 2020-01-02, the SEC lists it from 2020-07-10), so the CIK now has its own
-`cik_available_at` and stays hidden until then. Diffs go to
+`cik_available_at` and stays hidden until then. The second found segments stamped knowable
+at 00:00 of the event that created them although the build needs their own first bar, which
+is knowable only at 20:00 (CXAIV -> CXAI on 2023-03-15): a segment is now never knowable
+before its first bar, and a takeover's relabelled history not before the taker's. The
+default instants are fixed in `configs/truncation_instants.txt`: computed ones move whenever
+the master changes, and a leak seen only at an instant that moved away would look fixed.
+Leaks are weighed by what a backtest reads (which security a bar belongs to, which CIK a
+ticker names), not by every field of the master. Diffs go to
 `$ASOF_DATA_DIR/market/audit/truncation/<instant>.parquet`. Reviewed and accepted leaks go
 into `configs/truncation_exceptions.yaml`; leaks known but not fixed yet sit in
 `configs/truncation_baseline.txt`, a ratchet whose count may only shrink. The command exits

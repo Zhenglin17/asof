@@ -31,7 +31,8 @@ Fake data provenance ("real" = read off the store / the security master on 2026-
 - Relabelled history (I1, N3): Alpaca files a security's past under its newest name, so the raw
   store holds BK's bars under BNY as well, identical on every day (real).
 - ARNC-type instant mismatch (M1): before the "earliest instant of the day" rule 5 of 723
-  back-to-back same-symbol pairs had old.end_available_at != new.available_at (real, fixed).
+  back-to-back same-symbol pairs had a successor knowable before the old end (real, fixed); a
+  gap the other way (successor waits for its first bar) is allowed since 2026-10-19.
 - SEC history: snapshots before SEC_HISTORY_START (2019-10-02) are one stale file and must be
   ignored (real); a CIK listed under a different number for one snapshot interval is the ARNC
   2020-04-01 .. 07-10 shape (real).

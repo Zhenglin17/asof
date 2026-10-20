@@ -274,12 +274,13 @@ def test_l_xper_takeover_is_not_left_for_a_human(xper_built: Built) -> None:
 
 def test_l_xper_nothing_is_known_early(xper_built: Built) -> None:
     # Leakage: a reader the day before the rename sees old XPER open and nothing that starts
-    # on 10-03; from 00:00 New York of 10-03 both sides of the rename are known together.
+    # on 10-03; what starts on 10-03 is known from its first bar, 20:00 New York of 10-03.
     master, _ = xper_built
 
     eve = [r for r in visible_at(master, et_midnight(XPER_CUT) - MICRO) if r["symbol"] == "XPER"]
     assert [r["valid_from"] for r in eve] == [date(2020, 1, 2)]
-    on_day = {r["valid_from"] for r in visible_at(master, et_midnight(XPER_CUT))}
+    # first-bar rule: pieces starting 10-03 wait for their first bar
+    on_day = {r["valid_from"] for r in visible_at(master, bar_available_at(XPER_CUT))}
     assert XPER_CUT in on_day
     assert_nothing_known_before_its_valid_from(master)
     assert_end_knowability_invariant(master)
@@ -395,8 +396,10 @@ def test_r_gold_b_barricks_history_under_b_joins_barrick(gb_built: Built) -> Non
     assert past["security_id"] == now["security_id"]
     assert past["cik"] == now["cik"] == GB_BARRICK
     assert past["evidence"] == "relabelled"
-    assert past["available_at"] == now["available_at"] == et_midnight(GB_CUT)
-    assert past["end_available_at"] == now["available_at"]
+    # first-bar rule: the relabelled piece is judged on the taker's bars after the cut, so both
+    # are knowable at the taker's first bar
+    assert past["available_at"] == past["end_available_at"] == bar_available_at(GB_CUT)
+    assert now["available_at"] == bar_available_at(GB_CUT)
     # A-Mark's GOLD from 2025-12-02 is A-Mark, not Barrick
     gold = segment_at(master, "GOLD", date(2026, 1, 5))
     assert gold["security_id"] == segment_at(master, "AMRK", date(2023, 6, 1))["security_id"]
@@ -422,7 +425,8 @@ def test_r_gold_b_relabelled_piece_is_unknown_before_the_takeover_record(
     # Leakage, on the read path strategies use. The B bars of 2020..2025-05 sit on disk all
     # along, but that they are Barrick's is only known from the GOLD -> B record: a reader on
     # 2023-06-02 must see no segment placing them, and none with Barrick's CIK; from 00:00 New
-    # York of 2025-05-09 the piece is there with its original valid_from.
+    # York of 2025-05-09 nothing yet; with Barrick's first bar under B that evening the piece is
+    # there with its original valid_from.
     master, conflicts = gb_built
     root = market_root(tmp_path)
     write_master(master, conflicts, root)
@@ -434,7 +438,10 @@ def test_r_gold_b_relabelled_piece_is_unknown_before_the_takeover_record(
         assert not [r for r in early if r["symbol"] == "B" and r["cik"] == GB_BARRICK]
         eve = visible_master(con, root, et_midnight(GB_CUT) - MICRO).to_pylist()
         assert not [r for r in eve if r["symbol"] == "B"]
-        known = visible_master(con, root, et_midnight(GB_CUT)).to_pylist()
+        at_record = visible_master(con, root, et_midnight(GB_CUT)).to_pylist()
+        # first-bar rule: the relabelling waits for the taker's first bar
+        assert not [r for r in at_record if r["symbol"] == "B"]
+        known = visible_master(con, root, bar_available_at(GB_CUT)).to_pylist()
         assert [(r["valid_from"], r["valid_to"]) for r in known if r["symbol"] == "B"] == [
             (date(2020, 1, 2), GB_CUT),
             (GB_CUT, None),
@@ -512,7 +519,9 @@ def test_r_inbx_old_label_days_are_inhibrx_biosciences(in_built: Built) -> None:
     assert p["security_id"] == new["security_id"]
     assert p["cik"] == new["cik"] == IN_NEW
     assert p["evidence"] == "relabelled"
-    assert p["available_at"] == new["available_at"] == et_midnight(IN_CUT)
+    # first-bar rule: the relabelled piece is knowable with the taker, at its first bar
+    assert p["available_at"] == bar_available_at(IN_CUT)
+    assert new["available_at"] == bar_available_at(IN_CUT)
     [row] = touching(conflicts, "INBX", IN_CUT)
     assert row["resolution"] == "relabelled"
     assert str(IN_OLD) in row["detail"]
@@ -630,7 +639,9 @@ def test_r_fgmc_icct_listing_before_the_sec_saw_it_is_the_merged_company(
     assert p["security_id"] == new["security_id"] == spac["security_id"]
     assert p["cik"] == new["cik"] == FI_SPAC
     assert p["evidence"] == "relabelled"
-    assert p["available_at"] == new["available_at"] == et_midnight(FI_CUT)
+    # first-bar rule: the relabelled piece is knowable with the new piece, at its first bar
+    assert p["available_at"] == bar_available_at(FI_CUT)
+    assert new["available_at"] == bar_available_at(FI_CUT)
     [row] = touching(conflicts, "ICCT", FI_CUT)
     assert row["resolution"] == "relabelled"
     assert str(FI_OLD) in row["detail"]
@@ -651,8 +662,9 @@ def test_r_fgmc_clipped_end_is_not_knowable_before_the_takeover(fi_built: Built)
     master, _ = fi_built
 
     [fgmc] = segments(master, "FGMC")
-    assert fgmc["end_available_at"] == et_midnight(FI_CUT)
-    assert fgmc["end_available_at"] >= segment_at(master, "ICCT", FI_CUT)["available_at"]
+    # first-bar rule: the clip is part of the relabelling, knowable at the new piece's first bar
+    assert fgmc["end_available_at"] == bar_available_at(FI_CUT)
+    assert fgmc["end_available_at"] >= segment_at(master, "ICCT", FI_P_START)["available_at"]
     mid = visible_at(master, datetime(2023, 9, 15, 12, tzinfo=UTC))
     assert [r["symbol"] for r in mid if r["symbol"] in ("FGMC", "ICCT")] == ["FGMC"]
     [seen] = [r for r in mid if r["symbol"] == "FGMC"]
