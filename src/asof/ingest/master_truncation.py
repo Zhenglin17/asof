@@ -24,7 +24,10 @@ Histories the vendor rewrote later (AXNX, volume revisions) are the audit's busi
 test's: it checks the build, not the inputs.
 """
 
+import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -253,3 +256,88 @@ def load_truncation_exceptions(path: Path) -> dict[str, str]:
                 raise ValueError(f"{path}: entry {item!r} needs a {name}")
         loaded[str(item["key"])] = str(item["reason"])
     return loaded
+
+
+LEAK_REASONS = ("only_in_full", "fields_differ", "grouping_differs", "replaced")
+_KEY = re.compile(r"^[^:\s]+:(\d{4}-\d{2}-\d{2}):(" + "|".join(LEAK_REASONS) + r")(:[^:\s]+)?$")
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """``new``: leaks neither file knows. ``fixed``: baseline keys that no longer occur (their
+    lines must go, so the count only shrinks). ``stale_exceptions``: reviewed leaks that no
+    longer occur, reported but never failing. The last two only from a full run."""
+
+    new: list[str]
+    fixed: list[str]
+    stale_exceptions: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return not self.new and not self.fixed
+
+
+def gate(
+    found: Iterable[str],
+    *,
+    baseline: Iterable[str],
+    exceptions: Mapping[str, str],
+    full_run: bool,
+) -> GateResult:
+    """Judge the leak keys of a run against the baseline (known, to be fixed) and the exceptions
+    (reviewed, accepted). A partial run visits only some instants, so a key it did not find may
+    still occur elsewhere: it reports no ``fixed`` and no ``stale_exceptions``."""
+    seen, known, reviewed = set(found), set(baseline), set(exceptions)
+    both = sorted(known & reviewed)
+    if both:
+        raise ValueError(f"keys both in the baseline and the exceptions: {', '.join(both)}")
+    return GateResult(
+        new=sorted(seen - known - reviewed),
+        fixed=sorted(known - seen) if full_run else [],
+        stale_exceptions=sorted(reviewed - seen) if full_run else [],
+    )
+
+
+def _read_baseline(path: Path) -> tuple[list[str], list[str]]:
+    """(header comment lines before the first key, keys in file order), checked."""
+    header: list[str] = []
+    keys: list[str] = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            if not keys and line.startswith("#"):
+                header.append(raw)
+            continue
+        match = _KEY.match(line)
+        if match is None:
+            raise ValueError(f"{path}: not a leak key: {line!r}")
+        try:
+            date.fromisoformat(match.group(1))
+        except ValueError:
+            raise ValueError(f"{path}: bad date in {line!r}") from None
+        if line in keys:
+            raise ValueError(f"{path}: duplicated key {line}")
+        keys.append(line)
+    return header, keys
+
+
+def load_baseline(path: Path) -> list[str]:
+    """``configs/truncation_baseline.txt``: known leaks not fixed yet, one ``diff_key`` per
+    line, ``#`` comments. Lines are added by hand only; ``prune_baseline`` removes them. A
+    missing file is empty."""
+    return _read_baseline(path)[1] if path.exists() else []
+
+
+def prune_baseline(path: Path, fixed: Iterable[str]) -> int:
+    """Remove the ``fixed`` keys, keep the header, sort the rest. Never adds: a key not in the
+    file is refused and nothing is written. Returns how many lines went."""
+    header, keys = _read_baseline(path)
+    drop = set(fixed)
+    unknown = sorted(drop - set(keys))
+    if unknown:
+        raise ValueError(f"{path}: not in the baseline: {', '.join(unknown)}")
+    kept = sorted(k for k in keys if k not in drop)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(f"{line}\n" for line in [*header, *kept]))
+    os.replace(tmp, path)
+    return len(keys) - len(kept)

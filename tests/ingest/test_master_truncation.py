@@ -59,6 +59,7 @@ import yaml
 from typer.testing import CliRunner
 
 from asof.cli import app
+from asof.ingest import master_truncation as mt
 from asof.ingest import security_master as sm
 from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA
 from asof.ingest.master_truncation import (
@@ -66,6 +67,8 @@ from asof.ingest.master_truncation import (
     compare,
     default_instants,
     diff_key,
+    load_baseline,
+    load_truncation_exceptions,
     mask_master,
     truncate_inputs,
 )
@@ -913,9 +916,14 @@ def run_truncation(
     as_of: Sequence[str] = (),
     overrides: Sequence[Mapping[str, Any]] = (),
     exceptions: Any = (),
+    baseline: Sequence[str] = (),
+    prune: bool = False,
 ) -> Any:
     overrides_path = write_yaml(tmp_path / "overrides.yaml", list(overrides))
     exceptions_path = write_yaml(tmp_path / "exceptions.yaml", list(exceptions))
+    # always a file of the test's own: never the repo's configs/truncation_baseline.txt
+    baseline_path = tmp_path / "baseline.txt"
+    baseline_path.write_text("".join(f"{k}\n" for k in baseline))
     args = ["market", "truncation"]
     for value in as_of:
         args += ["--as-of", value]
@@ -924,6 +932,9 @@ def run_truncation(
         str(overrides_path),
         "--exceptions",
         str(exceptions_path),
+        "--baseline",
+        str(baseline_path),
+        *(["--prune-baseline"] if prune else []),
         "--data-dir",
         str(tmp_path),
     ]
@@ -982,7 +993,61 @@ def test_cli_one_leak_left_unexcepted_still_fails(tmp_path: Path) -> None:
     reviewed = [{"key": OTHER_KEY, "reason": "dated human merge", "date": "2026-10-19"}]
     result = run_truncation(tmp_path, as_of=["2024-03-01"], overrides=[MERGE], exceptions=reviewed)
     assert result.exit_code == LEAK_EXIT, result.output
-    assert f"stale exception: {OTHER_KEY}" in result.output
+    # a partial run cannot tell an exception unused: OTHER_KEY may occur at another instant
+    assert "stale exception" not in result.output
+
+
+def test_cli_baseline_leaks_do_not_fail(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(tmp_path, as_of=["2024-03-01"], overrides=[MERGE], baseline=LEAK_KEYS)
+    assert result.exit_code == 0, result.output
+    assert "0 new" in result.output
+
+
+def test_cli_default_run_fails_on_a_baseline_key_that_no_longer_occurs(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    # the ratchet: OTHER_KEY matches no row, so its line must go
+    result = run_truncation(tmp_path, overrides=[MERGE], baseline=[*LEAK_KEYS, OTHER_KEY])
+    assert result.exit_code == LEAK_EXIT, result.output
+    assert f"(--prune-baseline): {OTHER_KEY}" in result.output
+
+
+def test_cli_prune_baseline_refuses_while_a_new_leak_is_open(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    # KRSA's leak is new and OTHER_KEY is gone: deleting one must wait for reviewing the other
+    result = run_truncation(tmp_path, overrides=[MERGE], baseline=[OTHER_KEY], prune=True)
+    assert result.exit_code != 0
+    assert "new leak" in result.output
+    assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
+
+
+def test_repo_baseline_and_exceptions_load_and_do_not_overlap() -> None:
+    # read only: a hand-added line that is malformed, duplicated or also excepted fails CI,
+    # not 26 minutes into a real run
+    repo = Path(__file__).resolve().parents[2] / "configs"
+    known = load_baseline(repo / "truncation_baseline.txt")
+    reviewed = load_truncation_exceptions(repo / "truncation_exceptions.yaml")
+    assert known
+    assert mt.gate([], baseline=known, exceptions=reviewed, full_run=False).ok
+
+
+def test_cli_prune_baseline_deletes_the_fixed_keys_and_passes(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(
+        tmp_path, overrides=[MERGE], baseline=[*LEAK_KEYS, OTHER_KEY], prune=True
+    )
+    assert result.exit_code == 0, result.output
+    assert load_baseline(tmp_path / "baseline.txt") == LEAK_KEYS
+
+
+def test_cli_prune_baseline_refuses_a_partial_run(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(
+        tmp_path, as_of=["2024-03-01"], overrides=[MERGE], baseline=[OTHER_KEY], prune=True
+    )
+    assert result.exit_code != 0
+    assert "--prune-baseline" in result.output
+    assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
 
 
 @pytest.mark.parametrize("missing", ["reason", "date"])
@@ -1041,3 +1106,247 @@ def test_a_relabelled_piece_never_shows_the_takers_cik_before_the_taker_does(
         ]
         if own:
             assert r["cik_available_at"] >= min(own), (r["symbol"], r["valid_from"])
+
+
+# =============================================================================================
+# the ratchet gate: configs/truncation_baseline.txt (known leaks, count may only shrink)
+# =============================================================================================
+# API:
+#     mt.GateResult(new, fixed, stale_exceptions), .ok = not new and not fixed
+#     mt.gate(found, *, baseline, exceptions, full_run) -> GateResult
+#     mt.load_baseline(path) -> list[str]
+#     mt.prune_baseline(path, fixed) -> int
+# The baseline holds known-but-unfixed leaks; the exceptions file holds reviewed-and-accepted
+# ones. A key may live in one of them, never both. ``fixed`` and ``stale_exceptions`` are only
+# computed on a full run: a partial ``--as-of`` run does not visit every instant, so a key it
+# did not find may still occur elsewhere.
+
+BASE_A = "AAAU:2020-01-02:fields_differ:cik_available_at"
+BASE_B = "CCL:2020-01-02:fields_differ:end_available_at+valid_to"
+EXC_C = "GOOG:2019-07-01:only_in_full"
+REVIEWED = {EXC_C: "reviewed share-class split"}
+HEADER = "# Known leaks, one key per line; the count may only shrink.\n#\n"
+
+
+def write_baseline(path: Path, text: str) -> Path:
+    path.write_text(text)
+    return path
+
+
+def test_gate_all_found_keys_known_on_a_full_run_is_ok() -> None:
+    result = mt.gate(
+        [BASE_A, BASE_B, EXC_C], baseline=[BASE_A, BASE_B], exceptions=REVIEWED, full_run=True
+    )
+    assert result.ok
+    assert (result.new, result.fixed, result.stale_exceptions) == ([], [], [])
+
+
+def test_gate_baseline_key_not_found_on_a_full_run_is_fixed_and_fails() -> None:
+    # the ratchet: a fix must also delete its baseline line, so the count shrinks for good
+    result = mt.gate([BASE_A, EXC_C], baseline=[BASE_A, BASE_B], exceptions=REVIEWED, full_run=True)
+    assert result.fixed == [BASE_B]
+    assert result.new == []
+    assert not result.ok
+
+
+def test_gate_exception_not_found_on_a_full_run_is_stale_but_ok() -> None:
+    result = mt.gate([BASE_A], baseline=[BASE_A], exceptions=REVIEWED, full_run=True)
+    assert result.stale_exceptions == [EXC_C]
+    assert result.ok
+
+
+def test_gate_partial_run_reports_no_fixed_and_no_stale() -> None:
+    result = mt.gate([], baseline=[BASE_A, BASE_B], exceptions=REVIEWED, full_run=False)
+    assert (result.fixed, result.stale_exceptions) == ([], [])
+    assert result.ok
+
+
+def test_gate_partial_run_still_reports_new_leaks() -> None:
+    new = "ZZZ:2021-03-04:replaced"
+    result = mt.gate([new], baseline=[BASE_A], exceptions=REVIEWED, full_run=False)
+    assert result.new == [new]
+    assert not result.ok
+
+
+def test_gate_nothing_found_nothing_known_is_ok() -> None:
+    result = mt.gate([], baseline=[], exceptions={}, full_run=True)
+    assert result.ok
+    assert (result.new, result.fixed, result.stale_exceptions) == ([], [], [])
+
+
+def test_gate_a_key_found_at_several_instants_counts_once() -> None:
+    new = "ZZZ:2021-03-04:replaced"
+    result = mt.gate([new, BASE_A, new, BASE_A], baseline=[BASE_A], exceptions={}, full_run=True)
+    assert result.new == [new]
+
+
+def test_gate_outputs_are_sorted_whatever_the_input_order() -> None:
+    found = ["ZZZ:2021-03-04:replaced", "BBB:2020-05-01:only_in_full", "MMM:2020-05-01:replaced"]
+    baseline = ["YYY:2020-01-02:replaced", "AAA:2020-01-02:replaced"]
+    exceptions = {"XXX:2020-01-02:replaced": "r", "CCC:2020-01-02:replaced": "r"}
+    result = mt.gate(found, baseline=baseline, exceptions=exceptions, full_run=True)
+    assert result.new == sorted(found)
+    assert result.fixed == sorted(baseline)
+    assert result.stale_exceptions == sorted(exceptions)
+
+
+def test_gate_refuses_a_key_both_in_baseline_and_exceptions() -> None:
+    with pytest.raises(ValueError, match="GOOG:2019-07-01:only_in_full"):
+        mt.gate([EXC_C], baseline=[BASE_A, EXC_C], exceptions=REVIEWED, full_run=True)
+
+
+def test_gate_result_ok_ignores_stale_exceptions() -> None:
+    assert mt.GateResult(new=[], fixed=[], stale_exceptions=[EXC_C]).ok
+    assert not mt.GateResult(new=[BASE_A], fixed=[], stale_exceptions=[]).ok
+    assert not mt.GateResult(new=[], fixed=[BASE_A], stale_exceptions=[]).ok
+
+
+# --- leakage: a new leak must never slip through the gate ---
+
+
+def test_gate_baseline_key_does_not_cover_the_same_row_with_one_more_field() -> None:
+    known = "X:2020-01-02:fields_differ:valid_to"
+    found = "X:2020-01-02:fields_differ:cik+valid_to"
+    result = mt.gate([found], baseline=[known], exceptions={}, full_run=True)
+    assert result.new == [found]
+    assert result.fixed == [known]
+    assert not result.ok
+
+
+def test_gate_same_symbol_and_date_with_another_reason_is_new() -> None:
+    found = "AAAU:2020-01-02:grouping_differs"
+    result = mt.gate([found], baseline=[BASE_A], exceptions={}, full_run=False)
+    assert result.new == [found]
+
+
+def test_gate_same_symbol_with_another_valid_from_is_new() -> None:
+    found = "AAAU:2020-01-03:fields_differ:cik_available_at"
+    result = mt.gate([found], baseline=[BASE_A], exceptions={}, full_run=False)
+    assert result.new == [found]
+
+
+def test_gate_a_key_covered_by_exceptions_is_not_new() -> None:
+    result = mt.gate([EXC_C], baseline=[], exceptions=REVIEWED, full_run=False)
+    assert result.new == []
+    assert result.ok
+
+
+def test_baseline_written_from_diff_key_rows_loads_and_gates_clean(tmp_path: Path) -> None:
+    rows = pa.Table.from_pylist(
+        [
+            {
+                "kind": "leak",
+                "reason": "fields_differ",
+                "symbol": "CCL",
+                "valid_from": date(2020, 1, 2),
+                "fields": "end_available_at+valid_to",
+                "detail": "",
+            },
+            {
+                "kind": "leak",
+                "reason": "only_in_full",
+                "symbol": "GOOG",
+                "valid_from": date(2019, 7, 1),
+                "fields": None,
+                "detail": "",
+            },
+            {
+                "kind": "leak",
+                "reason": "grouping_differs",
+                "symbol": "KRSA",
+                "valid_from": date(2024, 1, 2),
+                "fields": "",
+                "detail": "",
+            },
+        ],
+        schema=DIFF_SCHEMA,
+    ).to_pylist()
+    keys = [diff_key(r) for r in rows]
+    path = write_baseline(tmp_path / "baseline.txt", HEADER + "".join(f"{k}\n" for k in keys))
+
+    loaded = mt.load_baseline(path)
+
+    assert loaded == keys
+    assert mt.gate(keys, baseline=loaded, exceptions={}, full_run=True).ok
+
+
+# --- load_baseline ---
+
+
+def test_load_baseline_reads_keys_in_file_order_skipping_comments(tmp_path: Path) -> None:
+    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_B}\n{BASE_A}\n")
+    assert mt.load_baseline(path) == [BASE_B, BASE_A]
+
+
+def test_load_baseline_missing_file_is_empty(tmp_path: Path) -> None:
+    assert mt.load_baseline(tmp_path / "absent.txt") == []
+
+
+def test_load_baseline_ignores_blank_lines_and_strips_whitespace(tmp_path: Path) -> None:
+    path = write_baseline(tmp_path / "baseline.txt", f"\n  {BASE_A}  \n\n\t{BASE_B}\n   \n")
+    assert mt.load_baseline(path) == [BASE_A, BASE_B]
+
+
+def test_load_baseline_refuses_a_duplicated_key(tmp_path: Path) -> None:
+    path = write_baseline(tmp_path / "baseline.txt", f"{BASE_A}\n{BASE_B}\n{BASE_A}\n")
+    with pytest.raises(ValueError, match="baseline.txt") as raised:
+        mt.load_baseline(path)
+    assert BASE_A in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "X:2020-13-02:only_in_full",  # date does not parse
+        "X:20200102:only_in_full",  # not YYYY-MM-DD
+        "X:2020-01-02:went_missing",  # unknown reason
+        "X:2020-01-02:only_in_truncated",  # a delay, never a baseline leak
+        "X:2020-01-02:cik_withheld",  # a delay
+        "X:2020-01-02:evidence_differs",  # info
+        "X:2020-01-02:fields_differ:",  # trailing empty fields
+        "X:2020-01-02",  # no reason
+        ":2020-01-02:only_in_full",  # no symbol
+    ],
+)
+def test_load_baseline_refuses_a_malformed_line(tmp_path: Path, line: str) -> None:
+    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_A}\n{line}\n")
+    with pytest.raises(ValueError, match="baseline.txt") as raised:
+        mt.load_baseline(path)
+    assert line in str(raised.value)
+
+
+# --- prune_baseline ---
+
+
+def test_prune_baseline_removes_keys_keeps_header_and_sorts(tmp_path: Path) -> None:
+    other = "ZZZ:2021-03-04:replaced"
+    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{other}\n{BASE_B}\n{BASE_A}\n")
+
+    removed = mt.prune_baseline(path, [BASE_B])
+
+    assert removed == 1
+    assert path.read_text() == f"{HEADER}{BASE_A}\n{other}\n"
+
+
+def test_prune_then_load_round_trips(tmp_path: Path) -> None:
+    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_B}\n{BASE_A}\n{EXC_C}\n")
+    fixed = mt.gate([BASE_A], baseline=mt.load_baseline(path), exceptions={}, full_run=True).fixed
+
+    assert mt.prune_baseline(path, fixed) == 2
+    assert mt.load_baseline(path) == [BASE_A]
+    assert mt.gate([BASE_A], baseline=mt.load_baseline(path), exceptions={}, full_run=True).ok
+
+
+def test_prune_baseline_of_every_key_leaves_the_header(tmp_path: Path) -> None:
+    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_A}\n")
+    assert mt.prune_baseline(path, [BASE_A]) == 1
+    assert mt.load_baseline(path) == []
+    assert path.read_text().startswith(HEADER)
+
+
+def test_prune_baseline_refuses_an_unknown_key_and_writes_nothing(tmp_path: Path) -> None:
+    text = f"{HEADER}{BASE_B}\n{BASE_A}\n"
+    path = write_baseline(tmp_path / "baseline.txt", text)
+    with pytest.raises(ValueError, match="ZZZ:2021-03-04:replaced"):
+        mt.prune_baseline(path, [BASE_A, "ZZZ:2021-03-04:replaced"])
+    assert path.read_text() == text

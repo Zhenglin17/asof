@@ -1,5 +1,7 @@
 """Command-line entry point. Subcommands are added as each pipeline stage lands."""
 
+import dataclasses
+import hashlib
 import os
 import time
 from datetime import UTC, date, datetime
@@ -29,7 +31,10 @@ from asof.ingest.master_truncation import (
     compare,
     default_instants,
     diff_key,
+    gate,
+    load_baseline,
     load_truncation_exceptions,
+    prune_baseline,
 )
 from asof.ingest.sec_ticker_history import (
     EXCHANGE_HISTORY_PATH,
@@ -831,12 +836,20 @@ def market_truncation(
     exceptions: Annotated[Path, typer.Option(help="Reviewed leaks.")] = Path(
         "configs/truncation_exceptions.yaml"
     ),
+    baseline: Annotated[Path, typer.Option(help="Known leaks not fixed yet (a ratchet).")] = Path(
+        "configs/truncation_baseline.txt"
+    ),
+    prune: Annotated[
+        bool,
+        typer.Option("--prune-baseline", help="Delete baseline keys that no longer occur."),
+    ] = False,
     data_dir: Annotated[
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
     ] = None,
 ) -> None:
     """Rebuild the security master from the inputs knowable at each instant and diff it with the
-    full master as seen then. Exit 0 when every leak is excepted, 2 when not; rows go to
+    full master as seen then. Exit 0 when every leak is in the baseline or the exceptions and,
+    on a default run, every baseline key still occurs; 2 when not. Rows go to
     <market>/audit/truncation/<UTC instant>.parquet."""
     root = _market_root(data_dir)
     if not overrides.exists():
@@ -844,8 +857,12 @@ def market_truncation(
     try:
         decisions = load_overrides(overrides)
         reviewed = load_truncation_exceptions(exceptions)
+        known = load_baseline(baseline)
+        gate([], baseline=known, exceptions=reviewed, full_run=False)  # overlap, before 26 min
     except ValueError as error:
         _fail(str(error))
+    if prune and as_of:
+        _fail("--prune-baseline needs the default instants: a partial run cannot tell fixed")
     started = time.monotonic()
     full, _ = build_from_store(root, decisions)
     instants = (
@@ -856,8 +873,7 @@ def market_truncation(
     out_dir = root / "audit" / "truncation"
     out_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"full master {full.num_rows:,} segments; {len(instants)} instants")
-    open_leaks: dict[str, str] = {}
-    matched: set[str] = set()
+    first_at: dict[str, str] = {}
     for t in instants:
         step = time.monotonic()
         try:
@@ -870,24 +886,37 @@ def market_truncation(
         pq.write_table(diff, tmp)
         os.replace(tmp, path)
         leaks = [r for r in diff.to_pylist() if r["kind"] == "leak"]
-        excepted = [r for r in leaks if diff_key(r) in reviewed]
-        matched.update(diff_key(r) for r in excepted)
         for r in leaks:
-            if diff_key(r) not in reviewed:
-                open_leaks.setdefault(
-                    diff_key(r), f"{t.astimezone(ET):%Y-%m-%d %H:%M} {r['detail']}"
-                )
+            first_at.setdefault(diff_key(r), f"{t.astimezone(ET):%Y-%m-%d %H:%M} {r['detail']}")
         typer.echo(
-            f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leaks {len(leaks):>5,} "
-            f"(excepted {len(excepted):,})  delays {diff.num_rows - len(leaks):>5,}  "
-            f"{time.monotonic() - step:,.0f}s"
+            f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leaks {len(leaks):>5,}  "
+            f"delays {diff.num_rows - len(leaks):>5,}  {time.monotonic() - step:,.0f}s"
         )
-    for key in sorted(set(reviewed) - matched):
-        typer.echo(f"stale exception: {key} ({reviewed[key]})")
+    verdict = gate(first_at, baseline=known, exceptions=reviewed, full_run=not as_of)
+    # default instants follow the data: a key gone from them may still occur elsewhere
+    fingerprint = hashlib.sha256("|".join(t.isoformat() for t in instants).encode()).hexdigest()
+    typer.echo(f"{len(instants)} instants, fingerprint {fingerprint[:12]}")
     typer.echo(f"rows -> {out_dir}/<instant>.parquet; {time.monotonic() - started:,.0f}s")
-    if open_leaks:
-        typer.echo(f"{len(open_leaks):,} leak keys not excepted:")
-        for key, where in sorted(open_leaks.items())[:50]:
-            typer.echo(f"  {key}  first at {where}")
+    for key in verdict.stale_exceptions:
+        typer.echo(f"stale exception: {key} ({reviewed[key]})")
+    if prune and verdict.new:
+        _fail(f"{len(verdict.new):,} new leaks: review them before pruning the baseline")
+    if prune and verdict.fixed:
+        try:
+            removed = prune_baseline(baseline, verdict.fixed)
+        except ValueError as error:
+            _fail(str(error))
+        typer.echo(f"pruned {removed:,} keys no longer occurring from {baseline}")
+        verdict = dataclasses.replace(verdict, fixed=[])
+    typer.echo(
+        f"{len(known):,} baseline keys, {len(reviewed):,} exceptions; "
+        f"{len(verdict.new):,} new, {len(verdict.fixed):,} no longer occurring"
+        + (" (partial run: not checked)" if as_of else "")
+    )
+    for key in verdict.fixed[:50]:
+        typer.echo(f"  no longer occurs at these instants (--prune-baseline): {key}")
+    for key in verdict.new[:50]:
+        typer.echo(f"  new leak: {key}  first at {first_at[key]}")
+    if not verdict.ok:
         raise typer.Exit(code=2)
-    typer.echo("no leak outside the exceptions")
+    typer.echo("no leak outside the baseline and the exceptions")

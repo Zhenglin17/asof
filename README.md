@@ -226,11 +226,13 @@ on days the full master leaves open, or a CIK it still withholds, is a **delay**
 found that a segment's CIK came from SEC snapshots months after it started trading (AAAU
 trades from 2020-01-02, the SEC lists it from 2020-07-10), so the CIK now has its own
 `cik_available_at` and stays hidden until then. Diffs go to
-`$ASOF_DATA_DIR/market/audit/truncation/<instant>.parquet`; reviewed leaks go into
-`configs/truncation_exceptions.yaml`, and the command exits 2 while any other leak remains.
-The same comparison runs in the test suite on every hand-built identity scenario at every
-instant at which its master or its inputs change, against a baseline of known leaks that
-may only shrink.
+`$ASOF_DATA_DIR/market/audit/truncation/<instant>.parquet`. Reviewed and accepted leaks go
+into `configs/truncation_exceptions.yaml`; leaks known but not fixed yet sit in
+`configs/truncation_baseline.txt`, a ratchet whose count may only shrink. The command exits
+2 on any leak in neither file, and, on the default instants, on a baseline key that no
+longer occurs (`--prune-baseline` deletes those; lines are only added by hand). The same
+comparison runs in the test suite on every hand-built identity scenario at every instant at
+which its master or its inputs change, against a baseline of its own.
 
 ## Layout
 
