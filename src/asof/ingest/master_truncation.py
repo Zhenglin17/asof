@@ -24,9 +24,11 @@ Histories the vendor rewrote later (AXNX, volume revisions) are the audit's busi
 test's: it checks the build, not the inputs.
 """
 
+import multiprocessing
 import os
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -36,6 +38,7 @@ import duckdb
 import pyarrow as pa
 import yaml
 
+from asof.ingest import security_master as sm
 from asof.ingest.security_master import MASTER_SCHEMA, _midnight
 
 MICRO = timedelta(microseconds=1)
@@ -229,6 +232,71 @@ def default_instants(full_master: pa.Table) -> list[datetime]:
         ordered = sorted(values)
         picked |= {ordered[0], ordered[(len(ordered) - 1) // 2], ordered[-1]}
     return sorted({t.astimezone(UTC) for p in picked for t in (p, p - MICRO)})
+
+
+# (full master, inputs, overrides) of the run in progress: set in the parent before the pool
+# forks, so every worker inherits them instead of receiving 1 GB of bars through a pipe.
+_RUN: tuple[pa.Table, "sm.StoreInputs", list[Mapping[str, Any]]] | None = None
+
+
+def _diff_at(t: datetime) -> tuple[datetime, pa.Table]:
+    if _RUN is None:
+        raise RuntimeError("_diff_at runs only inside run_instants, which sets _RUN")
+    full, inputs, overrides = _RUN
+    truncated, _ = sm.build_from_inputs(inputs, overrides, as_of=t)
+    return t, compare(full, truncated, t)
+
+
+def run_instants(
+    full: pa.Table,
+    inputs: "sm.StoreInputs",
+    overrides: Sequence[Mapping[str, Any]],
+    instants: Iterable[datetime],
+    *,
+    jobs: int = 1,
+    progress: Callable[[datetime, pa.Table], None] | None = None,
+) -> list[tuple[datetime, pa.Table]]:
+    """``compare`` of the full master with a build from ``inputs`` truncated at each distinct
+    instant, sorted by instant (UTC). ``jobs`` builds run at once in forked workers; the
+    result never depends on it (``jobs=1`` runs in this process, the reference). ``progress``
+    sees each result in instant order as soon as it and all earlier ones are done. A failed
+    build raises here once every earlier instant is done; the builds still queued are
+    cancelled and running workers are terminated, so an error or Ctrl-C never waits on them."""
+    global _RUN
+    if jobs < 1:
+        raise ValueError(f"jobs must be at least 1, got {jobs}")
+    ts = sorted({_aware(t) for t in instants})
+    if not ts:
+        return []
+    _RUN = (full, inputs, list(overrides))
+    try:
+        out: list[tuple[datetime, pa.Table]] = []
+        if jobs == 1:
+            for t in ts:
+                out.append(_diff_at(t))
+                if progress is not None:
+                    progress(*out[-1])
+            return out
+        pool = ProcessPoolExecutor(
+            max_workers=min(jobs, len(ts)), mp_context=multiprocessing.get_context("fork")
+        )
+        try:
+            for result in pool.map(_diff_at, ts):  # in the order of ts, whatever finishes first
+                out.append(result)
+                if progress is not None:
+                    progress(*result)
+        except BaseException:
+            # waiting would hang on a stuck worker; this pool's processes are our only children
+            pool.shutdown(wait=False, cancel_futures=True)
+            for child in multiprocessing.active_children():
+                child.terminate()
+            for child in multiprocessing.active_children():
+                child.join(timeout=10)
+            raise
+        pool.shutdown(wait=True)
+        return out
+    finally:
+        _RUN = None
 
 
 def load_instants(path: Path) -> list[datetime]:

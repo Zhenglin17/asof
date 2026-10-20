@@ -99,6 +99,7 @@ uv run asof market liquid --as-of 2021-03-01            # the liquid tier that m
 uv run asof market liquid --from 2020-01-01 --to 2026-10-01   # one tier per month start, and the union
 uv run asof market audit                 # count every kind of data error found so far
 uv run asof market truncation            # rebuild the security master as of past instants and diff
+uv run asof market truncation --jobs 10  # the same in 10 processes (default 6, about 20 GB in all)
 ```
 
 The universe is the union of every symbol Alpaca lists, every ticker that appeared in an SEC
@@ -231,7 +232,7 @@ is knowable only at 20:00 (CXAIV -> CXAI on 2023-03-15): a segment is now never 
 before its first bar, and a takeover's relabelled history not before the taker's. The
 default instants are fixed in `configs/truncation_instants.txt`: computed ones move whenever
 the master changes, and a leak seen only at an instant that moved away would look fixed.
-Leaks are weighed by what a backtest reads (which security a bar belongs to, which CIK a
+The store is read once and the 66 rebuilds run in forked worker processes (8.5 minutes with six, against 40 serially, with identical reports). Leaks are weighed by what a backtest reads (which security a bar belongs to, which CIK a
 ticker names), not by every field of the master. Diffs go to
 `$ASOF_DATA_DIR/market/audit/truncation/<instant>.parquet`. Reviewed and accepted leaks go
 into `configs/truncation_exceptions.yaml`; leaks known but not fixed yet sit in

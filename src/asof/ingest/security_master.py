@@ -2218,21 +2218,22 @@ def load_overrides(path: Path) -> list[dict[str, Any]]:
     return raw
 
 
-def build_from_store(
-    market_root: Path,
-    overrides: Sequence[Mapping[str, Any]] = (),
-    *,
-    as_of: datetime | None = None,
-) -> tuple[pa.Table, pa.Table]:
-    """Build from the daily bars, the SEC history and the Alpaca name changes on disk.
+@dataclass(frozen=True)
+class StoreInputs:
+    """What a build reads from the store: daily bars (imports applied), the SEC ticker history
+    and Alpaca's name changes. Loaded once (about a second on the real store), shared by every
+    build of a truncation run."""
 
-    With ``as_of``, only the inputs knowable then (``master_truncation.truncate_inputs``): the
-    master a build at that instant would have produced, for the truncation test."""
-    if as_of is not None and as_of.tzinfo is None:
-        raise ValueError("as_of must be timezone-aware")
-    # Imported bars override the vendor's row of the same (symbol, t), exactly as the read path
-    # serves them (PARA 2022-02..2025-08 is Paramount from Yahoo, not Alpaca's Banzai copies):
-    # a master built on the vendor's rows alone would judge Paramount's piece on Banzai's bars.
+    bars: pa.Table
+    sec_history: pa.Table
+    name_changes: pa.Table
+
+
+def load_store_inputs(market_root: Path) -> StoreInputs:
+    """The build inputs on disk. Imported bars override the vendor's row of the same (symbol,
+    t), exactly as the read path serves them (PARA 2022-02..2025-08 is Paramount from Yahoo,
+    not Alpaca's Banzai copies): a master built on the vendor's rows alone would judge
+    Paramount's piece on Banzai's bars."""
     from asof.store.market import bar_files, bars_source_sql  # noqa: PLC0415  (market imports us)
 
     alpaca_files, ext_files = bar_files(market_root, "1Day")
@@ -2269,6 +2270,22 @@ def build_from_store(
         )
     finally:
         con.close()
+    return StoreInputs(bars=bars, sec_history=sec, name_changes=name_changes)
+
+
+def build_from_inputs(
+    inputs: StoreInputs,
+    overrides: Sequence[Mapping[str, Any]] = (),
+    *,
+    as_of: datetime | None = None,
+) -> tuple[pa.Table, pa.Table]:
+    """Build from loaded store inputs, which are never changed.
+
+    With ``as_of``, only the inputs knowable then (``master_truncation.truncate_inputs``): the
+    master a build at that instant would have produced, for the truncation test."""
+    if as_of is not None and as_of.tzinfo is None:
+        raise ValueError("as_of must be timezone-aware")
+    bars, sec, name_changes = inputs.bars, inputs.sec_history, inputs.name_changes
     if as_of is not None:
         from asof.ingest.master_truncation import truncate_inputs  # noqa: PLC0415  (imports us)
 
@@ -2282,6 +2299,18 @@ def build_from_store(
         overrides=overrides,
         sec_history_start=SEC_HISTORY_START,
     )
+
+
+def build_from_store(
+    market_root: Path,
+    overrides: Sequence[Mapping[str, Any]] = (),
+    *,
+    as_of: datetime | None = None,
+) -> tuple[pa.Table, pa.Table]:
+    """Build from the daily bars, the SEC history and the Alpaca name changes on disk."""
+    if as_of is not None and as_of.tzinfo is None:
+        raise ValueError("as_of must be timezone-aware")
+    return build_from_inputs(load_store_inputs(market_root), overrides, as_of=as_of)
 
 
 _CHECK_VIEW = "_asof_check_master"

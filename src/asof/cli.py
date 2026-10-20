@@ -4,12 +4,14 @@ import dataclasses
 import hashlib
 import os
 import time
+from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import duckdb
 import httpx
+import pyarrow as pa
 import pyarrow.parquet as pq
 import typer
 from sqlmodel import Session
@@ -28,7 +30,6 @@ from asof.ingest.instrument_class import (
 )
 from asof.ingest.instrument_class import build_from_store as build_classes_from_store
 from asof.ingest.master_truncation import (
-    compare,
     default_instants,
     diff_key,
     gate,
@@ -36,6 +37,7 @@ from asof.ingest.master_truncation import (
     load_instants,
     load_truncation_exceptions,
     prune_baseline,
+    run_instants,
 )
 from asof.ingest.sec_ticker_history import (
     EXCHANGE_HISTORY_PATH,
@@ -56,8 +58,10 @@ from asof.ingest.sec_tickers import (
 )
 from asof.ingest.security_master import (
     MASTER_FILE,
+    build_from_inputs,
     build_from_store,
     load_overrides,
+    load_store_inputs,
     write_master,
 )
 from asof.ingest.tickers import is_valid_symbol, normalize_ticker
@@ -855,6 +859,9 @@ def market_truncation(
             help="Use the computed spread instead of --instants (a partial run: no pruning).",
         ),
     ] = False,
+    jobs: Annotated[
+        int, typer.Option("--jobs", help="Rebuilds run at once (6: about 20 GB in all).")
+    ] = 6,
     data_dir: Annotated[
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
     ] = None,
@@ -874,6 +881,8 @@ def market_truncation(
         gate([], baseline=known, exceptions=reviewed, full_run=False)  # overlap, before 26 min
     except ValueError as error:
         _fail(str(error))
+    if not 1 <= jobs <= (os.cpu_count() or 1):
+        _fail(f"--jobs must be between 1 and {os.cpu_count() or 1} (the cores here), got {jobs}")
     if as_of and computed:
         _fail("--as-of and --computed-instants exclude each other")
     if prune and (as_of or computed):
@@ -881,7 +890,8 @@ def market_truncation(
     if not as_of and not computed and not fixed_instants:
         _fail(f"{instants_file}: no instants (pass --instants, --as-of or --computed-instants)")
     started = time.monotonic()
-    full, _ = build_from_store(root, decisions)
+    inputs = load_store_inputs(root)
+    full, _ = build_from_inputs(inputs, decisions)
     if as_of:
         instants = sorted({_as_of_option(t).astimezone(UTC) for t in as_of})
     elif not computed:
@@ -899,13 +909,8 @@ def market_truncation(
     out_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"full master {full.num_rows:,} segments; {len(instants)} instants")
     first_at: dict[str, str] = {}
-    for t in instants:
-        step = time.monotonic()
-        try:
-            truncated, _ = build_from_store(root, decisions, as_of=t)
-        except ValueError as error:
-            _fail(str(error))
-        diff = compare(full, truncated, t)
+
+    def record(t: datetime, diff: pa.Table) -> None:
         path = out_dir / f"{t:%Y%m%dT%H%M%S%f}.parquet"
         tmp = path.with_name(path.name + ".tmp")
         pq.write_table(diff, tmp)
@@ -915,8 +920,15 @@ def market_truncation(
             first_at.setdefault(diff_key(r), f"{t.astimezone(ET):%Y-%m-%d %H:%M} {r['detail']}")
         typer.echo(
             f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leaks {len(leaks):>5,}  "
-            f"delays {diff.num_rows - len(leaks):>5,}  {time.monotonic() - step:,.0f}s"
+            f"delays {diff.num_rows - len(leaks):>5,}  {time.monotonic() - started:,.0f}s"
         )
+
+    try:
+        run_instants(full, inputs, decisions, instants, jobs=jobs, progress=record)
+    except ValueError as error:
+        _fail(str(error))
+    except BrokenProcessPool:
+        _fail(f"a worker died (most often out of memory): try a smaller --jobs than {jobs}")
     # only the fixed list stands for every instant: the computed one drifts with the master
     full_run = not as_of and not computed
     verdict = gate(first_at, baseline=known, exceptions=reviewed, full_run=full_run)

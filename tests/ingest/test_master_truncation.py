@@ -22,7 +22,15 @@ Target API (implementation pending, acceptance point 6-d):
         diff_key(row) = SYMBOL:YYYY-MM-DD:reason[:field+field...]
         compare(full, truncated, as_of) -> pa.Table     DIFF_SCHEMA rows
         default_instants(full_master) -> list[datetime]
+    asof.ingest.security_master (acceptance point 6-f, parallel instants):
+        load_store_inputs(market_root) -> StoreInputs     frozen: bars, sec_history, name_changes
+        build_from_inputs(inputs, overrides=(), *, as_of=None) -> (master, conflicts)
+            build_from_store(root, ...) == build_from_inputs(load_store_inputs(root), ...)
+    asof.ingest.master_truncation.run_instants(full, inputs, overrides, instants, *, jobs=1)
+        -> [(instant UTC, compare(full, truncated at instant, instant))], sorted, one per distinct
+        instant; jobs > 1 = a fork process pool, results identical to jobs=1; jobs < 1 refused.
     asof market truncation [--as-of ISO]... [--exceptions PATH] [--overrides PATH] [--data-dir]
+        [--jobs N]  (default 6; < 1 refused before any build; output identical whatever N)
         diffs -> <market>/audit/truncation/<YYYYMMDDTHHMMSSffffff of the UTC instant>.parquet;
         exit 2 on a leak whose key ``SYMBOL:YYYY-MM-DD:reason`` is not excepted, 0 otherwise.
 
@@ -45,8 +53,13 @@ Real-data checks for the assumptions (audit command, then the standard cases):
   2025-08-07 shows Bed Bath & Beyond's closed piece and no Beyond Inc piece yet (no diff).
 """
 
+import dataclasses
+import multiprocessing
 import os
-from collections.abc import Mapping, Sequence
+import signal
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -919,6 +932,7 @@ def run_truncation(
     baseline: Sequence[str] = (),
     prune: bool = False,
     instants: Sequence[str] | None = None,
+    jobs: str | None = None,
 ) -> Any:
     overrides_path = write_yaml(tmp_path / "overrides.yaml", list(overrides))
     exceptions_path = write_yaml(tmp_path / "exceptions.yaml", list(exceptions))
@@ -943,6 +957,7 @@ def run_truncation(
         str(instants_path),
         *(["--computed-instants"] if instants is None and not as_of else []),
         *(["--prune-baseline"] if prune else []),
+        *(["--jobs", jobs] if jobs is not None else []),
         "--data-dir",
         str(tmp_path),
     ]
@@ -1428,3 +1443,409 @@ def test_prune_baseline_refuses_an_unknown_key_and_writes_nothing(tmp_path: Path
     with pytest.raises(ValueError, match="ZZZ:2021-03-04:replaced"):
         mt.prune_baseline(path, [BASE_A, "ZZZ:2021-03-04:replaced"])
     assert path.read_text() == text
+
+
+# =============================================================================================
+# parallel instants: load_store_inputs / build_from_inputs / run_instants / --jobs
+# =============================================================================================
+# The real run loaded the store once per instant (1.1 s) and built serially (33 s x 66 instants
+# = 40 min). The store is now read once, and the instants run in a fork-context process pool
+# whose workers inherit the inputs. Whatever the number of workers, the diffs must be exactly
+# those of the serial run: parallelism may change how long the run takes, never what it finds.
+
+DiffList = list[tuple[datetime, pa.Table]]
+
+
+@contextmanager
+def within(seconds: float) -> Iterator[None]:
+    """Fail instead of hanging: a pool that waits forever on a dead worker raises here."""
+
+    def expire(signum: int, frame: Any) -> None:
+        raise TimeoutError(f"no answer within {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def no_children_left(seconds: float = 10.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while multiprocessing.active_children():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def store_inputs_of(world: Inputs) -> Any:
+    """A scenario world as the store loader's output. build_from_inputs applies
+    SEC_HISTORY_START as build_from_store does; the worlds below keep their leaks with it
+    (measured 2026-10-20: r_gold_b 12, l_arnc 8, r4 8 leak rows over instants_of)."""
+    return sm.StoreInputs(
+        bars=world.bars, sec_history=world.sec_history, name_changes=world.name_changes
+    )
+
+
+def same_diffs(left: DiffList, right: DiffList) -> None:
+    assert [t for t, _ in left] == [t for t, _ in right]
+    for (t, a), (_, b) in zip(left, right, strict=True):
+        assert a.schema.equals(DIFF_SCHEMA), t
+        assert a.equals(b), t
+
+
+def hand_loop(
+    full: pa.Table, inputs: Any, overrides: Any, instants: Sequence[datetime]
+) -> DiffList:
+    return [
+        (t, compare(full, sm.build_from_inputs(inputs, overrides, as_of=t)[0], t))
+        for t in sorted({t.astimezone(UTC) for t in instants})
+    ]
+
+
+def cli_world(tmp_path: Path) -> tuple[Path, Any, pa.Table]:
+    root = write_cli_store(market_root(tmp_path))
+    inputs = sm.load_store_inputs(root)
+    full, _ = sm.build_from_inputs(inputs, [MERGE])
+    return root, inputs, full
+
+
+def cli_instants(full: pa.Table) -> list[datetime]:
+    named = [datetime.fromisoformat(t) for t in CLI_INSTANTS]
+    return sorted({*(t.astimezone(UTC) for t in named), *default_instants(full)[:4]})
+
+
+# --- load_store_inputs / build_from_inputs ---
+
+
+def test_store_inputs_is_a_frozen_dataclass_of_the_three_tables(tmp_path: Path) -> None:
+    inputs = sm.load_store_inputs(write_cli_store(market_root(tmp_path)))
+    assert [f.name for f in dataclasses.fields(inputs)] == [
+        "bars",
+        "sec_history",
+        "name_changes",
+    ]
+    assert all(isinstance(getattr(inputs, n), pa.Table) for n in ("bars", "sec_history"))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        inputs.bars = inputs.sec_history  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "as_of",
+    [
+        None,
+        et_midnight(date(2024, 1, 5)) - MICRO,  # before the first snapshot
+        et_midnight(date(2024, 3, 1)),  # a snapshot's own midnight, the merge not yet decided
+        et_midnight(CLI_DECIDED) - MICRO,
+        et_midnight(CLI_DECIDED),
+        datetime(2030, 1, 1, tzinfo=UTC),
+    ],
+    ids=["none", "pre_snapshot", "snapshot", "decided_minus_1us", "decided", "everything"],
+)
+@pytest.mark.parametrize("with_merge", [False, True], ids=["plain", "merge"])
+def test_build_from_inputs_of_the_loaded_store_equals_build_from_store(
+    tmp_path: Path, as_of: datetime | None, with_merge: bool
+) -> None:
+    root = write_cli_store(market_root(tmp_path))
+    overrides = [MERGE] if with_merge else []
+
+    master, conflicts = sm.build_from_inputs(sm.load_store_inputs(root), overrides, as_of=as_of)
+    expected, expected_conflicts = sm.build_from_store(root, overrides, as_of=as_of)
+
+    assert master.equals(expected)
+    assert conflicts.equals(expected_conflicts)
+
+
+def test_build_from_inputs_matches_the_store_with_records_and_imported_bars(
+    tmp_path: Path,
+) -> None:
+    # the I-world store: an imported history and a name-change file, which the CLI store lacks
+    root = write_store(market_root(tmp_path))
+    inputs = sm.load_store_inputs(root)
+    assert inputs.name_changes.num_rows == 1
+    for as_of in (None, et_midnight(STORE_RECORD) - MICRO, et_midnight(STORE_RECORD)):
+        master, conflicts = sm.build_from_inputs(inputs, as_of=as_of)
+        expected, expected_conflicts = sm.build_from_store(root, as_of=as_of)
+        assert master.equals(expected), as_of
+        assert conflicts.equals(expected_conflicts), as_of
+
+
+def test_load_store_inputs_without_a_name_change_file_is_an_empty_table(tmp_path: Path) -> None:
+    inputs = sm.load_store_inputs(write_cli_store(market_root(tmp_path)))
+    assert inputs.name_changes.num_rows == 0
+    assert inputs.name_changes.schema.equals(NAME_CHANGE_SCHEMA)
+    assert inputs.bars.num_rows > 0
+
+
+def test_build_from_inputs_refuses_a_naive_as_of(tmp_path: Path) -> None:
+    inputs = sm.load_store_inputs(write_cli_store(market_root(tmp_path)))
+    with pytest.raises(ValueError):
+        sm.build_from_inputs(inputs, as_of=datetime(2024, 3, 1))
+
+
+def test_build_from_inputs_at_an_instant_does_not_change_the_inputs(tmp_path: Path) -> None:
+    # the workers share one inputs object: a build at one instant must not truncate it for
+    # the next
+    inputs = sm.load_store_inputs(write_cli_store(market_root(tmp_path)))
+    rows = (inputs.bars.num_rows, inputs.sec_history.num_rows, inputs.name_changes.num_rows)
+    sm.build_from_inputs(inputs, [MERGE], as_of=et_midnight(date(2024, 1, 5)))
+    assert (inputs.bars.num_rows, inputs.sec_history.num_rows, inputs.name_changes.num_rows) == rows
+
+
+# --- run_instants: normal ---
+
+
+def test_run_instants_serial_is_the_hand_loop(tmp_path: Path) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = cli_instants(full)
+    assert len(instants) >= 4
+
+    got = mt.run_instants(full, inputs, [MERGE], instants, jobs=1)
+
+    same_diffs(got, hand_loop(full, inputs, [MERGE], instants))
+
+
+def test_run_instants_default_jobs_is_serial(tmp_path: Path) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = cli_instants(full)
+    same_diffs(
+        mt.run_instants(full, inputs, [MERGE], instants),
+        mt.run_instants(full, inputs, [MERGE], instants, jobs=1),
+    )
+
+
+@pytest.mark.parametrize("jobs", [2, 3])
+def test_run_instants_in_a_pool_equals_serial_on_the_cli_store(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = cli_instants(full)
+    serial = mt.run_instants(full, inputs, [MERGE], instants, jobs=1)
+    with within(120):
+        pooled = mt.run_instants(full, inputs, [MERGE], instants, jobs=jobs)
+    same_diffs(pooled, serial)
+    assert any(table.num_rows for _, table in serial)  # the comparison is not of empty tables
+
+
+@pytest.mark.parametrize("scenario", ["r_gold_b", "l_arnc", "r4"])
+def test_run_instants_in_a_pool_equals_serial_on_leaking_worlds(scenario: str) -> None:
+    inputs = store_inputs_of(SCENARIOS[scenario]())
+    full, _ = sm.build_from_inputs(inputs)
+    instants = instants_of(full, SCENARIOS[scenario]())
+    serial = mt.run_instants(full, inputs, (), instants, jobs=1)
+    with within(120):
+        pooled = mt.run_instants(full, inputs, (), instants, jobs=2)
+    same_diffs(pooled, serial)
+    leaks = [r for _, table in serial for r in table.to_pylist() if r["kind"] == "leak"]
+    assert leaks, f"{scenario}: no leak rows; pick a world that leaks"
+
+
+# --- run_instants: edges ---
+
+
+def test_run_instants_sorts_and_deduplicates_the_instants(tmp_path: Path) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    decided = et_midnight(CLI_DECIDED)
+    early = et_midnight(date(2024, 3, 1))
+    # the same instant twice, once in New York time and once in UTC, and out of order
+    given = [decided, early, decided.astimezone(UTC), early - MICRO]
+    expected = sorted({t.astimezone(UTC) for t in given})
+    assert len(expected) == 3
+
+    for jobs in (1, 2):
+        with within(120):
+            got = mt.run_instants(full, inputs, [MERGE], given, jobs=jobs)
+        assert [t for t, _ in got] == expected, jobs
+        assert all(t.utcoffset() == timedelta(0) for t, _ in got), jobs
+        same_diffs(got, hand_loop(full, inputs, [MERGE], given))
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_of_no_instants_is_empty(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    with within(60):
+        assert mt.run_instants(full, inputs, [MERGE], [], jobs=jobs) == []
+
+
+def test_run_instants_with_more_jobs_than_instants(tmp_path: Path) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
+    serial = mt.run_instants(full, inputs, [MERGE], instants, jobs=1)
+    with within(120):
+        same_diffs(mt.run_instants(full, inputs, [MERGE], instants, jobs=8), serial)
+        same_diffs(mt.run_instants(full, inputs, [MERGE], instants[:1], jobs=8), serial[:1])
+    assert no_children_left()
+
+
+@pytest.mark.parametrize("jobs", [0, -1])
+def test_run_instants_refuses_fewer_than_one_job(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    with pytest.raises(ValueError):
+        mt.run_instants(full, inputs, [MERGE], [et_midnight(CLI_DECIDED)], jobs=jobs)
+    with pytest.raises(ValueError):  # refused even with nothing to run
+        mt.run_instants(full, inputs, [MERGE], [], jobs=jobs)
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_refuses_a_naive_instant(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    with within(60), pytest.raises(ValueError):
+        mt.run_instants(full, inputs, [MERGE], [datetime(2024, 3, 1)], jobs=jobs)
+    assert no_children_left()
+
+
+def failing_at_two_snapshots(real: Callable[..., Any]) -> Callable[..., Any]:
+    """build_security_master raising when exactly two of the three CLI snapshots are given:
+    the instants from 2024-03-01 to before 2024-05-01. Installed in the parent, so a forked
+    worker inherits it."""
+
+    def build(**kwargs: Any) -> Any:
+        snapshots = set(kwargs["sec_history"].column("snapshot_date").to_pylist())
+        if len(snapshots) == 2:
+            raise ValueError("planted failure at the 2024-03-01 instant")
+        return real(**kwargs)
+
+    return build
+
+
+@pytest.mark.parametrize("jobs", [1, 2, 3])
+def test_run_instants_an_error_at_one_instant_reaches_the_caller(
+    tmp_path: Path, jobs: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, inputs, full = cli_world(tmp_path)  # the full build, before the failure is planted
+    monkeypatch.setattr(
+        sm, "build_security_master", failing_at_two_snapshots(build_security_master)
+    )
+    instants = [
+        et_midnight(date(2024, 1, 5)),
+        et_midnight(date(2024, 3, 1)),  # the failing one
+        et_midnight(CLI_DECIDED),
+        datetime(2030, 1, 1, tzinfo=UTC),
+    ]
+    with within(120), pytest.raises(ValueError, match="planted failure"):
+        mt.run_instants(full, inputs, [MERGE], instants, jobs=jobs)
+    assert no_children_left()
+
+
+def test_run_instants_an_error_does_not_wait_on_a_stuck_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # one instant fails, a later one never returns: the error must arrive and the stuck worker
+    # must be gone, not waited on (a hung build would otherwise hang the whole run)
+    _, inputs, full = cli_world(tmp_path)
+    real = build_security_master
+
+    def build(**kwargs: Any) -> Any:
+        snapshots = set(kwargs["sec_history"].column("snapshot_date").to_pylist())
+        if len(snapshots) == 2:
+            raise ValueError("planted failure at the 2024-03-01 instant")
+        if len(snapshots) == 3:
+            time.sleep(1e6)
+        return real(**kwargs)
+
+    monkeypatch.setattr(sm, "build_security_master", build)
+    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
+    with within(60), pytest.raises(ValueError, match="planted failure"):
+        mt.run_instants(full, inputs, [MERGE], instants, jobs=2)
+    assert no_children_left()
+
+
+# --- run_instants: leakage ---
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_each_worker_truncates_to_its_own_instant(tmp_path: Path, jobs: int) -> None:
+    # Leakage. The merge decided on 2024-06-03 is in the overrides every worker inherits; a
+    # worker must still build the master of 2024-06-02 without it (the KRSA leak shows), and
+    # only the 06-03 build may use it (no diff).
+    _, inputs, full = cli_world(tmp_path)
+    decided = et_midnight(CLI_DECIDED)
+    with within(120):
+        (before, early), (at, late) = mt.run_instants(
+            full, inputs, [MERGE], [decided, decided - MICRO], jobs=jobs
+        )
+    assert (before, at) == (decided - MICRO, decided)
+    assert {
+        f"{r['symbol']}:{r['valid_from'].isoformat()}:{r['reason']}"
+        for r in early.to_pylist()
+        if r["kind"] == "leak"
+    } == set(LEAK_KEYS)
+    assert late.num_rows == 0
+
+
+# --- CLI --jobs ---
+
+
+def summary_lines(output: str) -> list[str]:
+    """The run's output without the per-instant timings and the total duration."""
+    return [
+        line
+        for line in output.splitlines()
+        if not line.startswith("  20") and not line.startswith("rows -> ")
+    ]
+
+
+def reports(tmp_path: Path) -> dict[str, pa.Table]:
+    return {p.name: pq.read_table(p) for p in sorted(report_dir(tmp_path).glob("*.parquet"))}
+
+
+@pytest.mark.parametrize(
+    "baseline", [[], LEAK_KEYS, [*LEAK_KEYS, OTHER_KEY]], ids=["new", "known", "fixed"]
+)
+def test_cli_reports_and_verdict_do_not_depend_on_jobs(tmp_path: Path, baseline: list[str]) -> None:
+    runs = {}
+    for jobs in ("1", "2", None):  # None: the default (6)
+        here = tmp_path / f"jobs_{jobs}"
+        here.mkdir()
+        write_cli_store(market_root(here))
+        result = run_truncation(
+            here, overrides=[MERGE], baseline=baseline, instants=CLI_INSTANTS, jobs=jobs
+        )
+        # each run has its own directory, printed in the output: not a difference of behaviour
+        output = result.output.replace(str(here), "<run>")
+        runs[jobs] = (result, output, reports(here), (here / "baseline.txt").read_text())
+
+    serial, serial_output, serial_reports, serial_baseline = runs["1"]
+    assert len(serial_reports) == len(CLI_INSTANTS)
+    for jobs in ("2", None):
+        result, output, written, kept = runs[jobs]
+        assert result.exit_code == serial.exit_code, result.output
+        assert summary_lines(output) == summary_lines(serial_output)
+        assert output.splitlines()[-1] == serial_output.splitlines()[-1]
+        assert written.keys() == serial_reports.keys()
+        for name, table in written.items():
+            assert table.equals(serial_reports[name]), (jobs, name)
+        assert kept == serial_baseline
+
+
+def test_cli_prune_with_jobs_prunes_as_serial(tmp_path: Path) -> None:
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(
+        tmp_path,
+        overrides=[MERGE],
+        baseline=[*LEAK_KEYS, OTHER_KEY],
+        prune=True,
+        instants=CLI_INSTANTS,
+        jobs="2",
+    )
+    assert result.exit_code == 0, result.output
+    assert load_baseline(tmp_path / "baseline.txt") == LEAK_KEYS
+
+
+@pytest.mark.parametrize("jobs", ["0", "-2"])
+def test_cli_refuses_fewer_than_one_job_before_any_build(
+    tmp_path: Path, jobs: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_cli_store(market_root(tmp_path))
+
+    def no_build(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("built although --jobs was refused")
+
+    monkeypatch.setattr(sm, "build_security_master", no_build)
+    result = run_truncation(tmp_path, overrides=[MERGE], instants=CLI_INSTANTS, jobs=jobs)
+
+    assert result.exit_code not in (0, LEAK_EXIT), result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
+    assert "jobs" in result.output
+    assert not report_dir(tmp_path).exists() or not list(report_dir(tmp_path).glob("*"))
