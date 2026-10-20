@@ -869,7 +869,8 @@ def market_truncation(
         int | None,
         typer.Option(
             "--jobs",
-            help="Rebuilds run at once (default: the smaller of 6 and the cores; 6 take 20 GB).",
+            help="Rebuilds run at once (default: the smaller of 4 and the cores; 4 take 22 GB, "
+            "6 ran out of 31 GB).",
         ),
     ] = None,
     data_dir: Annotated[
@@ -893,7 +894,7 @@ def market_truncation(
         _fail(str(error))
     cores = _cores()
     if jobs is None:
-        jobs = min(6, cores)  # a CI runner has 2-4 cores
+        jobs = min(4, cores)  # memory bounds it (~6 GB per late instant); CI has 2-4 cores
     elif not 1 <= jobs <= cores:
         _fail(f"--jobs must be between 1 and {cores} (the cores here), got {jobs}")
     if as_of and computed:

@@ -1800,7 +1800,7 @@ def test_cli_reports_and_verdict_do_not_depend_on_jobs(
 ) -> None:
     monkeypatch.setattr(cli, "_cores", lambda: 4)  # --jobs 2 must not depend on this machine
     runs = {}
-    for jobs in ("1", "2", None):  # None: the default, min(6, cores)
+    for jobs in ("1", "2", None):  # None: the default, min(4, cores)
         here = tmp_path / f"jobs_{jobs}"
         here.mkdir()
         write_cli_store(market_root(here))
@@ -1858,6 +1858,26 @@ def test_cli_default_jobs_fit_a_small_machine(
     result = run_truncation(tmp_path, overrides=[MERGE], baseline=LEAK_KEYS, instants=CLI_INSTANTS)
     assert result.exit_code == 0, result.output
     assert used == [2]
+
+
+def test_cli_default_jobs_are_bounded_by_memory_not_cores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 2026-10-20 on the real store: 6 workers ran out of a 31 GB machine (the kernel killed one
+    # at the 2026 instants, ~6 GB each); 4 peaked at 22 GB in all. More cores add no memory.
+    monkeypatch.setattr(cli, "_cores", lambda: 32)
+    used: list[int] = []
+    real = cli.run_instants
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        used.append(kwargs["jobs"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_instants", spy)
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(tmp_path, overrides=[MERGE], baseline=LEAK_KEYS, instants=CLI_INSTANTS)
+    assert result.exit_code == 0, result.output
+    assert used == [4]
 
 
 def test_cli_refuses_more_jobs_than_cores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
