@@ -30,7 +30,8 @@ Target API (implementation pending, acceptance point 6-d):
         -> [(instant UTC, compare(full, truncated at instant, instant))], sorted, one per distinct
         instant; jobs > 1 = a fork process pool, results identical to jobs=1; jobs < 1 refused.
     asof market truncation [--as-of ISO]... [--exceptions PATH] [--overrides PATH] [--data-dir]
-        [--jobs N]  (default 6; < 1 refused before any build; output identical whatever N)
+        [--jobs N]  (default min(6, cores); outside 1..cores refused before any build;
+                     output identical whatever N)
         diffs -> <market>/audit/truncation/<YYYYMMDDTHHMMSSffffff of the UTC instant>.parquet;
         exit 2 on a leak whose key ``SYMBOL:YYYY-MM-DD:reason`` is not excepted, 0 otherwise.
 
@@ -71,6 +72,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from asof import cli
 from asof.cli import app
 from asof.ingest import master_truncation as mt
 from asof.ingest import security_master as sm
@@ -1793,9 +1795,12 @@ def reports(tmp_path: Path) -> dict[str, pa.Table]:
 @pytest.mark.parametrize(
     "baseline", [[], LEAK_KEYS, [*LEAK_KEYS, OTHER_KEY]], ids=["new", "known", "fixed"]
 )
-def test_cli_reports_and_verdict_do_not_depend_on_jobs(tmp_path: Path, baseline: list[str]) -> None:
+def test_cli_reports_and_verdict_do_not_depend_on_jobs(
+    tmp_path: Path, baseline: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_cores", lambda: 4)  # --jobs 2 must not depend on this machine
     runs = {}
-    for jobs in ("1", "2", None):  # None: the default (6)
+    for jobs in ("1", "2", None):  # None: the default, min(6, cores)
         here = tmp_path / f"jobs_{jobs}"
         here.mkdir()
         write_cli_store(market_root(here))
@@ -1819,7 +1824,10 @@ def test_cli_reports_and_verdict_do_not_depend_on_jobs(tmp_path: Path, baseline:
         assert kept == serial_baseline
 
 
-def test_cli_prune_with_jobs_prunes_as_serial(tmp_path: Path) -> None:
+def test_cli_prune_with_jobs_prunes_as_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_cores", lambda: 4)  # --jobs 2 must not depend on this machine
     write_cli_store(market_root(tmp_path))
     result = run_truncation(
         tmp_path,
@@ -1831,6 +1839,33 @@ def test_cli_prune_with_jobs_prunes_as_serial(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert load_baseline(tmp_path / "baseline.txt") == LEAK_KEYS
+
+
+def test_cli_default_jobs_fit_a_small_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a CI runner has 2-4 cores: the default must shrink to them, not be refused
+    monkeypatch.setattr(cli, "_cores", lambda: 2)
+    used: list[int] = []
+    real = cli.run_instants
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        used.append(kwargs["jobs"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_instants", spy)
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(tmp_path, overrides=[MERGE], baseline=LEAK_KEYS, instants=CLI_INSTANTS)
+    assert result.exit_code == 0, result.output
+    assert used == [2]
+
+
+def test_cli_refuses_more_jobs_than_cores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_cores", lambda: 2)
+    write_cli_store(market_root(tmp_path))
+    result = run_truncation(tmp_path, overrides=[MERGE], instants=CLI_INSTANTS, jobs="3")
+    assert result.exit_code not in (0, LEAK_EXIT), result.output
+    assert "between 1 and 2" in result.output
 
 
 @pytest.mark.parametrize("jobs", ["0", "-2"])

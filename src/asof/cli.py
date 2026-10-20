@@ -825,6 +825,12 @@ def market_audit(
     typer.echo(f"all gated checks clean at tier {tier} ({len(CHECKS)} checks known)")
 
 
+def _cores() -> int:
+    """Cores this process may run on: the affinity mask, not the host (a container or CI runner
+    gets fewer than the machine has)."""
+    return len(os.sched_getaffinity(0)) or 1
+
+
 @market_app.command("truncation")
 def market_truncation(
     as_of: Annotated[
@@ -860,8 +866,12 @@ def market_truncation(
         ),
     ] = False,
     jobs: Annotated[
-        int, typer.Option("--jobs", help="Rebuilds run at once (6: about 20 GB in all).")
-    ] = 6,
+        int | None,
+        typer.Option(
+            "--jobs",
+            help="Rebuilds run at once (default: the smaller of 6 and the cores; 6 take 20 GB).",
+        ),
+    ] = None,
     data_dir: Annotated[
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
     ] = None,
@@ -881,8 +891,11 @@ def market_truncation(
         gate([], baseline=known, exceptions=reviewed, full_run=False)  # overlap, before 26 min
     except ValueError as error:
         _fail(str(error))
-    if not 1 <= jobs <= (os.cpu_count() or 1):
-        _fail(f"--jobs must be between 1 and {os.cpu_count() or 1} (the cores here), got {jobs}")
+    cores = _cores()
+    if jobs is None:
+        jobs = min(6, cores)  # a CI runner has 2-4 cores
+    elif not 1 <= jobs <= cores:
+        _fail(f"--jobs must be between 1 and {cores} (the cores here), got {jobs}")
     if as_of and computed:
         _fail("--as-of and --computed-instants exclude each other")
     if prune and (as_of or computed):
