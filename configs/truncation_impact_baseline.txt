@@ -14,14 +14,10 @@ B:2020-01-02:fields_differ:available_at+cik+cik_available_at+end_available_at pr
 B:2025-05-09:grouping_differs price=227 cik=0
 BURU:2023-02-01:fields_differ:end_available_at+valid_to price=3360 cik=0
 BURU:2024-08-02:replaced price=3360 cik=0
-CIIG:2021-11-05:fields_differ:end_available_at+valid_to price=0 cik=128
-GSAH:2020-08-20:only_in_full price=24 cik=0
-GSAH:2020-09-05:grouping_differs price=566 cik=0
 HWM:2020-04-01:fields_differ:cusip price=125 cik=0
 HWM:2020-04-01:grouping_differs price=125 cik=0
 IRNT:2021-09-01:grouping_differs price=8174 cik=0
 LBRDK:2020-01-02:fields_differ:available_at+cik+cik_available_at price=0 cik=5556
-MIR:2021-10-21:grouping_differs price=2484 cik=0
 NAOV:2020-01-02:fields_differ:end_available_at+valid_to price=78 cik=78
 NUKK:2024-01-05:grouping_differs price=8 cik=0
 OAS:2020-01-02:fields_differ:end_available_at+valid_to price=804 cik=804
@@ -36,6 +32,3 @@ TT:2020-01-02:replaced price=213 cik=0
 TT:2020-03-02:only_in_full price=213 cik=0
 WKEY:2020-01-02:fields_differ:available_at+cik+cik_available_at+end_available_at price=0 cik=1792
 XPER:2022-10-03:grouping_differs price=28 cik=0
-YOU:2021-06-30:only_in_full price=727 cik=727
-YPF:2020-01-02:only_in_full price=2690 cik=2690
-YQ:2020-12-04:only_in_full price=1740 cik=1740

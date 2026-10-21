@@ -1923,6 +1923,10 @@ def build_security_master(
         # A piece with no bars attributes nothing; keep it only as a link in a chain.
         pieces = [p for p in pieces if p.n_bars or (p.start is not None and p.end is not None)]
         pieces = [p for p in pieces if p.valid_from is not None]
+        # Keys must stay unique once resumed pieces are appended at len(pieces): every later step
+        # finds pieces by key, and a shared key let rule R drop YEXT along with resumed AACI.
+        for i, p in enumerate(pieces):
+            p.key = i
         resumed = _resumed_pieces(con, pieces)
         for p in resumed:
             p.key = len(pieces)

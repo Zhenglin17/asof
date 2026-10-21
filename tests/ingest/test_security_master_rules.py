@@ -1263,3 +1263,185 @@ def test_s_opening_segment_fallback_is_delayed_too() -> None:
     assert seg["valid_to"] == rename_day
     assert seg["cik"] == S_CIK
     assert seg["cik_available_at"] == et_midnight(S_SPELLING_DAY)
+
+
+# =============================================================================================
+# K: piece keys stay unique when resumed pieces join the list
+# =============================================================================================
+# build_security_master numbers every piece by its position (p.key), drops the pieces with no
+# bars that are no chain link, then appends rule O's resumed pieces with key = len(pieces). The
+# survivors keep their old numbers, so once anything was dropped the resumed pieces reuse keys
+# still held by the last survivors -- the alphabetically last symbols. Rule R (_relabelled_pieces)
+# and the drop that follows it work by key: a resumed piece judged to be a taker's relabelled
+# history takes the unrelated piece holding the same key down with it. Real store (2026-10-20):
+# 22,660 surviving pieces, max key 22,923, all 120 resumed pieces collide (key 22660 held by
+# YEXT and by the resumed AACI); adding the Alpaca record PSKY -> SKYD swapped unrelated segments
+# (GSAH.U / GSAH, RSF.RTWI / RQI.RTWI, YICC / YICCU) and YPF, YQ, YOU vanished from truncated
+# builds. Expected: one input that changes nothing about a symbol leaves that symbol's segments
+# alone.
+#
+# Fake data provenance (all constructed unless noted; the collision depends only on how many
+# pieces are dropped and on where the symbols sort, not on any external behaviour):
+# - RLB: own bars 2020-01-02..06-30, vacated for RLN by an Alpaca record 2020-07-01; from
+#   2020-10-01 to 2021-05-28 the label carries TKR's bars (Alpaca relabelling, real mechanism:
+#   BNY carried BK's bars, test_security_master.py); TKR -> RLB on 2021-06-01, TKR's own bars
+#   continue under RLB. Rule O opens a resumed piece for 2020-10-01..2021-06-01 and rule R drops
+#   it as TKR's history.
+# - CSW: bars 2020-01-02..06-30; the SEC lists CSW under 8801 to 2020-06-01 and under 8802 from
+#   2021-01-04 (a label reused by a filer that never trades here): the CIK switch opens a piece
+#   with no bars that is no chain link -> dropped by the filter.
+# - BKRPQ -> BKRP 2021-03-01 with no BKRP bars after the record (real shape: the six real
+#   XQ -> X records have no bars after the record, see the V exception above). Assumption:
+#   BKRP has no SEC rows, which is what makes BKRP's bars before the record ownerless; in the
+#   real store MOND (332 of 984) and VINO (169 of 1,118) keep part of theirs ownerless, the
+#   other four keep none (PROGRESS, open). The record opens a BKRP piece with no bars ->
+#   dropped. A record whose two symbols have no bars at all is discarded before any piece
+#   exists and could not show the bug.
+# - ZZZ: plain bars 2020-01-02..2021-12-31, the last symbol in sort order.
+#
+# Real-data checks (the fake worlds cannot show these): after the fix, rebuild the real store
+# and confirm (1) no resumed piece shares a key with a surviving piece when rule R runs (today
+# all 120 do), (2) the master built with and without PSKY -> SKYD differs only in PSKY /
+# SKYD rows, (3) YPF, YQ and YOU are present in the truncation audit's builds.
+
+K_SNAPSHOTS = [date(2020, 1, 13), date(2020, 6, 1), date(2021, 1, 4), date(2021, 7, 1)]
+K_VACATED = date(2020, 7, 1)  # RLB -> RLN
+K_COPIES_FROM = date(2020, 10, 1)  # RLB carries TKR's bars from here (gap > RESUME_GAP_DAYS)
+K_TAKEN = date(2021, 6, 1)  # TKR -> RLB
+K_SWITCH = date(2021, 1, 4)  # CSW's new filer
+K_Q_RECORD = date(2021, 3, 1)  # BKRPQ -> BKRP
+K_END = date(2021, 12, 31)
+K_RENAMES: list[Rename] = [  # CUSIPs constructed
+    ("RLB", "RLN", K_VACATED, "000100100", "000100200"),
+    ("TKR", "RLB", K_TAKEN, "000200100", "000200100"),
+]
+K_Q_RENAME: Rename = ("BKRPQ", "BKRP", K_Q_RECORD, "000300100", "000300200")
+K_COMPARED = ("available_at", "end_available_at", "cik", "cik_available_at", "cusip", "evidence")
+
+
+def k_inputs(*, cik_switch: bool = False, q_record: bool = False) -> dict[str, pa.Table]:
+    tkr = bar_rows("TKR", date(2020, 1, 2), date(2021, 5, 28), 30.0)
+    bars = [
+        *bar_rows("RLB", date(2020, 1, 2), date(2020, 6, 30), 10.0),
+        *bar_rows("RLN", K_VACATED, K_END, 10.1),
+        *tkr,
+        *relabel([r for r in tkr if r["session_date"] >= K_COPIES_FROM], "RLB"),
+        *bar_rows("RLB", K_TAKEN, K_END, 30.5),
+        *bar_rows("CSW", date(2020, 1, 2), date(2020, 6, 30), 7.0),
+        *bar_rows("BKRP", date(2020, 1, 2), date(2020, 6, 30), 9.0),
+        *bar_rows("ZZZ", date(2020, 1, 2), K_END, 5.0),
+    ]
+    lives: list[Life] = [("CSW", 8801, date(2020, 1, 13), date(2020, 6, 1))]
+    if cik_switch:
+        lives.append(("CSW", 8802, K_SWITCH, None))
+    renames = [*K_RENAMES, *([K_Q_RENAME] if q_record else [])]
+    return {
+        "bars": bars_table(bars),
+        "sec_history": sec_table(K_SNAPSHOTS, lives),
+        "name_changes": name_changes_table(renames),
+    }
+
+
+def k_build(**kwargs: bool) -> pa.Table:
+    master, _ = build_security_master(**k_inputs(**kwargs))
+    return master
+
+
+def k_rows(master: pa.Table, without: set[str]) -> list[tuple[Any, ...]]:
+    """Every segment outside ``without``, security_id left out (its numbering may shift)."""
+    return sorted(
+        (r["symbol"], r["valid_from"], r["valid_to"], *(r[c] for c in K_COMPARED))
+        for r in master.to_pylist()
+        if r["symbol"] not in without
+    )
+
+
+def k_groups(master: pa.Table, without: set[str]) -> set[frozenset[tuple[str, date]]]:
+    """The securities as sets of (symbol, valid_from), segments in ``without`` left out."""
+    by_sid: dict[str, set[tuple[str, date]]] = {}
+    for r in master.to_pylist():
+        if r["symbol"] not in without:
+            by_sid.setdefault(r["security_id"], set()).add((r["symbol"], r["valid_from"]))
+    return {frozenset(g) for g in by_sid.values()}
+
+
+def test_k_world_without_a_dropped_piece_keeps_every_symbol() -> None:
+    # Boundary (passes today, must keep passing): nothing is dropped by the no-bars filter, so
+    # the resumed piece's key is fresh; ZZZ survives and the resumed RLB piece is gone (rule R).
+    master = k_build()
+
+    [zzz] = segments(master, "ZZZ")
+    assert (zzz["valid_from"], zzz["valid_to"]) == (date(2020, 1, 2), None)
+    first, taken = segments(master, "RLB")
+    assert (first["valid_from"], first["valid_to"]) == (date(2020, 1, 2), K_VACATED)
+    assert (taken["valid_from"], taken["valid_to"]) == (K_TAKEN, None)
+    assert taken["security_id"] == only_sid(master, "TKR")
+    assert covering(master, "RLB", date(2021, 1, 4)) == []  # TKR's copies own nothing
+
+
+def test_k_a_dropped_zero_bar_piece_does_not_remove_a_late_symbol() -> None:
+    # Normal path of the fix. CSW's new filer opens a piece with no bars (dropped), so the
+    # resumed RLB piece is numbered len(pieces) = ZZZ's key; rule R drops that key and ZZZ goes
+    # with it. Today: no ZZZ row at all. Expected: ZZZ as without the switch, CSW cut at it.
+    base = k_build()
+    master = k_build(cik_switch=True)
+
+    [zzz] = segments(master, "ZZZ")
+    assert (zzz["valid_from"], zzz["valid_to"]) == (date(2020, 1, 2), None)
+    [csw] = segments(master, "CSW")
+    assert (csw["valid_from"], csw["valid_to"]) == (date(2020, 1, 2), K_SWITCH)
+    assert k_rows(master, {"CSW"}) == k_rows(base, {"CSW"})
+    assert k_groups(master, {"CSW"}) == k_groups(base, {"CSW"})
+
+
+def test_k_an_unrelated_record_changes_no_other_security() -> None:
+    # Independence: the BKRPQ -> BKRP record concerns BKRP alone. It opens a BKRP piece with no
+    # bars (dropped), which shifts the resumed piece's key onto ZZZ. Today: ZZZ disappears.
+    # BKRP's own rows are excluded: the record changes them, rightly or not (see the world note);
+    # this test is about every other symbol.
+    base = k_build()
+    master = k_build(q_record=True)
+
+    assert k_rows(master, {"BKRP"}) == k_rows(base, {"BKRP"})
+    assert k_groups(master, {"BKRP"}) == k_groups(base, {"BKRP"})
+
+
+K_AS_OF = et_midnight(date(2020, 12, 1))  # before CSW's switch, the Q record and the takeover
+
+
+def test_k_leak_future_records_do_not_hide_a_symbol_already_visible() -> None:
+    # Leakage: on 2020-12-01 a reader has ZZZ's bars since January; CSW's new filer (2021-01-04)
+    # and TKR -> RLB (2021-06-01) are in the future. The build from the inputs knowable then
+    # shows ZZZ; the full build, read at the same instant, must show the same row. Today the
+    # future CIK switch drops a piece, the resumed piece lands on ZZZ's key and the full build
+    # has no ZZZ for any reader -- the truncation audit's YPF / YQ / YOU.
+    full = k_inputs(cik_switch=True)
+    bars, sec, changes, _ = truncate_inputs(**full, overrides=(), as_of=K_AS_OF)
+    truncated, _ = build_security_master(bars=bars, sec_history=sec, name_changes=changes)
+    master, _ = build_security_master(**full)
+
+    def zzz_seen(table: pa.Table) -> list[dict[str, Any]]:
+        rows = [r for r in mask_master(table, K_AS_OF).to_pylist() if r["symbol"] == "ZZZ"]
+        return [{k: v for k, v in r.items() if k != "security_id"} for r in rows]
+
+    assert len(zzz_seen(truncated)) == 1
+    assert zzz_seen(master) == zzz_seen(truncated)
+    assert_nothing_known_before_its_valid_from(master)
+
+
+def test_k_piece_keys_are_unique_when_rule_r_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # White-box (the invariant behind the three behavioural tests above): every key handed to
+    # _relabelled_pieces names one piece. The wrapper only records the keys at the call and
+    # then calls the real function. Today: the resumed RLB piece and ZZZ both carry key 7.
+    seen: list[list[int]] = []
+    real = sm._relabelled_pieces
+
+    def recording(con: Any, pieces: list[Any], edges: Any) -> dict[int, int]:
+        seen.append([p.key for p in pieces])
+        return real(con, pieces, edges)
+
+    monkeypatch.setattr(sm, "_relabelled_pieces", recording)
+    build_security_master(**k_inputs(cik_switch=True))
+
+    [keys] = seen
+    assert len(keys) == len(set(keys)), sorted(keys)
