@@ -254,8 +254,11 @@ the securities ever in the liquid tier: the daily price rows each security shows
 (open, high, low, close, volume and the split recorded for the bar's symbol, whatever symbol
 the row came through) and the CIK each symbol shows on each day. When II-VI took the ticker
 COHR in 2022, the two masters group the segments differently but read the same prices for
-II-VI, so that leak changes nothing; the full master giving Barnes Group's 2020-2025 history
-Barrick's CIK (Barrick took the ticker B in 2025) changes 1,345 days of filings. Every
+II-VI, so that leak changes nothing. B's 2020-2025 bars are Barrick's prices (closes of $13-30,
+moved there when Barrick took the ticker from Barnes Group in 2025): the full master files them
+under Barrick's CIK, while a rebuild in mid-2025, not yet knowing that A-Mark's later move to
+GOLD overwrote Barrick's old ticker, still files them under Barnes Group's, which differs on
+1,345 days of filings. Every
 differing (security, day) price cell and (symbol, day) CIK cell is attributed to the leak
 keys of the same instant whose segments its rows name; `configs/truncation_impact_baseline.txt`
 holds the cells each known key covers summed over the fixed instants (`KEY price=N cik=M`, so
