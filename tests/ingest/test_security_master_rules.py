@@ -1445,3 +1445,140 @@ def test_k_piece_keys_are_unique_when_rule_r_runs(monkeypatch: pytest.MonkeyPatc
 
     [keys] = seen
     assert len(keys) == len(set(keys)), sorted(keys)
+
+
+# =============================================================================================
+# Z: an opening segment takes a CIK from before its start only if the label is still listed
+# =============================================================================================
+# _segment_cik_rows' fallback for an opening segment with no SEC row inside it ("its SEC rows
+# then sit before valid_from") returns the label's last SEC row before valid_from, however old.
+# Real store (2026-10-21): 257 segments take a CIK from a row separated from their start by
+# 1..67 snapshots in which the label is not listed (median 58): ABAT 2023-09-21..10-02 gets
+# 745651 (Advanced Battery Technologies, last listed 2020-06-01; the segment is American Battery
+# Technology, 1576873); PATH 2021-04-21 (UiPath IPO) gets 1375200 from a 2020-06-01 row; RKT
+# 2020-08-06 gets 230498 and LI 2020-07-30 gets 737874 (last rows 2020-06-01, gone from the
+# 2020-07-10 snapshot). The legitimate case (33 real segments): the label is listed in the
+# snapshot right before the segment starts (segments starting 2020-01-02 whose label is in the
+# 2019-12-03 snapshot).
+#
+# Expected rule: the fallback uses the CIK only if the label is listed under it in the LAST SEC
+# snapshot of the whole table dated before valid_from; otherwise the segment has no CIK
+# (cik None, cik_available_at None). Rows inside the segment are unaffected.
+#
+# Fake data provenance: ABAT / 745651, LI / 737874 and their last-listed snapshot 2020-06-01
+# are real; the snapshot dates 2019-10-02, 2019-12-03, 2020-01-13, 2020-06-01, 2020-07-10,
+# 2020-08-03 are real SEC snapshot dates (2019-11-01 and 2019-12-20 are constructed); the
+# monthly 2020-01..2023-10 grid (3rd of each month) is constructed and stands in for the real,
+# irregular snapshot calendar. XYZ / 111 and the
+# filler label OTHR / 999 (listed throughout so that every snapshot exists in the table) are
+# constructed. Bars: ABAT 2023-09-21..10-02 and LI from 2020-07-30 are the real first bars;
+# levels are constructed.
+#
+# Real-data checks (the fake worlds cannot show these): after the fix, rebuild the real store
+# and confirm (1) the 257 segments above have cik None unless a row inside them gives one
+# (ABAT, PATH, RKT, LI in particular); (2) the 33 segments whose label is in the immediately
+# preceding snapshot keep their CIK; (3) the truncation audit shows no new "cik" diff.
+
+Z_OTHER: Life = ("OTHR", 999, date(2019, 1, 1), None)  # constructed filler
+
+
+def z_build(sec: pa.Table, bars: pa.Table) -> pa.Table:
+    master, _ = build_security_master(
+        bars=bars, sec_history=sec, name_changes=name_changes_table([])
+    )
+    return master
+
+
+def test_z_label_listed_in_the_snapshot_before_the_segment_keeps_its_cik() -> None:
+    # Normal path / guard (passes today, must keep passing): XYZ is listed in every snapshot
+    # of the table, the last of which (2019-12-03) is right before the first bar.
+    snapshots = [date(2019, 10, 2), date(2019, 11, 1), date(2019, 12, 3)]
+    sec = sec_table(snapshots, [("XYZ", 111, date(2019, 10, 2), None), Z_OTHER])
+    master = z_build(sec, bars_table(bar_rows("XYZ", date(2020, 1, 2), date(2020, 6, 30), 15.0)))
+
+    [seg] = segments(master, "XYZ")
+    assert seg["valid_from"] == date(2020, 1, 2)
+    assert seg["cik"] == 111
+    assert seg["cik_available_at"] == bar_available_at(date(2020, 1, 2))  # clamped to the bar
+
+
+Z_MONTHLY = [date(y, m, 3) for y in range(2020, 2024) for m in range(1, 13)][: 12 * 3 + 10]
+Z_ABAT_OLD = 745651  # real: Advanced Battery Technologies
+Z_ABAT_LAST = date(2020, 6, 1)  # real: last snapshot listing ABAT under 745651
+Z_ABAT_FIRST = date(2023, 9, 21)  # real: first bar of the 2023 segment
+Z_ABAT_END = date(2023, 10, 2)  # real
+
+
+def z_abat_sec() -> pa.Table:
+    snapshots = sorted({*Z_MONTHLY, Z_ABAT_LAST})
+    return sec_table(snapshots, [("ABAT", Z_ABAT_OLD, date(2020, 1, 3), Z_ABAT_LAST), Z_OTHER])
+
+
+def z_abat_bars() -> pa.Table:
+    return bars_table(bar_rows("ABAT", Z_ABAT_FIRST, Z_ABAT_END, 4.0))
+
+
+def test_z_zombie_cik_from_years_before_the_segment_is_not_used() -> None:
+    # ABAT was last listed under 745651 on 2020-06-01; 40 snapshots later (none listing ABAT)
+    # a new company trades as ABAT. No SEC row falls inside the segment -> no CIK.
+    # Today: cik 745651.
+    assert Z_MONTHLY[-1] == date(2023, 10, 3)
+    [seg] = segments(z_build(z_abat_sec(), z_abat_bars()), "ABAT")
+
+    assert seg["valid_from"] == Z_ABAT_FIRST
+    assert seg["cik"] is None
+    assert seg["cik_available_at"] is None
+
+
+def test_z_one_snapshot_gap_is_enough_to_drop_the_cik() -> None:
+    # Boundary (LI / RKT shape): LI listed under 737874 to 2020-06-01, absent from the next
+    # snapshot 2020-07-10 (the last one before the first bar 2020-07-30) and from 2020-08-03.
+    # Today: cik 737874.
+    snapshots = [date(2020, 1, 13), date(2020, 6, 1), date(2020, 7, 10), date(2020, 8, 3)]
+    sec = sec_table(snapshots, [("LI", 737874, date(2020, 1, 13), date(2020, 6, 1)), Z_OTHER])
+    master = z_build(sec, bars_table(bar_rows("LI", date(2020, 7, 30), date(2020, 12, 31), 15.0)))
+
+    [seg] = segments(master, "LI")
+    assert seg["cik"] is None
+    assert seg["cik_available_at"] is None
+
+
+def test_z_last_snapshot_is_the_tables_not_the_labels() -> None:
+    # Boundary: the label's own last row (2019-12-03) is the snapshot right before the
+    # segment in the label's history, but the table has a later snapshot (2019-12-20, OTHR
+    # only) before the first bar -> the label was not listed in the last snapshot -> no CIK.
+    # Today: cik 111.
+    snapshots = [date(2019, 10, 2), date(2019, 12, 3), date(2019, 12, 20)]
+    sec = sec_table(snapshots, [("XYZ", 111, date(2019, 10, 2), date(2019, 12, 3)), Z_OTHER])
+    master = z_build(sec, bars_table(bar_rows("XYZ", date(2020, 1, 2), date(2020, 6, 30), 15.0)))
+
+    [seg] = segments(master, "XYZ")
+    assert seg["cik"] is None
+
+
+Z_AS_OF = et_midnight(date(2023, 9, 28))  # a week into the ABAT segment
+
+
+def test_z_leak_full_and_truncated_builds_agree_there_is_no_cik() -> None:
+    # Leakage: on 2023-09-28 a reader sees ABAT's first bars and every SEC snapshot up to
+    # 2023-09-03; the later snapshot (2023-10-03) is in the future. Neither the truncated build
+    # nor the full build read at the same instant may show the 2020 CIK. Today: both show
+    # 745651.
+    bars, sec, changes, _ = truncate_inputs(
+        bars=z_abat_bars(),
+        sec_history=z_abat_sec(),
+        name_changes=name_changes_table([]),
+        overrides=(),
+        as_of=Z_AS_OF,
+    )
+    truncated = z_build(sec, bars)
+    full = z_build(z_abat_sec(), z_abat_bars())
+
+    def abat_seen(master: pa.Table) -> list[dict[str, Any]]:
+        rows = mask_master(master, Z_AS_OF).to_pylist()
+        return [
+            {k: r[k] for k in ("cik", "cik_available_at")} for r in rows if r["symbol"] == "ABAT"
+        ]
+
+    assert abat_seen(truncated) == [{"cik": None, "cik_available_at": None}]
+    assert abat_seen(full) == abat_seen(truncated)

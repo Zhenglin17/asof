@@ -148,7 +148,10 @@ took it in 2025) and joins the taker, knowable only from the takeover record, so
 2023 sees no segment for those bars rather than Barrick under a ticker it did not yet have;
 otherwise the two stay separate securities. A filer that renamed off a label takes its CIK
 along, however long the SEC table keeps listing it there (Xperi Holding became Adeia the day
-the spun-off Xperi Inc. took XPER). Every conflict the build reports carries a `resolution`
+the spun-off Xperi Inc. took XPER). A segment takes a CIK from snapshots before it only
+while the label is still listed in the last snapshot before it: ABAT trading again in 2023 is
+American Battery Technology, not Advanced Battery Technologies, last listed under ABAT in
+2020. Every conflict the build reports carries a `resolution`
 (`new_security`, `bridged`, `ignored`, `relabelled`, `unresolved`); the unresolved ones wait
 for a human, and so does each relabelled merge, once, since a coincidence of prices could
 produce the same absence of bars. `asof market instruments` then tags each segment with an

@@ -53,6 +53,7 @@ A CIK reached through another spelling is not known before the SEC writes the la
 
 import os
 import re
+from bisect import bisect_left
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -1764,6 +1765,7 @@ def _segment_cik(
     presence: list[tuple[date, int]],
     left: int | None = None,
     spelled: Mapping[int, date] | None = None,
+    last_snapshot: date | None = None,
 ) -> tuple[int | None, datetime | None]:
     """The segment's CIK and the snapshot instant that first showed it (00:00 New York).
 
@@ -1773,15 +1775,18 @@ def _segment_cik(
     are not the new holder's.
 
     ``spelled``: per CIK, the first snapshot writing this label's own spelling when some rows
-    reached it from another one (``spelling_known_since``); the CIK is not known before it."""
-    cik, since = _segment_cik_rows(seg, presence, left)
+    reached it from another one (``spelling_known_since``); the CIK is not known before it.
+
+    ``last_snapshot``: the table's last snapshot before the segment starts; rows before the
+    segment count only if the label is listed there."""
+    cik, since = _segment_cik_rows(seg, presence, left, last_snapshot)
     if cik is not None and since is not None and spelled and cik in spelled:
         since = max(since, _midnight(spelled[cik]))
     return cik, since
 
 
 def _segment_cik_rows(
-    seg: _Segment, presence: list[tuple[date, int]], left: int | None
+    seg: _Segment, presence: list[tuple[date, int]], left: int | None, last_snapshot: date | None
 ) -> tuple[int | None, datetime | None]:
     inside = [
         (day, cik)
@@ -1802,8 +1807,16 @@ def _segment_cik_rows(
     ]
     # A label's opening segment may predate our bars; its SEC rows then sit before valid_from.
     # Only trust them when nothing says the label changed hands since (no start edge, not a
-    # resumption: the ETF that took INTL is not StoneX, whose rows sit before it).
-    if before and seg.start is None and not seg.cik_cut and not seg.resumed:
+    # resumption: the ETF that took INTL is not StoneX, whose rows sit before it), and only
+    # while the label is still listed in the last snapshot before it: ABAT's 2023 piece is not
+    # Advanced Battery Technologies, last listed under ABAT on 2020-06-01.
+    if (
+        before
+        and before[-1][0] == last_snapshot
+        and seg.start is None
+        and not seg.cik_cut
+        and not seg.resumed
+    ):
         return before[-1][1], _midnight(before[-1][0])
     return None, None
 
@@ -1960,8 +1973,13 @@ def build_security_master(
             # let a reader who may not yet know the end see that one is coming.
             leaver = leavers.get((p.symbol, p.valid_from)) if p.start is not None else None  # type: ignore[arg-type]
             left = leaver.cik if leaver is not None and not _round_trip(leaver, p) else None
+            at = bisect_left(snapshots, p.valid_from) if p.valid_from is not None else 0
             p.cik, p.cik_since = _segment_cik(
-                p, presence.get(p.symbol, []), left, spelled_since.get(p.symbol)
+                p,
+                presence.get(p.symbol, []),
+                left,
+                spelled_since.get(p.symbol),
+                snapshots[at - 1] if at else None,
             )
             if p.end is not None and p.valid_to is not None:
                 leavers[(p.symbol, p.valid_to)] = p
