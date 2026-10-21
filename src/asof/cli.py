@@ -23,6 +23,7 @@ from asof.ingest.bars import ET, Partition, backfill, windows_for_requests
 from asof.ingest.corporate_actions import build_tables, download_all
 from asof.ingest.http import make_fetch
 from asof.ingest.instrument_class import (
+    CLASS_FILE,
     CLASSES,
     load_class_overrides,
     load_rules,
@@ -58,6 +59,7 @@ from asof.ingest.sec_tickers import (
 )
 from asof.ingest.security_master import (
     MASTER_FILE,
+    MASTER_SCHEMA,
     build_from_inputs,
     build_from_store,
     load_overrides,
@@ -65,6 +67,7 @@ from asof.ingest.security_master import (
     write_master,
 )
 from asof.ingest.tickers import is_valid_symbol, normalize_ticker
+from asof.ingest.truncation_impact import run_impact, summarize, unmatched_leaks
 from asof.ingest.universe import (
     EXCHANGE_DIR,
     HISTORY_PATH,
@@ -87,7 +90,7 @@ from asof.store.audit import (
 )
 from asof.store.db import default_data_dir, default_db_path, init_db, make_engine
 from asof.store.entities import EntityConflict, upsert_entities
-from asof.store.market import bars_status, market_root
+from asof.store.market import bars_status, market_root, visible_splits
 from asof.store.models import EntityKind
 from asof.store.universe import (
     LIQUID_CLASSES,
@@ -975,3 +978,140 @@ def market_truncation(
     if not verdict.ok:
         raise typer.Exit(code=2)
     typer.echo("no leak outside the baseline and the exceptions")
+
+
+@market_app.command("truncation-impact")
+def market_truncation_impact(
+    as_of: Annotated[
+        list[datetime] | None,
+        typer.Option(
+            "--as-of",
+            help="Instant to rebuild at (date = 00:00 New York); repeatable. "
+            "Default: the instants in --instants.",
+        ),
+    ] = None,
+    overrides: Annotated[Path, typer.Option(help="Human decisions applied last.")] = Path(
+        "configs/security_overrides.yaml"
+    ),
+    baseline: Annotated[Path, typer.Option(help="Known leaks to summarise per key.")] = Path(
+        "configs/truncation_baseline.txt"
+    ),
+    instants_file: Annotated[
+        Path, typer.Option("--instants", help="Instants of a default run (fixed by hand).")
+    ] = Path("configs/truncation_instants.txt"),
+    jobs: Annotated[
+        int | None,
+        typer.Option(
+            "--jobs", help="Rebuilds run at once (default: the smaller of 4 and the cores)."
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Measure what the truncation leaks change for a backtest: per instant, the price rows of
+    liquid-tier securities and the CIKs of their symbols that the full master shows otherwise
+    than a build from the inputs knowable then (leak) or not yet (delay). Rows go to
+    <market>/audit/truncation_impact/<UTC instant>.parquet, the per-baseline-key summary to
+    summary.parquet. A measurement: exit 0 whatever it finds."""
+    root = _market_root(data_dir)
+    if not overrides.exists():
+        _fail(f"{overrides}: overrides file not found (run from the repo root or pass --overrides)")
+    if not baseline.exists():  # a mistyped path would summarise no key: "nothing matters"
+        _fail(f"{baseline}: baseline file not found")
+    try:
+        decisions = load_overrides(overrides)
+        known = load_baseline(baseline)
+        fixed_instants = load_instants(instants_file)
+    except ValueError as error:
+        _fail(str(error))
+    # before a minute of building: the liquid tier reads the master and the classes, and a
+    # missing split file would read as "no split", hiding a leak through one
+    splits_file = root / "corporate_actions" / "splits.parquet"
+    for needed in (root / MASTER_FILE, root / CLASS_FILE, splits_file):
+        if not needed.exists():
+            _fail(f"{needed}: not found (build the store first)")
+    cores = _cores()
+    if jobs is None:
+        jobs = min(4, cores)  # the same rebuilds as `market truncation`: memory bounds it
+    elif not 1 <= jobs <= cores:
+        _fail(f"--jobs must be between 1 and {cores} (the cores here), got {jobs}")
+    instants = (
+        sorted({_as_of_option(t).astimezone(UTC) for t in as_of}) if as_of else fixed_instants
+    )
+    if not instants:
+        _fail(f"{instants_file}: no instants (pass --instants or --as-of)")
+    started = time.monotonic()
+    inputs = load_store_inputs(root)
+    full, _ = build_from_inputs(inputs, decisions)
+    # the liquid tier names the ids of the master on disk; the full master here must be it
+    on_disk = pq.read_table(root / MASTER_FILE).select(MASTER_SCHEMA.names)
+    order = [("security_id", "ascending"), ("symbol", "ascending"), ("valid_from", "ascending")]
+    if not on_disk.sort_by(order).equals(full.select(MASTER_SCHEMA.names).sort_by(order)):
+        _fail(
+            f"{root / MASTER_FILE} is not the master these inputs build: run `asof market identity`"
+        )
+    # the tier through the last fixed instant whatever this run picks: a partial run then
+    # measures the same securities as the full one
+    last = max([*fixed_instants, *instants]).astimezone(ET).date()
+    con = duckdb.connect()
+    try:
+        tier = tier_union(con, root, date(2020, 1, 1), last)
+        splits = visible_splits(con, root, instants[-1])
+    except (ValueError, FileNotFoundError) as error:
+        _fail(str(error))
+    finally:
+        con.close()
+    liquid = set(tier.column("security_id").to_pylist())
+    out_dir = root / "audit" / "truncation_impact"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    partial = bool(as_of)
+    if not partial:  # an instant dropped from --instants must not pass for part of this run
+        for stale in out_dir.glob("[0-9]*T*.parquet"):
+            stale.unlink()
+    typer.echo(
+        f"full master {full.num_rows:,} segments; {len(liquid):,} securities ever liquid "
+        f"2020-01..{last:%Y-%m}; {len(instants)} instants"
+    )
+
+    def record(t: datetime, rows: pa.Table) -> None:
+        path = out_dir / f"{t:%Y%m%dT%H%M%S%f}.parquet"
+        tmp = path.with_name(path.name + ".tmp")
+        pq.write_table(rows, tmp)
+        os.replace(tmp, path)
+        counts = {
+            (kind, what): sum(
+                r["days"] for r in rows.to_pylist() if (r["kind"], r["what"]) == (kind, what)
+            )
+            for kind in ("leak", "delay")
+            for what in ("price", "cik")
+        }
+        typer.echo(
+            f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leak days price "
+            f"{counts['leak', 'price']:>6,} cik {counts['leak', 'cik']:>6,}  delay days price "
+            f"{counts['delay', 'price']:>6,} cik {counts['delay', 'cik']:>6,}  "
+            f"{time.monotonic() - started:,.0f}s"
+        )
+
+    try:
+        results = run_impact(
+            full, inputs, decisions, splits, instants, liquid=liquid, jobs=jobs, progress=record
+        )
+    except BrokenProcessPool:
+        _fail(f"a worker died (most often out of memory): try a smaller --jobs than {jobs}")
+    summary = summarize(known, results)
+    # summary.parquet speaks for the fixed instants only; a partial run must not replace it
+    path = out_dir / ("summary-partial.parquet" if partial else "summary.parquet")
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(summary, tmp)
+    os.replace(tmp, path)
+    with_leak = sum(1 for r in summary.to_pylist() if r["price_leak_days"] + r["cik_leak_days"] > 0)
+    typer.echo(f"rows -> {out_dir}/<instant>.parquet, {path}; {time.monotonic() - started:,.0f}s")
+    typer.echo(
+        f"{summary.num_rows:,} baseline keys: {with_leak:,} with a leak impact, "
+        f"{summary.num_rows - with_leak:,} without"
+    )
+    typer.echo(
+        f"{unmatched_leaks(known, results):,} leak rows name no baseline key's segment "
+        "(their cell may still be named through its other side's rows)"
+    )

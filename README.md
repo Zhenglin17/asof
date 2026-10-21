@@ -41,7 +41,8 @@ Any violation is look-ahead leakage and is treated as a bug.
       liquid tier, and hand-checked reference histories asserted as tests against it
 - [x] Truncation test: the security master rebuilt from only the inputs knowable at an
       instant and compared with what the full master shows then; every identity fact (a
-      segment, its end, its CIK) carries the instant it became knowable
+      segment, its end, its CIK) carries the instant it became knowable; each leak weighed by
+      whether it changes a price row or a CIK a backtest reads
 - [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
@@ -100,6 +101,7 @@ uv run asof market liquid --from 2020-01-01 --to 2026-10-01   # one tier per mon
 uv run asof market audit                 # count every kind of data error found so far
 uv run asof market truncation            # rebuild the security master as of past instants and diff
 uv run asof market truncation --jobs 2   # 2 processes (default: 4 or fewer cores; 4 take 22 GB)
+uv run asof market truncation-impact     # which of those leaks change the prices or CIKs a backtest reads
 ```
 
 The universe is the union of every symbol Alpaca lists, every ticker that appeared in an SEC
@@ -232,8 +234,9 @@ is knowable only at 20:00 (CXAIV -> CXAI on 2023-03-15): a segment is now never 
 before its first bar, and a takeover's relabelled history not before the taker's. The
 default instants are fixed in `configs/truncation_instants.txt`: computed ones move whenever
 the master changes, and a leak seen only at an instant that moved away would look fixed.
-The store is read once and the 66 rebuilds run in forked worker processes (8.5 minutes with six, against 40 serially, with identical reports). Leaks are weighed by what a backtest reads (which security a bar belongs to, which CIK a
-ticker names), not by every field of the master. Diffs go to
+The store is read once and the 66 rebuilds run in forked worker processes (about 11.5
+minutes with four, against 40 serially, with identical reports; six ran a 31 GB machine out
+of memory). Diffs go to
 `$ASOF_DATA_DIR/market/audit/truncation/<instant>.parquet`. Reviewed and accepted leaks go
 into `configs/truncation_exceptions.yaml`; leaks known but not fixed yet sit in
 `configs/truncation_baseline.txt`, a ratchet whose count may only shrink. The command exits
@@ -241,6 +244,18 @@ into `configs/truncation_exceptions.yaml`; leaks known but not fixed yet sit in
 longer occurs (`--prune-baseline` deletes those; lines are only added by hand). The same
 comparison runs in the test suite on every hand-built identity scenario at every instant at
 which its master or its inputs change, against a baseline of its own.
+
+Most leaks change nothing a backtest reads. `asof market truncation-impact` rebuilds the
+same 66 instants and compares only the two things a backtest takes from the master, for the
+securities ever in the liquid tier: the daily price rows each security shows on each day
+(open, high, low, close, volume and the split recorded for the bar's symbol, whatever symbol
+the row came through) and the CIK each symbol shows on each day. When II-VI took the ticker
+COHR in 2022, the two masters group the segments differently but read the same prices for
+II-VI, so that leak changes nothing; the full master giving Barnes Group's 2020-2025 history
+Barrick's CIK (Barrick took the ticker B in 2025) changes 1,345 days of filings. On the real
+store 44 of the 248 known leaks change a price or a CIK. Rows go to
+`$ASOF_DATA_DIR/market/audit/truncation_impact/<instant>.parquet`, one row per baseline key
+to `summary.parquet` (`summary-partial.parquet` for a run on chosen instants).
 
 ## Layout
 
