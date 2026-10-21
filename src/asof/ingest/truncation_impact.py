@@ -21,8 +21,8 @@ class is a per-segment fact too and is not compared (the build has no class file
 """
 
 import tempfile
-from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
@@ -30,7 +30,7 @@ import duckdb
 import pyarrow as pa
 
 from asof.ingest import security_master as sm
-from asof.ingest.master_truncation import _aware, _canonical, mask_master
+from asof.ingest.master_truncation import _aware, _canonical, compare, mask_master
 from asof.parallel import parallel_map
 
 IMPACT_SCHEMA = pa.schema(
@@ -45,19 +45,9 @@ IMPACT_SCHEMA = pa.schema(
         ("last_day", pa.date32()),
         ("days", pa.int64()),  # distinct sessions, not the span
         ("detail", pa.string()),
-    ]
-)
-KEY_IMPACT_SCHEMA = pa.schema(
-    [
-        ("key", pa.string()),
-        # days over the rows a baseline key's segment touches, the largest at any one instant
-        # (the same days recur at every later instant)
-        ("price_leak_days", pa.int64()),
-        ("cik_leak_days", pa.int64()),
-        ("price_delay_days", pa.int64()),
-        ("cik_delay_days", pa.int64()),
-        ("instants_with_leak", pa.int64()),
-        ("example", pa.string()),  # "<instant> <detail>" of the first leak row
+        # the sorted distinct sessions of `days`: the gate counts and matches (security, day)
+        # cells, and one bar can sit in rows of two cells
+        ("sessions", pa.list_(pa.date32())),
     ]
 )
 _OWNER_SCHEMA = pa.schema(
@@ -77,6 +67,16 @@ _OWNER_SCHEMA = pa.schema(
 # each count on 25 GB. Above the limit joins and aggregates spill to disk.
 DUCKDB_MEMORY_LIMIT = "3GB"
 DUCKDB_THREADS = 4
+
+
+@dataclass(frozen=True)
+class InstantResult:
+    """One instant of the truncation test: ``diff`` (``master_truncation.DIFF_SCHEMA``) and
+    ``impact`` (``IMPACT_SCHEMA``) of the same build from the inputs knowable at ``as_of``."""
+
+    as_of: datetime
+    diff: pa.Table
+    impact: pa.Table
 
 
 def _owners(master: pa.Table, as_of: datetime) -> tuple[pa.Table, dict[str, str]]:
@@ -260,7 +260,8 @@ def impact_at(
                      ELSE
                        'truncated reads ' || security || ' through ' || symbol
                        || '; full has no such row'
-                   END AS detail
+                   END AS detail,
+                   list_sort(list(DISTINCT session_date)) AS sessions
             FROM r
             GROUP BY kind, what, security, symbol, full_segment, trunc_segment
             ORDER BY what, kind, symbol, first_day, security NULLS FIRST,
@@ -273,18 +274,22 @@ def impact_at(
     return found.cast(IMPACT_SCHEMA)
 
 
-def _impact_of(
+def _result_at(
     run: tuple[
         pa.Table, "sm.StoreInputs", list[Mapping[str, Any]], pa.Table, frozenset[str] | None
     ],
     t: datetime,
-) -> tuple[datetime, pa.Table]:
+) -> InstantResult:
     full, inputs, overrides, splits, liquid = run
     truncated, _ = sm.build_from_inputs(inputs, overrides, as_of=t)
-    return t, impact_at(full, truncated, inputs.bars, splits, t, liquid=liquid)
+    return InstantResult(
+        as_of=t,
+        diff=compare(full, truncated, t),
+        impact=impact_at(full, truncated, inputs.bars, splits, t, liquid=liquid),
+    )
 
 
-def run_impact(
+def run_instants(
     full: pa.Table,
     inputs: "sm.StoreInputs",
     overrides: Sequence[Mapping[str, Any]],
@@ -293,91 +298,22 @@ def run_impact(
     *,
     liquid: Collection[str] | None = None,
     jobs: int = 1,
-    progress: Callable[[datetime, pa.Table], None] | None = None,
-) -> list[tuple[datetime, pa.Table]]:
-    """``impact_at`` of the full master and a build from ``inputs`` truncated at each distinct
-    instant, sorted by instant (UTC), in ``jobs`` forked workers (``parallel_map``); the result
-    never depends on ``jobs``."""
+    progress: Callable[[InstantResult], None] | None = None,
+) -> list[InstantResult]:
+    """One build from ``inputs`` truncated at each distinct instant, and of it both ``compare``
+    with the full master and ``impact_at``; sorted by instant (UTC). ``jobs`` builds run at once
+    in forked workers that inherit the inputs (``parallel_map``); the result never depends on
+    it (``jobs=1`` runs in this process, the reference). ``progress`` sees each result in
+    instant order as soon as it and all earlier ones are done. A failed build raises here once
+    every earlier instant is done; queued builds are cancelled and running workers terminated."""
     if jobs < 1:
         raise ValueError(f"jobs must be at least 1, got {jobs}")
     ts = sorted({_aware(t) for t in instants})
     run = (full, inputs, list(overrides), splits, None if liquid is None else frozenset(liquid))
     return parallel_map(
-        _impact_of,
+        _result_at,
         run,
         ts,
         jobs=jobs,
-        progress=None if progress is None else lambda _, result: progress(*result),
-    )
-
-
-def _segments(keys: Iterable[str]) -> dict[str, list[str]]:
-    """``SYM:YYYY-MM-DD`` of each key ``SYM:YYYY-MM-DD:reason[:fields]``, sorted keys."""
-    by_segment: dict[str, list[str]] = defaultdict(list)
-    for key in sorted(set(keys)):
-        symbol, day = key.split(":")[:2]
-        by_segment[f"{symbol}:{day}"].append(key)
-    return by_segment
-
-
-def unmatched_leaks(keys: Iterable[str], results: Sequence[tuple[datetime, pa.Table]]) -> int:
-    """Leak rows whose segments match no key. A row is one side's evidence for a cell: the
-    cell may still be named through the other side's rows (real store 2026-10-20: 12 rows,
-    SUNE and DFNS bars the build filed into JCS's and BRLI's securities, whose full-side rows
-    match the PEGY and NUKK grouping keys). Zero means every leak row is named."""
-    by_segment = _segments(keys)
-    return sum(
-        1
-        for _, table in results
-        for r in table.to_pylist()
-        if r["kind"] == "leak"
-        and r["full_segment"] not in by_segment
-        and r["trunc_segment"] not in by_segment
-    )
-
-
-def summarize(keys: Iterable[str], results: Sequence[tuple[datetime, pa.Table]]) -> pa.Table:
-    """Per baseline key (``SYM:YYYY-MM-DD:reason[:fields]``), the impact rows its segment
-    touches (as ``full_segment`` or ``trunc_segment``; a row counts once): days per kind and
-    what, the largest at any one instant; how many instants show a leak; the first leak's
-    detail. One row per distinct key, sorted; ``KEY_IMPACT_SCHEMA``."""
-    wanted = sorted(set(keys))
-    by_segment = _segments(wanted)
-    days = {key: defaultdict(int) for key in wanted}
-    instants = dict.fromkeys(wanted, 0)
-    example: dict[str, str | None] = dict.fromkeys(wanted)
-    for t, table in sorted(results, key=lambda result: result[0]):
-        here: dict[str, defaultdict[tuple[str, str], int]] = defaultdict(lambda: defaultdict(int))
-        first_leak: dict[str, str] = {}
-        for r in table.to_pylist():
-            touched = {
-                key
-                for segment in {r["full_segment"], r["trunc_segment"]} - {None}
-                for key in by_segment.get(segment, ())
-            }
-            for key in touched:
-                here[key][(r["kind"], r["what"])] += r["days"]
-                if r["kind"] == "leak":
-                    first_leak.setdefault(key, r["detail"])
-        for key, counts in here.items():
-            for kind_what, n in counts.items():
-                days[key][kind_what] = max(days[key][kind_what], n)
-        for key, detail in first_leak.items():
-            instants[key] += 1
-            if example[key] is None:
-                example[key] = f"{t.isoformat()} {detail}"
-    return pa.Table.from_pylist(
-        [
-            {
-                "key": key,
-                "price_leak_days": days[key][("leak", "price")],
-                "cik_leak_days": days[key][("leak", "cik")],
-                "price_delay_days": days[key][("delay", "price")],
-                "cik_delay_days": days[key][("delay", "cik")],
-                "instants_with_leak": instants[key],
-                "example": example[key],
-            }
-            for key in wanted
-        ],
-        schema=KEY_IMPACT_SCHEMA,
+        progress=None if progress is None else lambda _, result: progress(result),
     )

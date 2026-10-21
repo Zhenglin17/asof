@@ -1,7 +1,6 @@
 """Command-line entry point. Subcommands are added as each pipeline stage lands."""
 
 import dataclasses
-import hashlib
 import os
 import time
 from concurrent.futures.process import BrokenProcessPool
@@ -11,7 +10,6 @@ from typing import Annotated, NoReturn
 
 import duckdb
 import httpx
-import pyarrow as pa
 import pyarrow.parquet as pq
 import typer
 from sqlmodel import Session
@@ -30,16 +28,7 @@ from asof.ingest.instrument_class import (
     write_instrument_class,
 )
 from asof.ingest.instrument_class import build_from_store as build_classes_from_store
-from asof.ingest.master_truncation import (
-    default_instants,
-    diff_key,
-    gate,
-    load_baseline,
-    load_instants,
-    load_truncation_exceptions,
-    prune_baseline,
-    run_instants,
-)
+from asof.ingest.master_truncation import default_instants, load_instants
 from asof.ingest.sec_ticker_history import (
     EXCHANGE_HISTORY_PATH,
     EXCHANGE_TARGET,
@@ -67,7 +56,17 @@ from asof.ingest.security_master import (
     write_master,
 )
 from asof.ingest.tickers import is_valid_symbol, normalize_ticker
-from asof.ingest.truncation_impact import run_impact, summarize, unmatched_leaks
+from asof.ingest.truncation_gate import (
+    ImpactCount,
+    attribute,
+    baseline_fingerprint,
+    gate,
+    instants_fingerprint,
+    load_impact_baseline,
+    prune_impact_baseline,
+    rebase_impact_baseline,
+)
+from asof.ingest.truncation_impact import InstantResult, run_instants
 from asof.ingest.universe import (
     EXCHANGE_DIR,
     HISTORY_PATH,
@@ -841,22 +840,29 @@ def market_truncation(
         typer.Option(
             "--as-of",
             help="Instant to rebuild at (date = 00:00 New York); repeatable. "
-            "Default: the instants in --instants, else the named instants plus each "
-            "evidence kind's spread.",
+            "Default: the instants in --instants.",
         ),
     ] = None,
     overrides: Annotated[Path, typer.Option(help="Human decisions applied last.")] = Path(
         "configs/security_overrides.yaml"
     ),
-    exceptions: Annotated[Path, typer.Option(help="Reviewed leaks.")] = Path(
-        "configs/truncation_exceptions.yaml"
-    ),
-    baseline: Annotated[Path, typer.Option(help="Known leaks not fixed yet (a ratchet).")] = Path(
-        "configs/truncation_baseline.txt"
-    ),
+    baseline: Annotated[
+        Path, typer.Option(help="Known leak impact per key, only ever lowered (a ratchet).")
+    ] = Path("configs/truncation_impact_baseline.txt"),
     prune: Annotated[
         bool,
-        typer.Option("--prune-baseline", help="Delete baseline keys that no longer occur."),
+        typer.Option(
+            "--prune-baseline",
+            help="Delete keys without impact and lower the numbers that shrank.",
+        ),
+    ] = False,
+    rebase: Annotated[
+        bool,
+        typer.Option(
+            "--rebase-baseline",
+            help="After --instants changed: re-sum every baseline number over the new list "
+            "(each change is printed; new keys are still added by hand).",
+        ),
     ] = False,
     instants_file: Annotated[
         Path, typer.Option("--instants", help="Instants of a default run (fixed by hand).")
@@ -872,7 +878,7 @@ def market_truncation(
         int | None,
         typer.Option(
             "--jobs",
-            help="Rebuilds run at once (default: the smaller of 4 and the cores; 4 take 22 GB, "
+            help="Rebuilds run at once (default: the smaller of 4 and the cores; 4 take 23 GB, "
             "6 ran out of 31 GB).",
         ),
     ] = None,
@@ -880,21 +886,44 @@ def market_truncation(
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
     ] = None,
 ) -> None:
-    """Rebuild the security master from the inputs knowable at each instant and diff it with the
-    full master as seen then. Exit 0 when every leak is in the baseline or the exceptions and,
-    on a default run, every baseline key still occurs; 2 when not. Rows go to
-    <market>/audit/truncation/<UTC instant>.parquet."""
+    """Rebuild the security master from the inputs knowable at each instant, diff it with the
+    full master as seen then, and measure what the leaks change for a backtest: the price cells
+    of liquid-tier securities and the CIKs of their symbols. Exit 0 when every leak's impact is
+    within the baseline and every leak cell is named by a diff key; 2 when not (on a default run
+    also when a baseline key has no impact left). Rows go to <market>/audit/truncation/ and
+    <market>/audit/truncation_impact/, one <UTC instant>.parquet each."""
     root = _market_root(data_dir)
     if not overrides.exists():
         _fail(f"{overrides}: overrides file not found (run from the repo root or pass --overrides)")
     try:
         decisions = load_overrides(overrides)
-        reviewed = load_truncation_exceptions(exceptions)
-        known = load_baseline(baseline)
+        known = load_impact_baseline(baseline)
+        recorded = baseline_fingerprint(baseline)
         fixed_instants = load_instants(instants_file)
-        gate([], baseline=known, exceptions=reviewed, full_run=False)  # overlap, before 26 min
     except ValueError as error:
         _fail(str(error))
+    # the baseline's numbers are sums over the instants named in its header: on any other list
+    # they can be neither exceeded nor undercut
+    fixed_print = instants_fingerprint(fixed_instants)
+    # a non-empty baseline without the line names no list: as good as another one
+    drifted = bool(known) and recorded != fixed_print
+    if prune and rebase:
+        _fail("--prune-baseline and --rebase-baseline exclude each other")
+    if prune and drifted:
+        _fail(
+            f"{instants_file} (fingerprint {fixed_print}) is not the list {baseline}'s numbers "
+            f"were summed over ({recorded or 'none recorded'}): --prune-baseline would drop "
+            "leaks seen only at the instants removed. Re-sum them with --rebase-baseline"
+        )
+    if rebase and not drifted:
+        # re-summing over the same list could only raise numbers past what the gate allows
+        _fail(f"{baseline} is summed over {instants_file} already: nothing to rebase")
+    # before a minute of building: the liquid tier reads the master and the classes, and a
+    # missing split file would read as "no split", hiding a leak through one
+    splits_file = root / "corporate_actions" / "splits.parquet"
+    for needed in (root / MASTER_FILE, root / CLASS_FILE, splits_file):
+        if not needed.exists():
+            _fail(f"{needed}: not found (build the store first)")
     cores = _cores()
     if jobs is None:
         jobs = min(4, cores)  # memory bounds it (~6 GB per late instant); CI has 2-4 cores
@@ -902,13 +931,21 @@ def market_truncation(
         _fail(f"--jobs must be between 1 and {cores} (the cores here), got {jobs}")
     if as_of and computed:
         _fail("--as-of and --computed-instants exclude each other")
-    if prune and (as_of or computed):
-        _fail("--prune-baseline needs the fixed instants: a partial run cannot tell fixed")
+    if (prune or rebase) and (as_of or computed):
+        flag = "--prune-baseline" if prune else "--rebase-baseline"
+        _fail(f"{flag} needs the fixed instants: a partial run cannot tell fixed")
     if not as_of and not computed and not fixed_instants:
         _fail(f"{instants_file}: no instants (pass --instants, --as-of or --computed-instants)")
     started = time.monotonic()
     inputs = load_store_inputs(root)
     full, _ = build_from_inputs(inputs, decisions)
+    # the liquid tier names the ids of the master on disk; the full master here must be it
+    on_disk = pq.read_table(root / MASTER_FILE).select(MASTER_SCHEMA.names)
+    order = [("security_id", "ascending"), ("symbol", "ascending"), ("valid_from", "ascending")]
+    if not on_disk.sort_by(order).equals(full.select(MASTER_SCHEMA.names).sort_by(order)):
+        _fail(
+            f"{root / MASTER_FILE} is not the master these inputs build: run `asof market identity`"
+        )
     if as_of:
         instants = sorted({_as_of_option(t).astimezone(UTC) for t in as_of})
     elif not computed:
@@ -922,135 +959,18 @@ def market_truncation(
             )
     else:
         instants = default_instants(full)
-    out_dir = root / "audit" / "truncation"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    typer.echo(f"full master {full.num_rows:,} segments; {len(instants)} instants")
-    first_at: dict[str, str] = {}
-
-    def record(t: datetime, diff: pa.Table) -> None:
-        path = out_dir / f"{t:%Y%m%dT%H%M%S%f}.parquet"
-        tmp = path.with_name(path.name + ".tmp")
-        pq.write_table(diff, tmp)
-        os.replace(tmp, path)
-        leaks = [r for r in diff.to_pylist() if r["kind"] == "leak"]
-        for r in leaks:
-            first_at.setdefault(diff_key(r), f"{t.astimezone(ET):%Y-%m-%d %H:%M} {r['detail']}")
-        typer.echo(
-            f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leaks {len(leaks):>5,}  "
-            f"delays {diff.num_rows - len(leaks):>5,}  {time.monotonic() - started:,.0f}s"
-        )
-
-    try:
-        run_instants(full, inputs, decisions, instants, jobs=jobs, progress=record)
-    except ValueError as error:
-        _fail(str(error))
-    except BrokenProcessPool:
-        _fail(f"a worker died (most often out of memory): try a smaller --jobs than {jobs}")
     # only the fixed list stands for every instant: the computed one drifts with the master
-    full_run = not as_of and not computed
-    verdict = gate(first_at, baseline=known, exceptions=reviewed, full_run=full_run)
-    # default instants follow the data: a key gone from them may still occur elsewhere
-    fingerprint = hashlib.sha256("|".join(t.isoformat() for t in instants).encode()).hexdigest()
-    typer.echo(f"{len(instants)} instants, fingerprint {fingerprint[:12]}")
-    typer.echo(f"rows -> {out_dir}/<instant>.parquet; {time.monotonic() - started:,.0f}s")
-    for key in verdict.stale_exceptions:
-        typer.echo(f"stale exception: {key} ({reviewed[key]})")
-    if prune and verdict.new:
-        for key in verdict.new[:50]:
-            typer.echo(f"  new leak: {key}  first at {first_at[key]}")
-        _fail(f"{len(verdict.new):,} new leaks: review them before pruning the baseline")
-    if prune and verdict.fixed:
-        try:
-            removed = prune_baseline(baseline, verdict.fixed)
-        except ValueError as error:
-            _fail(str(error))
-        typer.echo(f"pruned {removed:,} keys no longer occurring from {baseline}")
-        verdict = dataclasses.replace(verdict, fixed=[])
-    typer.echo(
-        f"{len(known):,} baseline keys, {len(reviewed):,} exceptions; "
-        f"{len(verdict.new):,} new, {len(verdict.fixed):,} no longer occurring"
-        + ("" if full_run else " (partial run: not checked)")
-    )
-    for key in verdict.fixed[:50]:
-        typer.echo(f"  no longer occurs at these instants (--prune-baseline): {key}")
-    for key in verdict.new[:50]:
-        typer.echo(f"  new leak: {key}  first at {first_at[key]}")
-    if not verdict.ok:
-        raise typer.Exit(code=2)
-    typer.echo("no leak outside the baseline and the exceptions")
-
-
-@market_app.command("truncation-impact")
-def market_truncation_impact(
-    as_of: Annotated[
-        list[datetime] | None,
-        typer.Option(
-            "--as-of",
-            help="Instant to rebuild at (date = 00:00 New York); repeatable. "
-            "Default: the instants in --instants.",
-        ),
-    ] = None,
-    overrides: Annotated[Path, typer.Option(help="Human decisions applied last.")] = Path(
-        "configs/security_overrides.yaml"
-    ),
-    baseline: Annotated[Path, typer.Option(help="Known leaks to summarise per key.")] = Path(
-        "configs/truncation_baseline.txt"
-    ),
-    instants_file: Annotated[
-        Path, typer.Option("--instants", help="Instants of a default run (fixed by hand).")
-    ] = Path("configs/truncation_instants.txt"),
-    jobs: Annotated[
-        int | None,
-        typer.Option(
-            "--jobs", help="Rebuilds run at once (default: the smaller of 4 and the cores)."
-        ),
-    ] = None,
-    data_dir: Annotated[
-        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
-    ] = None,
-) -> None:
-    """Measure what the truncation leaks change for a backtest: per instant, the price rows of
-    liquid-tier securities and the CIKs of their symbols that the full master shows otherwise
-    than a build from the inputs knowable then (leak) or not yet (delay). Rows go to
-    <market>/audit/truncation_impact/<UTC instant>.parquet, the per-baseline-key summary to
-    summary.parquet. A measurement: exit 0 whatever it finds."""
-    root = _market_root(data_dir)
-    if not overrides.exists():
-        _fail(f"{overrides}: overrides file not found (run from the repo root or pass --overrides)")
-    if not baseline.exists():  # a mistyped path would summarise no key: "nothing matters"
-        _fail(f"{baseline}: baseline file not found")
-    try:
-        decisions = load_overrides(overrides)
-        known = load_baseline(baseline)
-        fixed_instants = load_instants(instants_file)
-    except ValueError as error:
-        _fail(str(error))
-    # before a minute of building: the liquid tier reads the master and the classes, and a
-    # missing split file would read as "no split", hiding a leak through one
-    splits_file = root / "corporate_actions" / "splits.parquet"
-    for needed in (root / MASTER_FILE, root / CLASS_FILE, splits_file):
-        if not needed.exists():
-            _fail(f"{needed}: not found (build the store first)")
-    cores = _cores()
-    if jobs is None:
-        jobs = min(4, cores)  # the same rebuilds as `market truncation`: memory bounds it
-    elif not 1 <= jobs <= cores:
-        _fail(f"--jobs must be between 1 and {cores} (the cores here), got {jobs}")
-    instants = (
-        sorted({_as_of_option(t).astimezone(UTC) for t in as_of}) if as_of else fixed_instants
-    )
-    if not instants:
-        _fail(f"{instants_file}: no instants (pass --instants or --as-of)")
-    started = time.monotonic()
-    inputs = load_store_inputs(root)
-    full, _ = build_from_inputs(inputs, decisions)
-    # the liquid tier names the ids of the master on disk; the full master here must be it
-    on_disk = pq.read_table(root / MASTER_FILE).select(MASTER_SCHEMA.names)
-    order = [("security_id", "ascending"), ("symbol", "ascending"), ("valid_from", "ascending")]
-    if not on_disk.sort_by(order).equals(full.select(MASTER_SCHEMA.names).sort_by(order)):
-        _fail(
-            f"{root / MASTER_FILE} is not the master these inputs build: run `asof market identity`"
+    full_run = not as_of and not computed and (not drifted or rebase)
+    comparable = not drifted and set(instants) <= set(fixed_instants)
+    if drifted and not rebase:
+        typer.echo(
+            f"{instants_file} is not the list the baseline was summed over "
+            f"({recorded or 'none recorded'}, now "
+            f"{fixed_print}): its numbers compare with nothing and this run fails; re-sum them "
+            "with --rebase-baseline"
         )
+    elif not comparable and not rebase:
+        typer.echo("instants outside the fixed list: only new keys and unmatched cells are judged")
     # the tier through the last fixed instant whatever this run picks: a partial run then
     # measures the same securities as the full one
     last = max([*fixed_instants, *instants]).astimezone(ET).date()
@@ -1063,55 +983,136 @@ def market_truncation_impact(
     finally:
         con.close()
     liquid = set(tier.column("security_id").to_pylist())
-    out_dir = root / "audit" / "truncation_impact"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    partial = bool(as_of)
-    if not partial:  # an instant dropped from --instants must not pass for part of this run
-        for stale in out_dir.glob("[0-9]*T*.parquet"):
-            stale.unlink()
+    diff_dir = root / "audit" / "truncation"
+    impact_dir = root / "audit" / "truncation_impact"
+    for out_dir in (diff_dir, impact_dir):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if full_run:  # an instant dropped from --instants must not pass for part of this run
+            for stale in out_dir.glob("[0-9]*T*.parquet"):
+                stale.unlink()
     typer.echo(
         f"full master {full.num_rows:,} segments; {len(liquid):,} securities ever liquid "
         f"2020-01..{last:%Y-%m}; {len(instants)} instants"
     )
 
-    def record(t: datetime, rows: pa.Table) -> None:
-        path = out_dir / f"{t:%Y%m%dT%H%M%S%f}.parquet"
-        tmp = path.with_name(path.name + ".tmp")
-        pq.write_table(rows, tmp)
-        os.replace(tmp, path)
-        counts = {
-            (kind, what): sum(
-                r["days"] for r in rows.to_pylist() if (r["kind"], r["what"]) == (kind, what)
+    def record(result: InstantResult) -> None:
+        name = f"{result.as_of:%Y%m%dT%H%M%S%f}.parquet"
+        for out_dir, table in ((diff_dir, result.diff), (impact_dir, result.impact)):
+            tmp = out_dir / f"{name}.tmp"
+            pq.write_table(table, tmp)
+            os.replace(tmp, out_dir / name)
+        leaks = sum(1 for k in result.diff.column("kind").to_pylist() if k == "leak")
+        days = {
+            what: sum(
+                r["days"]
+                for r in result.impact.to_pylist()
+                if (r["kind"], r["what"]) == ("leak", what)
             )
-            for kind in ("leak", "delay")
             for what in ("price", "cik")
         }
         typer.echo(
-            f"  {t.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leak days price "
-            f"{counts['leak', 'price']:>6,} cik {counts['leak', 'cik']:>6,}  delay days price "
-            f"{counts['delay', 'price']:>6,} cik {counts['delay', 'cik']:>6,}  "
-            f"{time.monotonic() - started:,.0f}s"
+            f"  {result.as_of.astimezone(ET):%Y-%m-%d %H:%M:%S.%f %Z}  leaks {leaks:>5,}  "
+            f"delays {result.diff.num_rows - leaks:>5,}  leak days price {days['price']:>6,} "
+            f"cik {days['cik']:>6,}  {time.monotonic() - started:,.0f}s"
         )
 
     try:
-        results = run_impact(
+        results = run_instants(
             full, inputs, decisions, splits, instants, liquid=liquid, jobs=jobs, progress=record
         )
+    except ValueError as error:
+        _fail(str(error))
     except BrokenProcessPool:
         _fail(f"a worker died (most often out of memory): try a smaller --jobs than {jobs}")
-    summary = summarize(known, results)
-    # summary.parquet speaks for the fixed instants only; a partial run must not replace it
-    path = out_dir / ("summary-partial.parquet" if partial else "summary.parquet")
-    tmp = path.with_name(path.name + ".tmp")
-    pq.write_table(summary, tmp)
-    os.replace(tmp, path)
-    with_leak = sum(1 for r in summary.to_pylist() if r["price_leak_days"] + r["cik_leak_days"] > 0)
-    typer.echo(f"rows -> {out_dir}/<instant>.parquet, {path}; {time.monotonic() - started:,.0f}s")
-    typer.echo(
-        f"{summary.num_rows:,} baseline keys: {with_leak:,} with a leak impact, "
-        f"{summary.num_rows - with_leak:,} without"
+    found = attribute(results)
+    verdict = gate(
+        found.counts,
+        baseline=known,
+        unmatched=len(found.unmatched),
+        full_run=full_run,
+        comparable=comparable,
     )
+    typer.echo(f"{len(instants)} instants, fingerprint {instants_fingerprint(instants)}")
+    typer.echo(f"rows -> {diff_dir}/, {impact_dir}/; {time.monotonic() - started:,.0f}s")
+
+    def show(c: ImpactCount) -> str:
+        return f"price {c.price:,} cik {c.cik:,}"
+
+    def report() -> None:
+        for key in verdict.new:
+            typer.echo(f"  new: {key}  {show(found.counts[key])}")
+        for key in verdict.grew:
+            typer.echo(f"  grew: {key}  {show(found.counts[key])}, baseline {show(known[key])}")
+        for key in verdict.fixed:
+            typer.echo(f"  no impact left (--prune-baseline): {key}  baseline {show(known[key])}")
+        for key in verdict.shrank:
+            typer.echo(
+                f"  shrank (--prune-baseline lowers it): {key}  {show(found.counts[key])}, "
+                f"baseline {show(known[key])}"
+            )
+        for cell in found.unmatched[:20]:
+            typer.echo(
+                f"  unmatched: {cell.as_of.astimezone(ET):%Y-%m-%d %H:%M} {cell.what} "
+                f"{cell.owner} {cell.day} (rows name {', '.join(cell.segments) or 'nothing'})"
+            )
+        if len(found.unmatched) > 20:
+            typer.echo(f"  ... {len(found.unmatched) - 20:,} more unmatched cells")
+
+    if rebase:
+        if verdict.new or verdict.unmatched:
+            report()
+            _fail("new or unmatched impact: review it before rebasing the baseline")
+        try:
+            changes = rebase_impact_baseline(baseline, counts=found.counts, fingerprint=fixed_print)
+        except ValueError as error:
+            _fail(str(error))
+        # lowered lines first; the ones to read (a number up, a key gone) last, apart
+        kept = [(k, o, n) for k, o, n in changes if n is not None]
+        rose = [(k, o, n) for k, o, n in kept if n.price > o.price or n.cik > o.cik]
+        for key, old, new in kept:
+            if (key, old, new) not in rose:
+                typer.echo(f"  rebased: {key}  baseline {show(old)} -> {show(new)}")
+        for key, old, new in rose:
+            typer.echo(f"  rose: {key}  baseline {show(old)} -> {show(new)}")
+        for key, old, new in changes:
+            if new is None:
+                typer.echo(f"  removed: {key}  baseline {show(old)}")
+        typer.echo(
+            f"rebased {baseline} onto {instants_file} ({fixed_print}): {len(changes):,} lines "
+            "changed; read them before committing"
+        )
+        return
+    if prune and (verdict.new or verdict.grew or verdict.unmatched):
+        report()
+        _fail("new, grown or unmatched impact: review it before pruning the baseline")
+    if prune and (verdict.fixed or verdict.shrank):
+        try:
+            removed, tightened = prune_impact_baseline(
+                baseline,
+                remove=verdict.fixed,
+                tighten={key: found.counts[key] for key in verdict.shrank},
+                fingerprint=fixed_print,
+            )
+        except ValueError as error:
+            _fail(str(error))
+        typer.echo(f"pruned {baseline}: {removed:,} keys removed, {tightened:,} lowered")
+        verdict = dataclasses.replace(verdict, fixed=[], shrank=[])
     typer.echo(
-        f"{unmatched_leaks(known, results):,} leak rows name no baseline key's segment "
-        "(their cell may still be named through its other side's rows)"
+        f"{len(known):,} baseline keys, {len(found.counts):,} keys with impact; "
+        f"{len(verdict.new):,} new, {len(verdict.grew):,} grew, {verdict.unmatched:,} unmatched "
+        f"cells"
+        + (
+            f", {len(verdict.fixed):,} without impact, {len(verdict.shrank):,} shrank"
+            if full_run
+            else " (partial run: fixed and shrank not checked)"
+            if comparable
+            else " (grew, fixed and shrank not checked)"
+        )
     )
+    report()
+    if drifted:
+        typer.echo("instants changed since the baseline was summed: run --rebase-baseline")
+        raise typer.Exit(code=2)
+    if not verdict.ok:
+        raise typer.Exit(code=2)
+    typer.echo("every leak impact within the baseline and named by a key")

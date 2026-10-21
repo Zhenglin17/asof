@@ -26,14 +26,11 @@ Target API (implementation pending, acceptance point 6-d):
         load_store_inputs(market_root) -> StoreInputs     frozen: bars, sec_history, name_changes
         build_from_inputs(inputs, overrides=(), *, as_of=None) -> (master, conflicts)
             build_from_store(root, ...) == build_from_inputs(load_store_inputs(root), ...)
-    asof.ingest.master_truncation.run_instants(full, inputs, overrides, instants, *, jobs=1)
-        -> [(instant UTC, compare(full, truncated at instant, instant))], sorted, one per distinct
-        instant; jobs > 1 = a fork process pool, results identical to jobs=1; jobs < 1 refused.
-    asof market truncation [--as-of ISO]... [--exceptions PATH] [--overrides PATH] [--data-dir]
-        [--jobs N]  (default min(6, cores); outside 1..cores refused before any build;
-                     output identical whatever N)
-        diffs -> <market>/audit/truncation/<YYYYMMDDTHHMMSSffffff of the UTC instant>.parquet;
-        exit 2 on a leak whose key ``SYMBOL:YYYY-MM-DD:reason`` is not excepted, 0 otherwise.
+    asof.ingest.master_truncation.load_instants(path) -> list[datetime]   sorted, UTC
+    (refactor pending: ``run_instants`` moves to asof.ingest.truncation_impact, see
+    tests/ingest/test_truncation_impact.py; ``gate``, ``GateResult``, ``load_baseline``,
+    ``prune_baseline`` and ``load_truncation_exceptions`` are removed: the command gates on the
+    leaks' backtest impact, tests/ingest/test_truncation_gate.py.)
 
 Fake data provenance:
 - The scenario worlds are the ones of tests/ingest/test_security_master*.py, read through
@@ -48,8 +45,8 @@ Fake data provenance:
   identical days and no record anywhere) and a dated merge override joins them.
 
 Real-data checks for the assumptions (audit command, then the standard cases):
-- ``asof market truncation`` on the real store at the default instants: every leak row is read
-  by a human; none may remain outside configs/truncation_exceptions.yaml.
+- ``asof market truncation`` on the real store at the fixed instants: every leak's impact is
+  read by a human and stands in configs/truncation_impact_baseline.txt (the gate's ratchet).
 - Standard cases: BK / BNY seen at 2022-06-01 shows BK open and no BNY (no diff); BBBY seen at
   2025-08-07 shows Bed Bath & Beyond's closed piece and no Beyond Inc piece yet (no diff).
 """
@@ -59,7 +56,7 @@ import multiprocessing
 import os
 import signal
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -70,10 +67,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import yaml
-from typer.testing import CliRunner
 
-from asof import cli
-from asof.cli import app
 from asof.ingest import master_truncation as mt
 from asof.ingest import security_master as sm
 from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA
@@ -82,8 +76,6 @@ from asof.ingest.master_truncation import (
     compare,
     default_instants,
     diff_key,
-    load_baseline,
-    load_truncation_exceptions,
     mask_master,
     truncate_inputs,
 )
@@ -879,8 +871,11 @@ def test_build_from_store_refuses_a_naive_as_of(tmp_path: Path) -> None:
 
 
 # =============================================================================================
-# CLI: asof market truncation
+# the CYCN / KRSA store (shared with test_truncation_impact.py and test_truncation_gate.py)
+# and load_instants
 # =============================================================================================
+# The `asof market truncation` command itself is tested in tests/ingest/test_truncation_gate.py:
+# it now gates on the backtest impact of the leaks, not on their diff keys.
 
 CLI_DAYS = business_days(date(2024, 1, 2), date(2024, 2, 13))
 CLI_SNAPSHOTS = [date(2024, 1, 5), date(2024, 3, 1), date(2024, 5, 1)]
@@ -925,200 +920,12 @@ def stamp(t: datetime) -> str:
     return t.astimezone(UTC).strftime("%Y%m%dT%H%M%S%f")
 
 
-def run_truncation(
-    tmp_path: Path,
-    *,
-    as_of: Sequence[str] = (),
-    overrides: Sequence[Mapping[str, Any]] = (),
-    exceptions: Any = (),
-    baseline: Sequence[str] = (),
-    prune: bool = False,
-    instants: Sequence[str] | None = None,
-    jobs: str | None = None,
-) -> Any:
-    overrides_path = write_yaml(tmp_path / "overrides.yaml", list(overrides))
-    exceptions_path = write_yaml(tmp_path / "exceptions.yaml", list(exceptions))
-    # always a file of the test's own: never the repo's configs/truncation_baseline.txt
-    baseline_path = tmp_path / "baseline.txt"
-    baseline_path.write_text("".join(f"{k}\n" for k in baseline))
-    # likewise never the repo's configs/truncation_instants.txt; None = --computed-instants
-    instants_path = tmp_path / "instants.txt"
-    if instants is not None:
-        instants_path.write_text("".join(f"{t}\n" for t in instants))
-    args = ["market", "truncation"]
-    for value in as_of:
-        args += ["--as-of", value]
-    args += [
-        "--overrides",
-        str(overrides_path),
-        "--exceptions",
-        str(exceptions_path),
-        "--baseline",
-        str(baseline_path),
-        "--instants",
-        str(instants_path),
-        *(["--computed-instants"] if instants is None and not as_of else []),
-        *(["--prune-baseline"] if prune else []),
-        *(["--jobs", jobs] if jobs is not None else []),
-        "--data-dir",
-        str(tmp_path),
-    ]
-    return CliRunner().invoke(app, args)
-
-
 MERGE = {"merge": ["CYCN", "KRSA"], "reason": "identical history", "date": CLI_DECIDED.isoformat()}
 # a fixed instant list for default runs: before the merge decision (the leak) and at it
 CLI_INSTANTS = [et_midnight(date(2024, 3, 1)).isoformat(), et_midnight(CLI_DECIDED).isoformat()]
 # the merge's one leak: KRSA joins CYCN's security (CYCN itself only gets an evidence note)
 LEAK_KEYS = [f"KRSA:{CLI_DAYS[0].isoformat()}:grouping_differs"]
 OTHER_KEY = f"CYCN:{CLI_DAYS[0].isoformat()}:grouping_differs"  # matches no row
-
-
-def report_dir(tmp_path: Path) -> Path:
-    return market_root(tmp_path) / "audit" / "truncation"
-
-
-def test_cli_writes_one_diff_file_per_instant_and_fails_on_a_leak(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-
-    result = run_truncation(
-        tmp_path, as_of=["2024-03-01", CLI_DECIDED.isoformat()], overrides=[MERGE]
-    )
-
-    assert result.exit_code == LEAK_EXIT, result.output
-    assert "leak" in result.output
-    before, decided = et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)
-    files = sorted(p.name for p in report_dir(tmp_path).glob("*.parquet"))
-    assert files == [f"{stamp(before)}.parquet", f"{stamp(decided)}.parquet"]
-    assert stamp(before) == "20240301T050000000000"  # 00:00 New York in winter, as UTC
-    early = pq.read_table(report_dir(tmp_path) / f"{stamp(before)}.parquet")
-    assert early.schema.equals(DIFF_SCHEMA)
-    assert {
-        f"{r['symbol']}:{r['valid_from'].isoformat()}:{r['reason']}"
-        for r in early.to_pylist()
-        if r["kind"] == "leak"
-    } == set(LEAK_KEYS)
-    late = pq.read_table(report_dir(tmp_path) / f"{stamp(decided)}.parquet")
-    assert late.schema.equals(DIFF_SCHEMA) and late.num_rows == 0
-
-
-def test_cli_excepted_leaks_do_not_fail(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    reviewed = [{"key": k, "reason": "dated human merge", "date": "2026-10-19"} for k in LEAK_KEYS]
-
-    result = run_truncation(tmp_path, as_of=["2024-03-01"], overrides=[MERGE], exceptions=reviewed)
-
-    assert result.exit_code == 0, result.output
-    # the rows are still written: an exception silences the gate, not the report (the leak
-    # and the two evidence notes)
-    assert pq.read_table(report_dir(tmp_path) / "20240301T050000000000.parquet").num_rows == 3
-
-
-def test_cli_one_leak_left_unexcepted_still_fails(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    # an exception covers its own key only
-    reviewed = [{"key": OTHER_KEY, "reason": "dated human merge", "date": "2026-10-19"}]
-    result = run_truncation(tmp_path, as_of=["2024-03-01"], overrides=[MERGE], exceptions=reviewed)
-    assert result.exit_code == LEAK_EXIT, result.output
-    # a partial run cannot tell an exception unused: OTHER_KEY may occur at another instant
-    assert "stale exception" not in result.output
-
-
-def test_cli_baseline_leaks_do_not_fail(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(tmp_path, as_of=["2024-03-01"], overrides=[MERGE], baseline=LEAK_KEYS)
-    assert result.exit_code == 0, result.output
-    assert "0 new" in result.output
-
-
-def test_cli_default_run_fails_on_a_baseline_key_that_no_longer_occurs(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    # the ratchet: OTHER_KEY matches no row, so its line must go
-    result = run_truncation(
-        tmp_path, overrides=[MERGE], baseline=[*LEAK_KEYS, OTHER_KEY], instants=CLI_INSTANTS
-    )
-    assert result.exit_code == LEAK_EXIT, result.output
-    assert f"(--prune-baseline): {OTHER_KEY}" in result.output
-
-
-def test_cli_prune_baseline_refuses_while_a_new_leak_is_open(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    # KRSA's leak is new and OTHER_KEY is gone: deleting one must wait for reviewing the other
-    result = run_truncation(
-        tmp_path, overrides=[MERGE], baseline=[OTHER_KEY], prune=True, instants=CLI_INSTANTS
-    )
-    assert result.exit_code != 0
-    assert f"new leak: {LEAK_KEYS[0]}" in result.output  # listed, not only counted
-    assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
-
-
-def test_repo_baseline_and_exceptions_load_and_do_not_overlap() -> None:
-    # read only: a hand-added line that is malformed, duplicated or also excepted fails CI,
-    # not 26 minutes into a real run
-    repo = Path(__file__).resolve().parents[2] / "configs"
-    known = load_baseline(repo / "truncation_baseline.txt")
-    reviewed = load_truncation_exceptions(repo / "truncation_exceptions.yaml")
-    assert known
-    assert mt.gate([], baseline=known, exceptions=reviewed, full_run=False).ok
-    assert mt.load_instants(repo / "truncation_instants.txt")
-
-
-def test_cli_prune_baseline_deletes_the_fixed_keys_and_passes(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(
-        tmp_path,
-        overrides=[MERGE],
-        baseline=[*LEAK_KEYS, OTHER_KEY],
-        prune=True,
-        instants=CLI_INSTANTS,
-    )
-    assert result.exit_code == 0, result.output
-    assert load_baseline(tmp_path / "baseline.txt") == LEAK_KEYS
-
-
-def test_cli_prune_baseline_refuses_the_computed_instants(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    # the computed spread drifts with the master: a key gone from it may still occur
-    result = run_truncation(tmp_path, overrides=[MERGE], baseline=[OTHER_KEY], prune=True)
-    assert result.exit_code != 0
-    assert "--prune-baseline" in result.output
-    assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
-
-
-def test_cli_without_an_instants_file_refuses_to_guess(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(tmp_path, overrides=[MERGE], instants=[])  # header-less, empty
-    assert result.exit_code != 0
-    assert "no instants" in result.output
-    assert not report_dir(tmp_path).exists() or not list(report_dir(tmp_path).glob("*"))
-
-
-def test_cli_prune_baseline_refuses_a_partial_run(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(
-        tmp_path, as_of=["2024-03-01"], overrides=[MERGE], baseline=[OTHER_KEY], prune=True
-    )
-    assert result.exit_code != 0
-    assert "--prune-baseline" in result.output
-    assert load_baseline(tmp_path / "baseline.txt") == [OTHER_KEY]
-
-
-def test_cli_default_run_checks_exactly_the_listed_instants(tmp_path: Path) -> None:
-    root = write_cli_store(market_root(tmp_path))
-    full, _ = sm.build_from_store(root, [MERGE])
-    listed = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
-    result = run_truncation(
-        tmp_path, overrides=[MERGE], baseline=LEAK_KEYS, instants=[t.isoformat() for t in listed]
-    )
-    assert {p.name for p in report_dir(tmp_path).glob("*.parquet")} == {
-        f"{stamp(t)}.parquet" for t in listed
-    }
-    # a full run: the listed instants stand for every instant, so fixed keys are checked
-    assert result.exit_code == 0, result.output
-    assert "0 no longer occurring" in result.output
-    # the computed spread is reported, not checked
-    assert len(set(default_instants(full)) - set(listed)) > 0
-    assert "computed instants not in" in result.output
 
 
 @pytest.mark.parametrize(
@@ -1149,40 +956,6 @@ def test_load_instants_reads_utc_sorted_and_refuses_duplicates(tmp_path: Path) -
         mt.load_instants(path)
 
 
-@pytest.mark.parametrize("missing", ["reason", "date"])
-def test_cli_rejects_an_exception_without_reason_or_date(tmp_path: Path, missing: str) -> None:
-    write_cli_store(market_root(tmp_path))
-    entry = {"key": LEAK_KEYS[0], "reason": "dated human merge", "date": "2026-10-19"}
-    del entry[missing]
-
-    result = run_truncation(tmp_path, as_of=["2024-03-01"], overrides=[MERGE], exceptions=[entry])
-
-    assert result.exit_code != 0
-    assert missing in result.output
-
-
-def test_cli_clean_store_exits_zero(tmp_path: Path) -> None:
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(tmp_path, as_of=["2024-03-01", "2024-06-03"])
-    assert result.exit_code == 0, result.output
-    for name in ("20240301T050000000000", "20240603T040000000000"):
-        table = pq.read_table(report_dir(tmp_path) / f"{name}.parquet")
-        assert table.schema.equals(DIFF_SCHEMA)
-        assert not [r for r in table.to_pylist() if r["kind"] == "leak"]
-
-
-def test_cli_without_as_of_runs_the_default_instants(tmp_path: Path) -> None:
-    root = write_cli_store(market_root(tmp_path))
-    full, _ = sm.build_from_store(root, [MERGE])
-
-    result = run_truncation(tmp_path, overrides=[MERGE])
-
-    expected = {f"{stamp(t)}.parquet" for t in default_instants(full)}
-    assert {p.name for p in report_dir(tmp_path).glob("*.parquet")} == expected
-    # the override evidence's earliest instant (CYCN's first bar) is before the decision
-    assert result.exit_code == LEAK_EXIT, result.output
-
-
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_a_relabelled_piece_never_shows_the_takers_cik_before_the_taker_does(
     scenario: str,
@@ -1204,258 +977,13 @@ def test_a_relabelled_piece_never_shows_the_takers_cik_before_the_taker_does(
 
 
 # =============================================================================================
-# the ratchet gate: configs/truncation_baseline.txt (known leaks, count may only shrink)
-# =============================================================================================
-# API:
-#     mt.GateResult(new, fixed, stale_exceptions), .ok = not new and not fixed
-#     mt.gate(found, *, baseline, exceptions, full_run) -> GateResult
-#     mt.load_baseline(path) -> list[str]
-#     mt.prune_baseline(path, fixed) -> int
-# The baseline holds known-but-unfixed leaks; the exceptions file holds reviewed-and-accepted
-# ones. A key may live in one of them, never both. ``fixed`` and ``stale_exceptions`` are only
-# computed on a full run: a partial ``--as-of`` run does not visit every instant, so a key it
-# did not find may still occur elsewhere.
-
-BASE_A = "AAAU:2020-01-02:fields_differ:cik_available_at"
-BASE_B = "CCL:2020-01-02:fields_differ:end_available_at+valid_to"
-EXC_C = "GOOG:2019-07-01:only_in_full"
-REVIEWED = {EXC_C: "reviewed share-class split"}
-HEADER = "# Known leaks, one key per line; the count may only shrink.\n#\n"
-
-
-def write_baseline(path: Path, text: str) -> Path:
-    path.write_text(text)
-    return path
-
-
-def test_gate_all_found_keys_known_on_a_full_run_is_ok() -> None:
-    result = mt.gate(
-        [BASE_A, BASE_B, EXC_C], baseline=[BASE_A, BASE_B], exceptions=REVIEWED, full_run=True
-    )
-    assert result.ok
-    assert (result.new, result.fixed, result.stale_exceptions) == ([], [], [])
-
-
-def test_gate_baseline_key_not_found_on_a_full_run_is_fixed_and_fails() -> None:
-    # the ratchet: a fix must also delete its baseline line, so the count shrinks for good
-    result = mt.gate([BASE_A, EXC_C], baseline=[BASE_A, BASE_B], exceptions=REVIEWED, full_run=True)
-    assert result.fixed == [BASE_B]
-    assert result.new == []
-    assert not result.ok
-
-
-def test_gate_exception_not_found_on_a_full_run_is_stale_but_ok() -> None:
-    result = mt.gate([BASE_A], baseline=[BASE_A], exceptions=REVIEWED, full_run=True)
-    assert result.stale_exceptions == [EXC_C]
-    assert result.ok
-
-
-def test_gate_partial_run_reports_no_fixed_and_no_stale() -> None:
-    result = mt.gate([], baseline=[BASE_A, BASE_B], exceptions=REVIEWED, full_run=False)
-    assert (result.fixed, result.stale_exceptions) == ([], [])
-    assert result.ok
-
-
-def test_gate_partial_run_still_reports_new_leaks() -> None:
-    new = "ZZZ:2021-03-04:replaced"
-    result = mt.gate([new], baseline=[BASE_A], exceptions=REVIEWED, full_run=False)
-    assert result.new == [new]
-    assert not result.ok
-
-
-def test_gate_nothing_found_nothing_known_is_ok() -> None:
-    result = mt.gate([], baseline=[], exceptions={}, full_run=True)
-    assert result.ok
-    assert (result.new, result.fixed, result.stale_exceptions) == ([], [], [])
-
-
-def test_gate_a_key_found_at_several_instants_counts_once() -> None:
-    new = "ZZZ:2021-03-04:replaced"
-    result = mt.gate([new, BASE_A, new, BASE_A], baseline=[BASE_A], exceptions={}, full_run=True)
-    assert result.new == [new]
-
-
-def test_gate_outputs_are_sorted_whatever_the_input_order() -> None:
-    found = ["ZZZ:2021-03-04:replaced", "BBB:2020-05-01:only_in_full", "MMM:2020-05-01:replaced"]
-    baseline = ["YYY:2020-01-02:replaced", "AAA:2020-01-02:replaced"]
-    exceptions = {"XXX:2020-01-02:replaced": "r", "CCC:2020-01-02:replaced": "r"}
-    result = mt.gate(found, baseline=baseline, exceptions=exceptions, full_run=True)
-    assert result.new == sorted(found)
-    assert result.fixed == sorted(baseline)
-    assert result.stale_exceptions == sorted(exceptions)
-
-
-def test_gate_refuses_a_key_both_in_baseline_and_exceptions() -> None:
-    with pytest.raises(ValueError, match="GOOG:2019-07-01:only_in_full"):
-        mt.gate([EXC_C], baseline=[BASE_A, EXC_C], exceptions=REVIEWED, full_run=True)
-
-
-def test_gate_result_ok_ignores_stale_exceptions() -> None:
-    assert mt.GateResult(new=[], fixed=[], stale_exceptions=[EXC_C]).ok
-    assert not mt.GateResult(new=[BASE_A], fixed=[], stale_exceptions=[]).ok
-    assert not mt.GateResult(new=[], fixed=[BASE_A], stale_exceptions=[]).ok
-
-
-# --- leakage: a new leak must never slip through the gate ---
-
-
-def test_gate_baseline_key_does_not_cover_the_same_row_with_one_more_field() -> None:
-    known = "X:2020-01-02:fields_differ:valid_to"
-    found = "X:2020-01-02:fields_differ:cik+valid_to"
-    result = mt.gate([found], baseline=[known], exceptions={}, full_run=True)
-    assert result.new == [found]
-    assert result.fixed == [known]
-    assert not result.ok
-
-
-def test_gate_same_symbol_and_date_with_another_reason_is_new() -> None:
-    found = "AAAU:2020-01-02:grouping_differs"
-    result = mt.gate([found], baseline=[BASE_A], exceptions={}, full_run=False)
-    assert result.new == [found]
-
-
-def test_gate_same_symbol_with_another_valid_from_is_new() -> None:
-    found = "AAAU:2020-01-03:fields_differ:cik_available_at"
-    result = mt.gate([found], baseline=[BASE_A], exceptions={}, full_run=False)
-    assert result.new == [found]
-
-
-def test_gate_a_key_covered_by_exceptions_is_not_new() -> None:
-    result = mt.gate([EXC_C], baseline=[], exceptions=REVIEWED, full_run=False)
-    assert result.new == []
-    assert result.ok
-
-
-def test_baseline_written_from_diff_key_rows_loads_and_gates_clean(tmp_path: Path) -> None:
-    rows = pa.Table.from_pylist(
-        [
-            {
-                "kind": "leak",
-                "reason": "fields_differ",
-                "symbol": "CCL",
-                "valid_from": date(2020, 1, 2),
-                "fields": "end_available_at+valid_to",
-                "detail": "",
-            },
-            {
-                "kind": "leak",
-                "reason": "only_in_full",
-                "symbol": "GOOG",
-                "valid_from": date(2019, 7, 1),
-                "fields": None,
-                "detail": "",
-            },
-            {
-                "kind": "leak",
-                "reason": "grouping_differs",
-                "symbol": "KRSA",
-                "valid_from": date(2024, 1, 2),
-                "fields": "",
-                "detail": "",
-            },
-        ],
-        schema=DIFF_SCHEMA,
-    ).to_pylist()
-    keys = [diff_key(r) for r in rows]
-    path = write_baseline(tmp_path / "baseline.txt", HEADER + "".join(f"{k}\n" for k in keys))
-
-    loaded = mt.load_baseline(path)
-
-    assert loaded == keys
-    assert mt.gate(keys, baseline=loaded, exceptions={}, full_run=True).ok
-
-
-# --- load_baseline ---
-
-
-def test_load_baseline_reads_keys_in_file_order_skipping_comments(tmp_path: Path) -> None:
-    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_B}\n{BASE_A}\n")
-    assert mt.load_baseline(path) == [BASE_B, BASE_A]
-
-
-def test_load_baseline_missing_file_is_empty(tmp_path: Path) -> None:
-    assert mt.load_baseline(tmp_path / "absent.txt") == []
-
-
-def test_load_baseline_ignores_blank_lines_and_strips_whitespace(tmp_path: Path) -> None:
-    path = write_baseline(tmp_path / "baseline.txt", f"\n  {BASE_A}  \n\n\t{BASE_B}\n   \n")
-    assert mt.load_baseline(path) == [BASE_A, BASE_B]
-
-
-def test_load_baseline_refuses_a_duplicated_key(tmp_path: Path) -> None:
-    path = write_baseline(tmp_path / "baseline.txt", f"{BASE_A}\n{BASE_B}\n{BASE_A}\n")
-    with pytest.raises(ValueError, match="baseline.txt") as raised:
-        mt.load_baseline(path)
-    assert BASE_A in str(raised.value)
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        "X:2020-13-02:only_in_full",  # date does not parse
-        "X:20200102:only_in_full",  # not YYYY-MM-DD
-        "X:2020-01-02:went_missing",  # unknown reason
-        "X:2020-01-02:only_in_truncated",  # a delay, never a baseline leak
-        "X:2020-01-02:cik_withheld",  # a delay
-        "X:2020-01-02:evidence_differs",  # info
-        "X:2020-01-02:fields_differ:",  # trailing empty fields
-        "X:2020-01-02",  # no reason
-        ":2020-01-02:only_in_full",  # no symbol
-    ],
-)
-def test_load_baseline_refuses_a_malformed_line(tmp_path: Path, line: str) -> None:
-    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_A}\n{line}\n")
-    with pytest.raises(ValueError, match="baseline.txt") as raised:
-        mt.load_baseline(path)
-    assert line in str(raised.value)
-
-
-# --- prune_baseline ---
-
-
-def test_prune_baseline_removes_keys_keeps_header_and_sorts(tmp_path: Path) -> None:
-    other = "ZZZ:2021-03-04:replaced"
-    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{other}\n{BASE_B}\n{BASE_A}\n")
-
-    removed = mt.prune_baseline(path, [BASE_B])
-
-    assert removed == 1
-    assert path.read_text() == f"{HEADER}{BASE_A}\n{other}\n"
-
-
-def test_prune_then_load_round_trips(tmp_path: Path) -> None:
-    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_B}\n{BASE_A}\n{EXC_C}\n")
-    fixed = mt.gate([BASE_A], baseline=mt.load_baseline(path), exceptions={}, full_run=True).fixed
-
-    assert mt.prune_baseline(path, fixed) == 2
-    assert mt.load_baseline(path) == [BASE_A]
-    assert mt.gate([BASE_A], baseline=mt.load_baseline(path), exceptions={}, full_run=True).ok
-
-
-def test_prune_baseline_of_every_key_leaves_the_header(tmp_path: Path) -> None:
-    path = write_baseline(tmp_path / "baseline.txt", f"{HEADER}{BASE_A}\n")
-    assert mt.prune_baseline(path, [BASE_A]) == 1
-    assert mt.load_baseline(path) == []
-    assert path.read_text().startswith(HEADER)
-
-
-def test_prune_baseline_refuses_an_unknown_key_and_writes_nothing(tmp_path: Path) -> None:
-    text = f"{HEADER}{BASE_B}\n{BASE_A}\n"
-    path = write_baseline(tmp_path / "baseline.txt", text)
-    with pytest.raises(ValueError, match="ZZZ:2021-03-04:replaced"):
-        mt.prune_baseline(path, [BASE_A, "ZZZ:2021-03-04:replaced"])
-    assert path.read_text() == text
-
-
-# =============================================================================================
-# parallel instants: load_store_inputs / build_from_inputs / run_instants / --jobs
+# parallel instants: load_store_inputs / build_from_inputs
 # =============================================================================================
 # The real run loaded the store once per instant (1.1 s) and built serially (33 s x 66 instants
 # = 40 min). The store is now read once, and the instants run in a fork-context process pool
-# whose workers inherit the inputs. Whatever the number of workers, the diffs must be exactly
-# those of the serial run: parallelism may change how long the run takes, never what it finds.
-
-DiffList = list[tuple[datetime, pa.Table]]
+# whose workers inherit the inputs. ``run_instants`` (one truncated build per instant feeding
+# both the diff and the impact) moved to asof.ingest.truncation_impact and is tested in
+# tests/ingest/test_truncation_impact.py with the helpers below.
 
 
 @contextmanager
@@ -1485,27 +1013,12 @@ def no_children_left(seconds: float = 10.0) -> bool:
 
 def store_inputs_of(world: Inputs) -> Any:
     """A scenario world as the store loader's output. build_from_inputs applies
-    SEC_HISTORY_START as build_from_store does; the worlds below keep their leaks with it
-    (measured 2026-10-20: r_gold_b 12, l_arnc 8, r4 8 leak rows over instants_of)."""
+    SEC_HISTORY_START as build_from_store does; the worlds the run_instants tests use
+    (test_truncation_impact.py) keep their leaks with it (measured 2026-10-20: r_gold_b 12,
+    l_arnc 8, r4 8 leak rows over instants_of)."""
     return sm.StoreInputs(
         bars=world.bars, sec_history=world.sec_history, name_changes=world.name_changes
     )
-
-
-def same_diffs(left: DiffList, right: DiffList) -> None:
-    assert [t for t, _ in left] == [t for t, _ in right]
-    for (t, a), (_, b) in zip(left, right, strict=True):
-        assert a.schema.equals(DIFF_SCHEMA), t
-        assert a.equals(b), t
-
-
-def hand_loop(
-    full: pa.Table, inputs: Any, overrides: Any, instants: Sequence[datetime]
-) -> DiffList:
-    return [
-        (t, compare(full, sm.build_from_inputs(inputs, overrides, as_of=t)[0], t))
-        for t in sorted({t.astimezone(UTC) for t in instants})
-    ]
 
 
 def cli_world(tmp_path: Path) -> tuple[Path, Any, pa.Table]:
@@ -1595,312 +1108,3 @@ def test_build_from_inputs_at_an_instant_does_not_change_the_inputs(tmp_path: Pa
     rows = (inputs.bars.num_rows, inputs.sec_history.num_rows, inputs.name_changes.num_rows)
     sm.build_from_inputs(inputs, [MERGE], as_of=et_midnight(date(2024, 1, 5)))
     assert (inputs.bars.num_rows, inputs.sec_history.num_rows, inputs.name_changes.num_rows) == rows
-
-
-# --- run_instants: normal ---
-
-
-def test_run_instants_serial_is_the_hand_loop(tmp_path: Path) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    instants = cli_instants(full)
-    assert len(instants) >= 4
-
-    got = mt.run_instants(full, inputs, [MERGE], instants, jobs=1)
-
-    same_diffs(got, hand_loop(full, inputs, [MERGE], instants))
-
-
-def test_run_instants_default_jobs_is_serial(tmp_path: Path) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    instants = cli_instants(full)
-    same_diffs(
-        mt.run_instants(full, inputs, [MERGE], instants),
-        mt.run_instants(full, inputs, [MERGE], instants, jobs=1),
-    )
-
-
-@pytest.mark.parametrize("jobs", [2, 3])
-def test_run_instants_in_a_pool_equals_serial_on_the_cli_store(tmp_path: Path, jobs: int) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    instants = cli_instants(full)
-    serial = mt.run_instants(full, inputs, [MERGE], instants, jobs=1)
-    with within(120):
-        pooled = mt.run_instants(full, inputs, [MERGE], instants, jobs=jobs)
-    same_diffs(pooled, serial)
-    assert any(table.num_rows for _, table in serial)  # the comparison is not of empty tables
-
-
-@pytest.mark.parametrize("scenario", ["r_gold_b", "l_arnc", "r4"])
-def test_run_instants_in_a_pool_equals_serial_on_leaking_worlds(scenario: str) -> None:
-    inputs = store_inputs_of(SCENARIOS[scenario]())
-    full, _ = sm.build_from_inputs(inputs)
-    instants = instants_of(full, SCENARIOS[scenario]())
-    serial = mt.run_instants(full, inputs, (), instants, jobs=1)
-    with within(120):
-        pooled = mt.run_instants(full, inputs, (), instants, jobs=2)
-    same_diffs(pooled, serial)
-    leaks = [r for _, table in serial for r in table.to_pylist() if r["kind"] == "leak"]
-    assert leaks, f"{scenario}: no leak rows; pick a world that leaks"
-
-
-# --- run_instants: edges ---
-
-
-def test_run_instants_sorts_and_deduplicates_the_instants(tmp_path: Path) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    decided = et_midnight(CLI_DECIDED)
-    early = et_midnight(date(2024, 3, 1))
-    # the same instant twice, once in New York time and once in UTC, and out of order
-    given = [decided, early, decided.astimezone(UTC), early - MICRO]
-    expected = sorted({t.astimezone(UTC) for t in given})
-    assert len(expected) == 3
-
-    for jobs in (1, 2):
-        with within(120):
-            got = mt.run_instants(full, inputs, [MERGE], given, jobs=jobs)
-        assert [t for t, _ in got] == expected, jobs
-        assert all(t.utcoffset() == timedelta(0) for t, _ in got), jobs
-        same_diffs(got, hand_loop(full, inputs, [MERGE], given))
-
-
-@pytest.mark.parametrize("jobs", [1, 2])
-def test_run_instants_of_no_instants_is_empty(tmp_path: Path, jobs: int) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    with within(60):
-        assert mt.run_instants(full, inputs, [MERGE], [], jobs=jobs) == []
-
-
-def test_run_instants_with_more_jobs_than_instants(tmp_path: Path) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
-    serial = mt.run_instants(full, inputs, [MERGE], instants, jobs=1)
-    with within(120):
-        same_diffs(mt.run_instants(full, inputs, [MERGE], instants, jobs=8), serial)
-        same_diffs(mt.run_instants(full, inputs, [MERGE], instants[:1], jobs=8), serial[:1])
-    assert no_children_left()
-
-
-@pytest.mark.parametrize("jobs", [0, -1])
-def test_run_instants_refuses_fewer_than_one_job(tmp_path: Path, jobs: int) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    with pytest.raises(ValueError):
-        mt.run_instants(full, inputs, [MERGE], [et_midnight(CLI_DECIDED)], jobs=jobs)
-    with pytest.raises(ValueError):  # refused even with nothing to run
-        mt.run_instants(full, inputs, [MERGE], [], jobs=jobs)
-
-
-@pytest.mark.parametrize("jobs", [1, 2])
-def test_run_instants_refuses_a_naive_instant(tmp_path: Path, jobs: int) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    with within(60), pytest.raises(ValueError):
-        mt.run_instants(full, inputs, [MERGE], [datetime(2024, 3, 1)], jobs=jobs)
-    assert no_children_left()
-
-
-def failing_at_two_snapshots(real: Callable[..., Any]) -> Callable[..., Any]:
-    """build_security_master raising when exactly two of the three CLI snapshots are given:
-    the instants from 2024-03-01 to before 2024-05-01. Installed in the parent, so a forked
-    worker inherits it."""
-
-    def build(**kwargs: Any) -> Any:
-        snapshots = set(kwargs["sec_history"].column("snapshot_date").to_pylist())
-        if len(snapshots) == 2:
-            raise ValueError("planted failure at the 2024-03-01 instant")
-        return real(**kwargs)
-
-    return build
-
-
-@pytest.mark.parametrize("jobs", [1, 2, 3])
-def test_run_instants_an_error_at_one_instant_reaches_the_caller(
-    tmp_path: Path, jobs: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _, inputs, full = cli_world(tmp_path)  # the full build, before the failure is planted
-    monkeypatch.setattr(
-        sm, "build_security_master", failing_at_two_snapshots(build_security_master)
-    )
-    instants = [
-        et_midnight(date(2024, 1, 5)),
-        et_midnight(date(2024, 3, 1)),  # the failing one
-        et_midnight(CLI_DECIDED),
-        datetime(2030, 1, 1, tzinfo=UTC),
-    ]
-    with within(120), pytest.raises(ValueError, match="planted failure"):
-        mt.run_instants(full, inputs, [MERGE], instants, jobs=jobs)
-    assert no_children_left()
-
-
-def test_run_instants_an_error_does_not_wait_on_a_stuck_worker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # one instant fails, a later one never returns: the error must arrive and the stuck worker
-    # must be gone, not waited on (a hung build would otherwise hang the whole run)
-    _, inputs, full = cli_world(tmp_path)
-    real = build_security_master
-
-    def build(**kwargs: Any) -> Any:
-        snapshots = set(kwargs["sec_history"].column("snapshot_date").to_pylist())
-        if len(snapshots) == 2:
-            raise ValueError("planted failure at the 2024-03-01 instant")
-        if len(snapshots) == 3:
-            time.sleep(1e6)
-        return real(**kwargs)
-
-    monkeypatch.setattr(sm, "build_security_master", build)
-    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
-    with within(60), pytest.raises(ValueError, match="planted failure"):
-        mt.run_instants(full, inputs, [MERGE], instants, jobs=2)
-    assert no_children_left()
-
-
-# --- run_instants: leakage ---
-
-
-@pytest.mark.parametrize("jobs", [1, 2])
-def test_run_instants_each_worker_truncates_to_its_own_instant(tmp_path: Path, jobs: int) -> None:
-    # Leakage. The merge decided on 2024-06-03 is in the overrides every worker inherits; a
-    # worker must still build the master of 2024-06-02 without it (the KRSA leak shows), and
-    # only the 06-03 build may use it (no diff).
-    _, inputs, full = cli_world(tmp_path)
-    decided = et_midnight(CLI_DECIDED)
-    with within(120):
-        (before, early), (at, late) = mt.run_instants(
-            full, inputs, [MERGE], [decided, decided - MICRO], jobs=jobs
-        )
-    assert (before, at) == (decided - MICRO, decided)
-    assert {
-        f"{r['symbol']}:{r['valid_from'].isoformat()}:{r['reason']}"
-        for r in early.to_pylist()
-        if r["kind"] == "leak"
-    } == set(LEAK_KEYS)
-    assert late.num_rows == 0
-
-
-# --- CLI --jobs ---
-
-
-def summary_lines(output: str) -> list[str]:
-    """The run's output without the per-instant timings and the total duration."""
-    return [
-        line
-        for line in output.splitlines()
-        if not line.startswith("  20") and not line.startswith("rows -> ")
-    ]
-
-
-def reports(tmp_path: Path) -> dict[str, pa.Table]:
-    return {p.name: pq.read_table(p) for p in sorted(report_dir(tmp_path).glob("*.parquet"))}
-
-
-@pytest.mark.parametrize(
-    "baseline", [[], LEAK_KEYS, [*LEAK_KEYS, OTHER_KEY]], ids=["new", "known", "fixed"]
-)
-def test_cli_reports_and_verdict_do_not_depend_on_jobs(
-    tmp_path: Path, baseline: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(cli, "_cores", lambda: 4)  # --jobs 2 must not depend on this machine
-    runs = {}
-    for jobs in ("1", "2", None):  # None: the default, min(4, cores)
-        here = tmp_path / f"jobs_{jobs}"
-        here.mkdir()
-        write_cli_store(market_root(here))
-        result = run_truncation(
-            here, overrides=[MERGE], baseline=baseline, instants=CLI_INSTANTS, jobs=jobs
-        )
-        # each run has its own directory, printed in the output: not a difference of behaviour
-        output = result.output.replace(str(here), "<run>")
-        runs[jobs] = (result, output, reports(here), (here / "baseline.txt").read_text())
-
-    serial, serial_output, serial_reports, serial_baseline = runs["1"]
-    assert len(serial_reports) == len(CLI_INSTANTS)
-    for jobs in ("2", None):
-        result, output, written, kept = runs[jobs]
-        assert result.exit_code == serial.exit_code, result.output
-        assert summary_lines(output) == summary_lines(serial_output)
-        assert output.splitlines()[-1] == serial_output.splitlines()[-1]
-        assert written.keys() == serial_reports.keys()
-        for name, table in written.items():
-            assert table.equals(serial_reports[name]), (jobs, name)
-        assert kept == serial_baseline
-
-
-def test_cli_prune_with_jobs_prunes_as_serial(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(cli, "_cores", lambda: 4)  # --jobs 2 must not depend on this machine
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(
-        tmp_path,
-        overrides=[MERGE],
-        baseline=[*LEAK_KEYS, OTHER_KEY],
-        prune=True,
-        instants=CLI_INSTANTS,
-        jobs="2",
-    )
-    assert result.exit_code == 0, result.output
-    assert load_baseline(tmp_path / "baseline.txt") == LEAK_KEYS
-
-
-def test_cli_default_jobs_fit_a_small_machine(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # a CI runner has 2-4 cores: the default must shrink to them, not be refused
-    monkeypatch.setattr(cli, "_cores", lambda: 2)
-    used: list[int] = []
-    real = cli.run_instants
-
-    def spy(*args: Any, **kwargs: Any) -> Any:
-        used.append(kwargs["jobs"])
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(cli, "run_instants", spy)
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(tmp_path, overrides=[MERGE], baseline=LEAK_KEYS, instants=CLI_INSTANTS)
-    assert result.exit_code == 0, result.output
-    assert used == [2]
-
-
-def test_cli_default_jobs_are_bounded_by_memory_not_cores(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # 2026-10-20 on the real store: 6 workers ran out of a 31 GB machine (the kernel killed one
-    # at the 2026 instants, ~6 GB each); 4 peaked at 22 GB in all. More cores add no memory.
-    monkeypatch.setattr(cli, "_cores", lambda: 32)
-    used: list[int] = []
-    real = cli.run_instants
-
-    def spy(*args: Any, **kwargs: Any) -> Any:
-        used.append(kwargs["jobs"])
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(cli, "run_instants", spy)
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(tmp_path, overrides=[MERGE], baseline=LEAK_KEYS, instants=CLI_INSTANTS)
-    assert result.exit_code == 0, result.output
-    assert used == [4]
-
-
-def test_cli_refuses_more_jobs_than_cores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_cores", lambda: 2)
-    write_cli_store(market_root(tmp_path))
-    result = run_truncation(tmp_path, overrides=[MERGE], instants=CLI_INSTANTS, jobs="3")
-    assert result.exit_code not in (0, LEAK_EXIT), result.output
-    assert "between 1 and 2" in result.output
-
-
-@pytest.mark.parametrize("jobs", ["0", "-2"])
-def test_cli_refuses_fewer_than_one_job_before_any_build(
-    tmp_path: Path, jobs: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    write_cli_store(market_root(tmp_path))
-
-    def no_build(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("built although --jobs was refused")
-
-    monkeypatch.setattr(sm, "build_security_master", no_build)
-    result = run_truncation(tmp_path, overrides=[MERGE], instants=CLI_INSTANTS, jobs=jobs)
-
-    assert result.exit_code not in (0, LEAK_EXIT), result.output
-    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
-    assert "jobs" in result.output
-    assert not report_dir(tmp_path).exists() or not list(report_dir(tmp_path).glob("*"))

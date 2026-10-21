@@ -9,26 +9,25 @@ reader could have seen.
 Target API (implementation pending), ``asof.ingest.truncation_impact``:
 
     IMPACT_SCHEMA = kind (leak | delay), what (price | cik), security, symbol, full_segment,
-        trunc_segment, first_day, last_day, days, detail
+        trunc_segment, first_day, last_day, days, detail, sessions
+        sessions: list<date32>, the sorted distinct session dates the row covers;
+        days == len(sessions), first_day == sessions[0], last_day == sessions[-1]
     impact_at(full, truncated, bars, splits, as_of, *, liquid=None, exhaustive=False) -> pa.Table
         a price cell present on both sides and differing is reported through the bars of both
         sides (rows with equal grouping columns merge); exhaustive=True compares every
         (security, day) cell instead of only the candidate cells, a verification mode whose
         output equals the default's
-    run_impact(full, inputs, overrides, splits, instants, *, liquid=None, jobs=1, progress=None)
-        -> [(instant UTC, impact_at(...))], sorted, one per distinct instant
-    KEY_IMPACT_SCHEMA = key, price_leak_days, cik_leak_days, price_delay_days, cik_delay_days,
-        instants_with_leak, example
-    summarize(keys, results) -> pa.Table
-    asof market truncation-impact [--as-of ISO]... [--instants PATH] [--overrides PATH]
-        [--baseline PATH] [--jobs N] [--data-dir DIR]
-        -> <market>/audit/truncation_impact/<UTC instant>.parquet; exit 0
-        a full run (no --as-of) first removes the instant files of earlier runs and writes
-        summary.parquet; an --as-of run writes summary-partial.parquet and leaves summary.parquet
-        alone; the liquid union always ends at the last instant of the --instants file; the
-        output ends with the number of leak rows matching no baseline key
-        refused (exit != 0, the file named, nothing built or written): a missing master file,
-        class file, corporate_actions/splits.parquet, or --baseline file
+    @dataclass(frozen=True) InstantResult(as_of: datetime UTC, diff: pa.Table, impact: pa.Table)
+        diff = master_truncation.compare(full, truncated, as_of) (DIFF_SCHEMA)
+        impact = impact_at(full, truncated, inputs.bars, splits, as_of, liquid=liquid)
+    run_instants(full, inputs, overrides, splits, instants, *, liquid=None, jobs=1, progress=None)
+        -> list[InstantResult]: ONE truncated build per distinct instant feeds both; sorted by
+        instant, deduplicated; a naive instant or jobs < 1 -> ValueError; jobs > 1 = a fork
+        process pool (parallel_map), results identical to jobs=1; progress(result) in instant
+        order
+    removed: run_impact, summarize, KEY_IMPACT_SCHEMA, unmatched_leaks (the per-key attribution
+    is asof.ingest.truncation_gate.attribute, tests/ingest/test_truncation_gate.py, which also
+    tests the `asof market truncation` command; `asof market truncation-impact` is gone)
 
 Fake data provenance:
 - Masters are hand-made MASTER_SCHEMA rows (``seg_row``: a segment knowable from 00:00 New York
@@ -56,58 +55,54 @@ Real-data checks for the assumptions (no as_of-free assumption here is left unch
   master shows Barrick's CIK 756894 on Barnes Group's B history (2020-01-02..2025-05-08) and
   continues Barnes's security with Barrick's B bars from 2025-05-09: a CIK leak and a price leak.
 - Exhaustive mode equals the default on the real store at 2022-09-04 (COHR, IIVI, B, YPF, AAPL).
-- Audit command: ``asof market truncation-impact`` on the real store at the fixed instants; its
-  summary over the 248 baseline keys is read by a human.
+- Audit command: ``asof market truncation`` on the real store at the fixed instants; every leak
+  cell is attributed to a diff key of its instant (none unmatched) and the per-key counts stand
+  in configs/truncation_impact_baseline.txt, read by a human.
 """
 
+import dataclasses
 import random
-import re
-from collections.abc import Collection, Sequence
+import time
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from typer.testing import CliRunner
 
-from asof import cli
-from asof.cli import app
 from asof.ingest import security_master as sm
 from asof.ingest.corporate_actions import SPLIT_SCHEMA
 from asof.ingest.corporate_actions import available_at as split_known
 from asof.ingest.instrument_class import CLASS_FILE, CLASS_SCHEMA
-from asof.ingest.master_truncation import compare, diff_key, load_baseline
+from asof.ingest.master_truncation import DIFF_SCHEMA, compare, diff_key
+from asof.ingest.security_master import build_security_master
 from asof.ingest.truncation_impact import (
     IMPACT_SCHEMA,
-    KEY_IMPACT_SCHEMA,
+    InstantResult,
     impact_at,
-    run_impact,
-    summarize,
+    run_instants,
 )
 from asof.store.db import default_data_dir
 from asof.store.market import market_root
-from asof.store.universe import tier_union
 from tests.ingest.fakes import daily
+from tests.ingest.master_scenarios import SCENARIOS
 from tests.ingest.test_master_truncation import (
     CLI_DAYS,
     CLI_DECIDED,
-    CLI_INSTANTS,
     CLI_SNAPSHOTS,
     LEAK_KEYS,
     MERGE,
     MICRO,
-    OTHER_KEY,
     cli_instants,
     cli_world,
     history_table,
+    instants_of,
     no_children_left,
-    stamp,
+    store_inputs_of,
     within,
-    write_yaml,
 )
 from tests.ingest.test_security_master import (
     bar_available_at,
@@ -138,6 +133,16 @@ def facts(table: pa.Table) -> list[Fact]:
          r["first_day"], r["last_day"], r["days"])
         for r in table.to_pylist()
     ]  # fmt: skip
+
+
+def check_sessions(table: pa.Table) -> None:
+    """The ``sessions`` invariant on every row: sorted, distinct, ``days`` of them, from
+    ``first_day`` to ``last_day``."""
+    for r in table.to_pylist():
+        sessions = r["sessions"]
+        assert sessions == sorted(set(sessions)), r
+        assert len(sessions) == r["days"], r
+        assert (sessions[0], sessions[-1]) == (r["first_day"], r["last_day"]), r
 
 
 def bar(
@@ -201,6 +206,7 @@ def impact(
         liquid=liquid,
     )
     assert out.schema.equals(IMPACT_SCHEMA)
+    check_sessions(out)
     return out
 
 
@@ -212,24 +218,15 @@ def impact(
 def test_impact_schema() -> None:
     assert IMPACT_SCHEMA.names == [
         "kind", "what", "security", "symbol", "full_segment", "trunc_segment",
-        "first_day", "last_day", "days", "detail",
+        "first_day", "last_day", "days", "detail", "sessions",
     ]  # fmt: skip
     for name in ("kind", "what", "security", "symbol", "full_segment", "trunc_segment", "detail"):
         assert IMPACT_SCHEMA.field(name).type == pa.string(), name
     assert IMPACT_SCHEMA.field("first_day").type == pa.date32()
     assert IMPACT_SCHEMA.field("last_day").type == pa.date32()
     assert IMPACT_SCHEMA.field("days").type == pa.int64()
-
-
-def test_key_impact_schema() -> None:
-    assert KEY_IMPACT_SCHEMA.names == [
-        "key", "price_leak_days", "cik_leak_days", "price_delay_days", "cik_delay_days",
-        "instants_with_leak", "example",
-    ]  # fmt: skip
-    assert KEY_IMPACT_SCHEMA.field("key").type == pa.string()
-    assert KEY_IMPACT_SCHEMA.field("example").type == pa.string()
-    for name in KEY_IMPACT_SCHEMA.names[1:-1]:
-        assert KEY_IMPACT_SCHEMA.field(name).type == pa.int64(), name
+    # the cells a row covers, for the gate's per-cell attribution (asof.ingest.truncation_gate)
+    assert IMPACT_SCHEMA.field("sessions").type == pa.list_(pa.date32())
 
 
 # =============================================================================================
@@ -266,6 +263,7 @@ def test_cli_world_compared_with_itself_has_no_impact(tmp_path: Path) -> None:
         out = impact_at(full, full, inputs.bars, splits_table(), t)
         assert out.schema.equals(IMPACT_SCHEMA), t
         assert out.num_rows == 0, t
+        assert out.column("sessions").type == pa.list_(pa.date32()), t
 
 
 @pytest.mark.parametrize("with_cik", [False, True], ids=["no_cik", "cik"])
@@ -353,24 +351,6 @@ def test_a_differing_cell_reports_the_bars_of_both_sides(b_in_full: bool) -> Non
     assert facts(impact(full, truncated, bars, liquid={"S1"})) == [H1_A, via_b]
     if b_in_full:
         assert facts(impact(full, truncated, bars, liquid={"S2"})) == [b_own]
-
-
-def test_a_symbol_joined_into_another_security_is_a_price_leak_on_its_baseline_key() -> None:
-    # H1 end to end. compare: B:2020-01-02 is in both masters, named B@2020-01-02 in full and
-    # A@2020-01-02 truncated -> B:2020-01-02:grouping_differs, the only leak (A's segment is
-    # named A@2020-01-02 on both sides, no field differs). summarize counts the rows touching
-    # segment B:2020-01-02 at the instant: (A@2020-01-02 through B, 5 days) and (B@2020-01-02
-    # through B, 5 days) = 10. Before H1 only the second row existed: 5.
-    full, truncated = joined_world(b_in_full=True)
-    bars = [*series("A", DAYS), *series("B", DAYS, 30.0)]
-    diffs = compare(master_table(full), master_table(truncated), AS_OF).to_pylist()
-    [key] = [diff_key(r) for r in diffs if r["kind"] == "leak"]
-    assert key == "B:2020-01-02:grouping_differs"
-
-    [row] = summarize([key], [(AS_OF, impact(full, truncated, bars))]).to_pylist()
-
-    assert row["price_leak_days"] == 10
-    assert (row["cik_leak_days"], row["price_delay_days"], row["instants_with_leak"]) == (0, 0, 1)
 
 
 def test_a_cell_missing_from_the_full_master_gets_no_truncated_side_leak_rows() -> None:
@@ -564,6 +544,11 @@ def test_days_count_distinct_sessions_and_rows_split_by_segment() -> None:
         ("leak", "price", "E@2020-01-02", "E", "E:2020-01-06", None,
          date(2020, 1, 6), date(2020, 1, 8), 2),
     ]  # fmt: skip
+    # the sessions themselves: 01-07 is inside the span but has no bar of E
+    assert out.column("sessions").to_pylist() == [
+        [date(2020, 1, 2)],
+        [date(2020, 1, 6), date(2020, 1, 8)],
+    ]
 
 
 def test_rows_are_sorted_by_what_kind_symbol_first_day() -> None:
@@ -764,7 +749,10 @@ def test_exhaustive_equals_the_candidate_cells_on_random_worlds() -> None:
             default = impact_at(full, truncated, bars, splits, as_of, liquid=scope)
             every = impact_at(full, truncated, bars, splits, as_of, liquid=scope, exhaustive=True)
             assert every.schema.equals(IMPACT_SCHEMA), seed
+            # equals compares the sessions lists too
             assert every.equals(default), (seed, scope, facts(every), facts(default))
+            check_sessions(default)
+            check_sessions(every)
             nonempty += default.num_rows > 0
             seen |= {(r["kind"], r["what"]) for r in default.to_pylist()}
     # not a comparison of empty tables: most worlds differ, and in every kind of way
@@ -817,6 +805,10 @@ def test_a_late_filed_bar_of_an_earlier_session_is_not_read_before_it_was_filed(
 
     [early] = facts(impact(full, truncated, bars))
     assert early[6:] == (AFTER[0], AFTER[-1], 2)
+    # the cells a reader at AS_OF has: not the late-filed day, although it lies inside the span
+    assert impact(full, truncated, bars).column("sessions").to_pylist() == [
+        [date(2020, 1, 6), date(2020, 1, 8)]
+    ]
     [late] = facts(impact(full, truncated, bars, as_of=LATE))
     assert late[6:] == (AFTER[0], AFTER[-1], 3)
 
@@ -886,31 +878,57 @@ def test_a_cik_the_full_master_still_withholds_counts_as_none(
 
 
 # =============================================================================================
-# run_impact
+# run_instants: one truncated build per instant, its diff and its impact
 # =============================================================================================
+# The real run loaded the store once per instant and built serially; the instants now run in a
+# fork-context process pool whose workers inherit the inputs. The diff and the impact of an
+# instant come from the same truncated build (one build per instant, not one per command), and
+# whatever the number of workers the results must be exactly those of the serial run.
 
 NO_SPLITS = splits_table()
 
 
 def hand_loop(
-    full: pa.Table, inputs: Any, instants: Sequence[datetime], liquid: Any = None
-) -> list[tuple[datetime, pa.Table]]:
-    return [
-        (t, impact_at(full, sm.build_from_inputs(inputs, [MERGE], as_of=t)[0], inputs.bars,
-                      NO_SPLITS, t, liquid=liquid))
-        for t in sorted({t.astimezone(UTC) for t in instants})
-    ]  # fmt: skip
+    full: pa.Table,
+    inputs: Any,
+    overrides: Sequence[Mapping[str, Any]],
+    instants: Sequence[datetime],
+    splits: pa.Table = NO_SPLITS,
+    liquid: Any = None,
+) -> list[tuple[datetime, pa.Table, pa.Table]]:
+    """(instant, compare, impact_at) of one truncated build per distinct instant, sorted."""
+    out = []
+    for t in sorted({t.astimezone(UTC) for t in instants}):
+        truncated = sm.build_from_inputs(inputs, overrides, as_of=t)[0]
+        out.append(
+            (t, compare(full, truncated, t),
+             impact_at(full, truncated, inputs.bars, splits, t, liquid=liquid))
+        )  # fmt: skip
+    return out
 
 
-def same_results(left: Any, right: Any) -> None:
-    assert [t for t, _ in left] == [t for t, _ in right]
-    for (t, a), (_, b) in zip(left, right, strict=True):
-        assert a.schema.equals(IMPACT_SCHEMA), t
-        assert a.equals(b), t
+def same_results(got: Sequence[InstantResult], expected: Sequence[Any]) -> None:
+    """``expected``: InstantResults or (instant, diff, impact) triples."""
+    triples = [(e.as_of, e.diff, e.impact) if isinstance(e, InstantResult) else e for e in expected]
+    assert [r.as_of for r in got] == [t for t, _, _ in triples]
+    for r, (t, diff, rows) in zip(got, triples, strict=True):
+        assert isinstance(r, InstantResult), t
+        assert r.diff.schema.equals(DIFF_SCHEMA), t
+        assert r.impact.schema.equals(IMPACT_SCHEMA), t
+        assert r.diff.equals(diff), t
+        assert r.impact.equals(rows), t
+        check_sessions(r.impact)
+
+
+def leak_keys(diff: pa.Table) -> set[str]:
+    return {diff_key(r) for r in diff.to_pylist() if r["kind"] == "leak"}
+
+
+# --- normal ---
 
 
 def test_the_cli_world_merge_shows_as_price_impact_before_the_decision(tmp_path: Path) -> None:
-    # The fixture the run_impact and CLI tests rely on. Before the merge is decided, the full
+    # The fixture the run_instants and CLI tests rely on. Before the merge is decided, the full
     # master reads KRSA's bars inside CYCN's security (CYCN@2024-01-02 then holds two equal bars a
     # day, the build then one) and the build reads them as KRSA@2024-01-02, which the full master
     # does not name: a leak on CYCN's cells, a delay on KRSA's.
@@ -919,7 +937,8 @@ def test_the_cli_world_merge_shows_as_price_impact_before_the_decision(tmp_path:
     truncated = sm.build_from_inputs(inputs, [MERGE], as_of=early)[0]
     assert set(LEAK_KEYS) <= {diff_key(r) for r in compare(full, truncated, early).to_pylist()}
 
-    out = facts(impact_at(full, truncated, inputs.bars, NO_SPLITS, early))
+    table = impact_at(full, truncated, inputs.bars, NO_SPLITS, early)
+    out = facts(table)
 
     n = len(CLI_DAYS)
     assert ("delay", "price", "KRSA@2024-01-02", "KRSA", "KRSA:2024-01-02", "KRSA:2024-01-02",
@@ -930,12 +949,128 @@ def test_the_cli_world_merge_shows_as_price_impact_before_the_decision(tmp_path:
         assert f[1:3] == ("price", "CYCN@2024-01-02")
         assert f[6:] == (CLI_DAYS[0], CLI_DAYS[-1], n)
     assert not [f for f in out if f[1] == "cik"]
+    check_sessions(table)
+    for r in table.to_pylist():
+        assert r["sessions"] == CLI_DAYS, r
     decided = et_midnight(CLI_DECIDED)
     truncated = sm.build_from_inputs(inputs, [MERGE], as_of=decided)[0]
     assert impact_at(full, truncated, inputs.bars, NO_SPLITS, decided).num_rows == 0
 
 
-def test_run_impact_serial_is_the_hand_loop_on_sorted_distinct_instants(tmp_path: Path) -> None:
+def test_instant_result_is_a_frozen_dataclass_of_instant_diff_and_impact() -> None:
+    result = InstantResult(
+        as_of=AS_OF, diff=DIFF_SCHEMA.empty_table(), impact=IMPACT_SCHEMA.empty_table()
+    )
+    assert [f.name for f in dataclasses.fields(result)] == ["as_of", "diff", "impact"]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.as_of = LATE  # type: ignore[misc]
+
+
+def test_run_instants_serial_is_compare_and_impact_at_of_the_same_build(tmp_path: Path) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = cli_instants(full)
+    assert len(instants) >= 4
+
+    got = run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=1)
+
+    same_results(got, hand_loop(full, inputs, [MERGE], instants))
+    # the fixture is not a comparison of empty tables: at 2024-03-01 both carry the merge leak
+    early = et_midnight(date(2024, 3, 1))
+    [at_early] = [r for r in got if r.as_of == early]
+    assert leak_keys(at_early.diff) == set(LEAK_KEYS)
+    assert [r for r in at_early.impact.to_pylist() if r["kind"] == "leak"]
+
+
+def test_run_instants_builds_each_instant_once_for_both_diff_and_impact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # one truncated build feeds compare and impact_at: two builds per instant would double the
+    # run (33 s per real build) and could let the diff and the impact see different masters
+    _, inputs, full = cli_world(tmp_path)
+    calls: list[int] = []
+
+    def counting(**kwargs: Any) -> Any:
+        calls.append(1)
+        return build_security_master(**kwargs)
+
+    monkeypatch.setattr(sm, "build_security_master", counting)
+    decided, early = et_midnight(CLI_DECIDED), et_midnight(date(2024, 3, 1))
+    run_instants(full, inputs, [MERGE], NO_SPLITS, [decided, early, decided], jobs=1)
+    assert len(calls) == 2
+
+
+def test_run_instants_default_jobs_is_serial(tmp_path: Path) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = cli_instants(full)
+    same_results(
+        run_instants(full, inputs, [MERGE], NO_SPLITS, instants),
+        run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=1),
+    )
+
+
+@pytest.mark.parametrize("jobs", [2, 3])
+def test_run_instants_in_a_pool_equals_serial_on_the_cli_store(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = cli_instants(full)
+    serial = run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=1)
+    with within(120):
+        pooled = run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=jobs)
+    same_results(pooled, serial)
+    # not a comparison of empty tables: some instant has both a diff and an impact
+    assert any(r.diff.num_rows and r.impact.num_rows for r in serial)
+    assert no_children_left()
+
+
+@pytest.mark.parametrize("scenario", ["r_gold_b", "l_arnc", "r4"])
+def test_run_instants_in_a_pool_equals_serial_on_leaking_worlds(scenario: str) -> None:
+    inputs = store_inputs_of(SCENARIOS[scenario]())
+    full, _ = sm.build_from_inputs(inputs)
+    instants = instants_of(full, SCENARIOS[scenario]())
+    serial = run_instants(full, inputs, (), NO_SPLITS, instants, jobs=1)
+    with within(120):
+        pooled = run_instants(full, inputs, (), NO_SPLITS, instants, jobs=2)
+    same_results(pooled, serial)
+    assert any(leak_keys(r.diff) for r in serial), f"{scenario}: no leak rows; pick a leaking world"
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_passes_liquid_and_splits_to_every_instant(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    [merged] = {r["security_id"] for r in full.to_pylist() if r["symbol"] == "CYCN"}
+    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
+    # a 2:1 split on CYCN only, knowable before the first instant: a different price history
+    # for CYCN's bars than for KRSA's identical ones (impact_at reads the splits it is given)
+    splits = splits_table([("CYCN", CLI_DAYS[3], 2.0, None)])
+    with within(120):
+        got = run_instants(
+            full, inputs, [MERGE], splits, instants, liquid={merged}, jobs=jobs
+        )  # fmt: skip
+    same_results(got, hand_loop(full, inputs, [MERGE], instants, splits, liquid={merged}))
+    # KRSA@2024-01-02 is no name of the liquid security: its delay is filtered out
+    assert all(r["security"] == "CYCN@2024-01-02" for res in got for r in res.impact.to_pylist())
+    assert got[0].impact.num_rows > 0
+    # the diff is the master comparison alone: liquid and splits do not filter it
+    assert got[0].diff.equals(hand_loop(full, inputs, [MERGE], instants[:1])[0][1])
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_progress_sees_each_result_in_instant_order(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    instants = cli_instants(full)
+    seen: list[InstantResult] = []
+    with within(120):
+        got = run_instants(
+            full, inputs, [MERGE], NO_SPLITS, list(reversed(instants)), jobs=jobs,
+            progress=seen.append,
+        )  # fmt: skip
+    assert [r.as_of for r in seen] == sorted(instants)
+    same_results(seen, got)
+
+
+# --- edges ---
+
+
+def test_run_instants_sorts_and_deduplicates_the_instants(tmp_path: Path) -> None:
     _, inputs, full = cli_world(tmp_path)
     decided, early = et_midnight(CLI_DECIDED), et_midnight(date(2024, 3, 1))
     # the same instant twice (New York and UTC), out of order
@@ -943,178 +1078,147 @@ def test_run_impact_serial_is_the_hand_loop_on_sorted_distinct_instants(tmp_path
     expected = sorted({t.astimezone(UTC) for t in given})
     assert len(expected) == 3
 
-    got = run_impact(full, inputs, [MERGE], NO_SPLITS, given, jobs=1)
+    for jobs in (1, 2):
+        with within(120):
+            got = run_instants(full, inputs, [MERGE], NO_SPLITS, given, jobs=jobs)
+        assert [r.as_of for r in got] == expected, jobs
+        assert all(r.as_of.utcoffset() == timedelta(0) for r in got), jobs
+        same_results(got, hand_loop(full, inputs, [MERGE], given))
 
-    assert [t for t, _ in got] == expected
-    assert all(t.utcoffset() == timedelta(0) for t, _ in got)
-    same_results(got, hand_loop(full, inputs, given))
 
-
-def test_run_impact_default_jobs_is_serial(tmp_path: Path) -> None:
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_of_no_instants_is_empty(tmp_path: Path, jobs: int) -> None:
     _, inputs, full = cli_world(tmp_path)
-    instants = cli_instants(full)
-    same_results(
-        run_impact(full, inputs, [MERGE], NO_SPLITS, instants),
-        run_impact(full, inputs, [MERGE], NO_SPLITS, instants, jobs=1),
-    )
+    with within(60):
+        assert run_instants(full, inputs, [MERGE], NO_SPLITS, [], jobs=jobs) == []
 
 
-def test_run_impact_in_a_pool_equals_serial(tmp_path: Path) -> None:
+def test_run_instants_with_more_jobs_than_instants(tmp_path: Path) -> None:
     _, inputs, full = cli_world(tmp_path)
-    instants = cli_instants(full)
-    serial = run_impact(full, inputs, [MERGE], NO_SPLITS, instants, jobs=1)
+    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
+    serial = run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=1)
     with within(120):
-        pooled = run_impact(full, inputs, [MERGE], NO_SPLITS, instants, jobs=2)
-    same_results(pooled, serial)
-    assert any(table.num_rows for _, table in serial)  # not a comparison of empty tables
+        same_results(run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=8), serial)
+        same_results(
+            run_instants(full, inputs, [MERGE], NO_SPLITS, instants[:1], jobs=8), serial[:1]
+        )
     assert no_children_left()
 
 
-@pytest.mark.parametrize("jobs", [1, 2])
-def test_run_impact_passes_liquid_to_every_instant(tmp_path: Path, jobs: int) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    [merged] = {r["security_id"] for r in full.to_pylist() if r["symbol"] == "CYCN"}
-    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
-    with within(120):
-        got = run_impact(full, inputs, [MERGE], NO_SPLITS, instants, liquid={merged}, jobs=jobs)
-    same_results(got, hand_loop(full, inputs, instants, liquid={merged}))
-    # KRSA@2024-01-02 is no name of the liquid security: its delay is filtered out
-    assert all(r["security"] == "CYCN@2024-01-02" for _, t in got for r in t.to_pylist())
-    assert got[0][1].num_rows > 0
-
-
-@pytest.mark.parametrize("jobs", [1, 2])
-def test_run_impact_progress_sees_each_instant_in_order(tmp_path: Path, jobs: int) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    instants = cli_instants(full)
-    seen: list[tuple[datetime, int]] = []
-    with within(120):
-        got = run_impact(
-            full, inputs, [MERGE], NO_SPLITS, list(reversed(instants)), jobs=jobs,
-            progress=lambda t, table: seen.append((t, table.num_rows)),
-        )  # fmt: skip
-    assert seen == [(t, table.num_rows) for t, table in got]
-    assert [t for t, _ in seen] == sorted(instants)
-
-
-@pytest.mark.parametrize("jobs", [1, 2])
-def test_run_impact_of_no_instants_is_empty(tmp_path: Path, jobs: int) -> None:
-    _, inputs, full = cli_world(tmp_path)
-    with within(60):
-        assert run_impact(full, inputs, [MERGE], NO_SPLITS, [], jobs=jobs) == []
-
-
 @pytest.mark.parametrize("jobs", [0, -1])
-def test_run_impact_refuses_fewer_than_one_job(tmp_path: Path, jobs: int) -> None:
+def test_run_instants_refuses_fewer_than_one_job(tmp_path: Path, jobs: int) -> None:
     _, inputs, full = cli_world(tmp_path)
     with pytest.raises(ValueError):
-        run_impact(full, inputs, [MERGE], NO_SPLITS, [et_midnight(CLI_DECIDED)], jobs=jobs)
+        run_instants(full, inputs, [MERGE], NO_SPLITS, [et_midnight(CLI_DECIDED)], jobs=jobs)
     with pytest.raises(ValueError):  # refused even with nothing to run
-        run_impact(full, inputs, [MERGE], NO_SPLITS, [], jobs=jobs)
+        run_instants(full, inputs, [MERGE], NO_SPLITS, [], jobs=jobs)
 
 
 @pytest.mark.parametrize("jobs", [1, 2])
-def test_run_impact_each_instant_builds_from_its_own_inputs(tmp_path: Path, jobs: int) -> None:
-    # Leakage. The merge decided on 2024-06-03 is in the overrides every worker inherits; the
-    # build one microsecond before must not use it (CYCN's cells differ), the build at it must.
+def test_run_instants_refuses_a_naive_instant(tmp_path: Path, jobs: int) -> None:
+    _, inputs, full = cli_world(tmp_path)
+    with within(60), pytest.raises(ValueError):
+        run_instants(full, inputs, [MERGE], NO_SPLITS, [datetime(2024, 3, 1)], jobs=jobs)
+    assert no_children_left()
+
+
+def failing_at_two_snapshots(real: Callable[..., Any]) -> Callable[..., Any]:
+    """build_security_master raising when exactly two of the three CLI snapshots are given:
+    the instants from 2024-03-01 to before 2024-05-01. Installed in the parent, so a forked
+    worker inherits it."""
+
+    def build(**kwargs: Any) -> Any:
+        snapshots = set(kwargs["sec_history"].column("snapshot_date").to_pylist())
+        if len(snapshots) == 2:
+            raise ValueError("planted failure at the 2024-03-01 instant")
+        return real(**kwargs)
+
+    return build
+
+
+@pytest.mark.parametrize("jobs", [1, 2, 3])
+def test_run_instants_an_error_at_one_instant_reaches_the_caller(
+    tmp_path: Path, jobs: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, inputs, full = cli_world(tmp_path)  # the full build, before the failure is planted
+    monkeypatch.setattr(
+        sm, "build_security_master", failing_at_two_snapshots(build_security_master)
+    )
+    instants = [
+        et_midnight(date(2024, 1, 5)),
+        et_midnight(date(2024, 3, 1)),  # the failing one
+        et_midnight(CLI_DECIDED),
+        datetime(2030, 1, 1, tzinfo=UTC),
+    ]
+    with within(120), pytest.raises(ValueError, match="planted failure"):
+        run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=jobs)
+    assert no_children_left()
+
+
+def test_run_instants_an_error_does_not_wait_on_a_stuck_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # one instant fails, a later one never returns: the error must arrive and the stuck worker
+    # must be gone, not waited on (a hung build would otherwise hang the whole run)
+    _, inputs, full = cli_world(tmp_path)
+    real = build_security_master
+
+    def build(**kwargs: Any) -> Any:
+        snapshots = set(kwargs["sec_history"].column("snapshot_date").to_pylist())
+        if len(snapshots) == 2:
+            raise ValueError("planted failure at the 2024-03-01 instant")
+        if len(snapshots) == 3:
+            time.sleep(1e6)
+        return real(**kwargs)
+
+    monkeypatch.setattr(sm, "build_security_master", build)
+    instants = [et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)]
+    with within(60), pytest.raises(ValueError, match="planted failure"):
+        run_instants(full, inputs, [MERGE], NO_SPLITS, instants, jobs=2)
+    assert no_children_left()
+
+
+# --- leakage ---
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_each_worker_truncates_to_its_own_instant(tmp_path: Path, jobs: int) -> None:
+    # Leakage. The merge decided on 2024-06-03 is in the overrides every worker inherits; a
+    # worker must still build the master of one microsecond before without it (the KRSA leak in
+    # the diff, CYCN's cells in the impact), and only the 06-03 build may use it (neither).
     _, inputs, full = cli_world(tmp_path)
     decided = et_midnight(CLI_DECIDED)
     with within(120):
-        (before, early), (at, late) = run_impact(
+        early, late = run_instants(
             full, inputs, [MERGE], NO_SPLITS, [decided, decided - MICRO], jobs=jobs
         )
-    assert (before, at) == (decided - MICRO, decided)
-    assert [r for r in early.to_pylist() if r["kind"] == "leak"]
-    assert late.num_rows == 0
+    assert (early.as_of, late.as_of) == (decided - MICRO, decided)
+    assert leak_keys(early.diff) == set(LEAK_KEYS)
+    assert [r for r in early.impact.to_pylist() if r["kind"] == "leak"]
+    assert late.diff.num_rows == 0
+    assert late.impact.num_rows == 0
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_run_instants_impact_never_reads_bars_later_than_its_instant(
+    tmp_path: Path, jobs: int
+) -> None:
+    # Leakage. Every worker inherits all bars (through 2024-06-28); at 2024-01-05 00:00 New York
+    # only the 01-02, 01-03 and 01-04 sessions are knowable (01-04's bar from 20:00 that
+    # evening; measured on this store: the leak rows cover 3 sessions there, 31 at 2024-03-01).
+    # The impact's sessions must stop before 01-05.
+    _, inputs, full = cli_world(tmp_path)
+    t = et_midnight(date(2024, 1, 5))
+    with within(120):
+        [result] = run_instants(full, inputs, [MERGE], NO_SPLITS, [t], jobs=jobs)
+    sessions = {d for r in result.impact.to_pylist() for d in r["sessions"]}
+    assert sessions
+    assert max(sessions) < date(2024, 1, 5)
 
 
 # =============================================================================================
-# summarize
-# =============================================================================================
-
-T1 = datetime(2024, 3, 1, 5, tzinfo=UTC)
-T2 = datetime(2024, 6, 3, 4, tzinfo=UTC)
-KEY_A = "A:2020-01-02:grouping_differs"
-KEY_B = "B:2020-01-06:only_in_full"
-KEY_C = "C:2020-01-02:fields_differ:cik+valid_to"  # the fields part does not take part in matching
-KEY_Z = "Z:2020-01-02:replaced"
-
-
-def impact_rows(rows: Sequence[tuple[Any, ...]]) -> pa.Table:
-    names = IMPACT_SCHEMA.names
-    return pa.Table.from_pylist([dict(zip(names, r, strict=True)) for r in rows], IMPACT_SCHEMA)
-
-
-def summary_results() -> list[tuple[datetime, pa.Table]]:
-    d1, d2 = date(2020, 1, 6), date(2020, 1, 8)
-    t1 = impact_rows([
-        ("leak", "price", "A@2020-01-02", "A", "A:2020-01-02", "A:2020-01-02", d1, d2, 3, "a1"),
-        # matches A by its full segment only
-        ("leak", "price", "Q@2020-01-02", "A", "A:2020-01-02", None, d1, d2, 2, "a2"),
-        ("leak", "cik", None, "B", "B:2020-01-06", None, d1, d2, 2, "b1"),
-        # matches C by its truncated segment only
-        ("delay", "cik", None, "C", None, "C:2020-01-02", d1, d1, 1, "c1"),
-        # neither matches A: another symbol sharing a prefix, another valid_from
-        ("leak", "price", "AB@2020-01-02", "AB", "AB:2020-01-02", "AB:2020-01-02", d1, d2, 9, ""),
-        ("leak", "price", "A@2020-01-03", "A", "A:2020-01-03", None, d1, d2, 8, ""),
-    ])  # fmt: skip
-    t2 = impact_rows([
-        ("leak", "price", "A@2020-01-02", "A", "A:2020-01-02", "A:2020-01-02", d1, d2, 4, "a3"),
-        ("delay", "price", "A@2020-01-06", "A", None, "A:2020-01-02", d1, d2, 7, "a4"),
-        ("leak", "cik", None, "B", "B:2020-01-06", None, d1, d2, 3, "b2"),
-    ])  # fmt: skip
-    return [(T1, t1), (T2, t2)]
-
-
-def test_summarize_takes_the_largest_instant_not_the_sum() -> None:
-    # the same days recur at many instants: A's price leak is 3 + 2 = 5 days at T1 and 4 at T2,
-    # so 5 (not 9); B's CIK leak 2 then 3, so 3
-    out = summarize([KEY_A, KEY_B, KEY_C, KEY_Z], summary_results())
-
-    assert out.schema.equals(KEY_IMPACT_SCHEMA)
-    rows = {r["key"]: r for r in out.to_pylist()}
-    counts = ("price_leak_days", "cik_leak_days", "price_delay_days", "cik_delay_days",
-              "instants_with_leak")  # fmt: skip
-    assert {k: tuple(r[c] for c in counts) for k, r in rows.items()} == {
-        KEY_A: (5, 0, 7, 0, 2),
-        KEY_B: (0, 3, 0, 0, 2),
-        KEY_C: (0, 0, 0, 1, 0),
-        KEY_Z: (0, 0, 0, 0, 0),
-    }
-
-
-def test_summarize_example_is_the_first_instant_with_a_leak() -> None:
-    rows = {r["key"]: r for r in summarize([KEY_A, KEY_B, KEY_C, KEY_Z], summary_results())
-            .to_pylist()}  # fmt: skip
-    assert rows[KEY_B]["example"] == f"{T1.isoformat()} b1"
-    # two leak rows of A at T1: either detail, from T1
-    assert rows[KEY_A]["example"] in (f"{T1.isoformat()} a1", f"{T1.isoformat()} a2")
-    assert rows[KEY_C]["example"] is None  # a delay is no example of a leak
-    assert rows[KEY_Z]["example"] is None
-
-
-def test_summarize_one_row_per_distinct_key_in_key_order() -> None:
-    keys = [KEY_A, KEY_A, KEY_B, KEY_C, KEY_Z]  # given sorted; one duplicate
-    out = summarize(keys, summary_results())
-    assert out.column("key").to_pylist() == [KEY_A, KEY_B, KEY_C, KEY_Z]
-
-
-def test_summarize_ignores_the_fields_part_of_a_key() -> None:
-    with_fields = "A:2020-01-02:fields_differ:cik"
-    [row] = summarize([with_fields], summary_results()).to_pylist()
-    assert (row["price_leak_days"], row["instants_with_leak"]) == (5, 2)
-
-
-def test_summarize_of_no_results_is_zeros() -> None:
-    out = summarize([KEY_A, KEY_Z], [])
-    assert out.schema.equals(KEY_IMPACT_SCHEMA)
-    for r in out.to_pylist():
-        assert [r[c] for c in KEY_IMPACT_SCHEMA.names[1:]] == [0, 0, 0, 0, 0, None]
-    assert summarize([], summary_results()).num_rows == 0
-
-
-# =============================================================================================
-# CLI: asof market truncation-impact
+# the CYCN / KRSA store with a liquid tier (the `asof market truncation` tests in
+# tests/ingest/test_truncation_gate.py run on it)
 # =============================================================================================
 
 
@@ -1169,358 +1273,10 @@ def write_liquid_store(root: Path) -> Path:
     return root
 
 
-AAA_KEY = "AAA:2024-01-02:only_in_full"  # AAA's cells are equal on both sides: matches nothing
-CLI_BASELINE = [AAA_KEY, OTHER_KEY, *LEAK_KEYS]
-
-
-def run_impact_cli(
-    tmp_path: Path,
-    *,
-    as_of: Sequence[str] = (),
-    baseline: Sequence[str] = CLI_BASELINE,
-    instants: Sequence[str] = CLI_INSTANTS,
-    jobs: str | None = None,
-    baseline_file: Path | None = None,
-) -> Any:
-    """``baseline_file``: pass this path as --baseline as it is (it may not exist) instead of
-    writing ``baseline`` to a file of the test's own."""
-    overrides_path = write_yaml(tmp_path / "overrides.yaml", [MERGE])
-    baseline_path = tmp_path / "baseline.txt"  # never the repo's configs/truncation_baseline.txt
-    if baseline_file is None:
-        baseline_path.write_text("".join(f"{k}\n" for k in baseline))
-    else:
-        baseline_path = baseline_file
-    instants_path = tmp_path / "instants.txt"  # never the repo's configs/truncation_instants.txt
-    instants_path.write_text("".join(f"{t}\n" for t in instants))
-    args = ["market", "truncation-impact"]
-    for value in as_of:
-        args += ["--as-of", value]
-    args += [
-        "--overrides", str(overrides_path),
-        "--baseline", str(baseline_path),
-        "--instants", str(instants_path),
-        *(["--jobs", jobs] if jobs is not None else []),
-        "--data-dir", str(tmp_path),
-    ]  # fmt: skip
-    return CliRunner().invoke(app, args)
-
-
-def impact_dir(tmp_path: Path) -> Path:
-    return market_root(tmp_path) / "audit" / "truncation_impact"
-
-
-def instant_files(tmp_path: Path) -> dict[str, pa.Table]:
-    return {
-        p.name: pq.read_table(p)
-        for p in sorted(impact_dir(tmp_path).glob("*.parquet"))
-        if p.name not in ("summary.parquet", "summary-partial.parquet")
-    }
-
-
 def cycn_id(tmp_path: Path) -> str:
     master = pq.read_table(market_root(tmp_path) / sm.MASTER_FILE)
     [found] = {r["security_id"] for r in master.to_pylist() if r["symbol"] == "CYCN"}
     return found
-
-
-def test_cli_writes_one_impact_file_per_instant_and_exits_zero_on_leaks(tmp_path: Path) -> None:
-    write_liquid_store(market_root(tmp_path))
-
-    result = run_impact_cli(tmp_path)
-
-    assert result.exit_code == 0, result.output  # a measurement, not a gate
-    early, decided = et_midnight(date(2024, 3, 1)), et_midnight(CLI_DECIDED)
-    files = instant_files(tmp_path)
-    assert list(files) == [f"{stamp(early)}.parquet", f"{stamp(decided)}.parquet"]
-    for table in files.values():
-        assert table.schema.equals(IMPACT_SCHEMA)
-    # only CYCN's security is liquid: its leak stays, KRSA@2024-01-02's delay is filtered out
-    rows = files[f"{stamp(early)}.parquet"].to_pylist()
-    assert rows
-    assert {(r["kind"], r["what"], r["security"]) for r in rows} == {
-        ("leak", "price", "CYCN@2024-01-02")
-    }
-    assert files[f"{stamp(decided)}.parquet"].num_rows == 0
-    assert len(result.output.splitlines()) >= len(CLI_INSTANTS) + 1
-
-
-def test_cli_summary_is_summarize_of_the_instant_files(tmp_path: Path) -> None:
-    write_liquid_store(market_root(tmp_path))
-
-    result = run_impact_cli(tmp_path)
-
-    assert result.exit_code == 0, result.output
-    summary = pq.read_table(impact_dir(tmp_path) / "summary.parquet")
-    assert summary.schema.equals(KEY_IMPACT_SCHEMA)
-    results = [
-        (datetime.strptime(name.removesuffix(".parquet"), "%Y%m%dT%H%M%S%f").replace(tzinfo=UTC),
-         table)
-        for name, table in instant_files(tmp_path).items()
-    ]  # fmt: skip
-    keys = load_baseline(tmp_path / "baseline.txt")
-    assert summary.equals(summarize(keys, results))
-    rows = {r["key"]: r for r in summary.to_pylist()}
-    # By hand. Liquid = {CYCN's merged id}, whose name is CYCN@2024-01-02. At 2024-03-01 the full
-    # cell (CYCN@2024-01-02, d) is {CYCN's bar, KRSA's bar} and the truncated one {CYCN's bar}:
-    # it differs on all n days. Leak rows: through CYCN (CYCN:2024-01-02 on both sides; H1's
-    # truncated-side CYCN bars have the same grouping columns and merge into it, still n days)
-    # and through KRSA (KRSA:2024-01-02 on both sides, n days). KRSA's truncated-only cells
-    # (KRSA@2024-01-02) are a delay outside the liquid scope: filtered. CIKs 1004 / 1005 are
-    # the same on both sides: no cik rows. At 2024-06-03 the build has the merge: no rows.
-    # So OTHER_KEY (segment CYCN:2024-01-02) and LEAK_KEYS[0] (KRSA:2024-01-02) each get n
-    # price leak days at one instant; AAA's cells are equal: nothing.
-    n = len(CLI_DAYS)
-    counts = ("price_leak_days", "cik_leak_days", "price_delay_days", "cik_delay_days",
-              "instants_with_leak")  # fmt: skip
-    assert {k: tuple(r[c] for c in counts) for k, r in rows.items()} == {
-        AAA_KEY: (0, 0, 0, 0, 0),
-        OTHER_KEY: (n, 0, 0, 0, 1),
-        LEAK_KEYS[0]: (n, 0, 0, 0, 1),
-    }
-    with_leak = sum(1 for r in rows.values() if r["price_leak_days"] + r["cik_leak_days"] > 0)
-    assert with_leak == 2
-    # the per-key tally line (no longer necessarily the last: the unmatched-row count follows)
-    assert any(
-        "baseline key" in line and str(with_leak) in line and str(len(rows) - with_leak) in line
-        for line in result.output.splitlines()
-    ), result.output
-
-
-def test_cli_liquid_is_the_tier_union_from_2020_to_the_last_instant(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    write_liquid_store(market_root(tmp_path))
-    spans: list[tuple[date, date]] = []
-    real_union = cli.tier_union
-
-    def union_spy(con: Any, root: Path, start: date, end: date, **kwargs: Any) -> pa.Table:
-        spans.append((start, end))
-        return real_union(con, root, start, end, **kwargs)
-
-    used: list[Any] = []
-    real_run = cli.run_impact
-
-    def run_spy(*args: Any, **kwargs: Any) -> Any:
-        used.append(kwargs.get("liquid"))
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(cli, "tier_union", union_spy)
-    monkeypatch.setattr(cli, "run_impact", run_spy)
-
-    result = run_impact_cli(tmp_path)
-
-    assert result.exit_code == 0, result.output
-    [(start, end)] = spans
-    assert start == date(2020, 1, 1)
-    assert (end.year, end.month) == (CLI_DECIDED.year, CLI_DECIDED.month)  # the latest instant
-    # the fixture guard: the real tier over these months is CYCN's merged security
-    con = duckdb.connect()
-    try:
-        tier = tier_union(con, market_root(tmp_path), start, end)
-    finally:
-        con.close()
-    assert set(tier.column("security_id").to_pylist()) == {cycn_id(tmp_path)}
-    [liquid] = used
-    assert set(liquid) == {cycn_id(tmp_path)}
-
-
-def test_cli_liquid_union_ends_at_the_last_fixed_instant_also_for_as_of_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The liquid set must not depend on which instants a run picks: a partial run at 2024-03-01
-    # reads the same tier as the full run, through the last instant of --instants (2024-06-03).
-    write_liquid_store(market_root(tmp_path))
-    spans: list[tuple[date, date]] = []
-    real_union = cli.tier_union
-
-    def union_spy(con: Any, root: Path, start: date, end: date, **kwargs: Any) -> pa.Table:
-        spans.append((start, end))
-        return real_union(con, root, start, end, **kwargs)
-
-    monkeypatch.setattr(cli, "tier_union", union_spy)
-
-    result = run_impact_cli(tmp_path, as_of=["2024-03-01"])
-
-    assert result.exit_code == 0, result.output
-    [(start, end)] = spans
-    assert start == date(2020, 1, 1)
-    assert (end.year, end.month) == (CLI_DECIDED.year, CLI_DECIDED.month)
-
-
-def test_cli_as_of_runs_only_those_instants(tmp_path: Path) -> None:
-    write_liquid_store(market_root(tmp_path))
-    result = run_impact_cli(tmp_path, as_of=["2024-03-01"])
-    assert result.exit_code == 0, result.output
-    assert list(instant_files(tmp_path)) == ["20240301T050000000000.parquet"]
-    # changed (review H3): summary.parquet is reserved for full runs -- a partial run used to
-    # overwrite the full summary with one over its own instants. Its summary is
-    # summary-partial.parquet.
-    assert (impact_dir(tmp_path) / "summary-partial.parquet").exists()
-    assert not (impact_dir(tmp_path) / "summary.parquet").exists()
-
-
-def test_cli_partial_run_leaves_the_full_summary_untouched(tmp_path: Path) -> None:
-    write_liquid_store(market_root(tmp_path))
-    assert run_impact_cli(tmp_path).exit_code == 0
-    full_summary = (impact_dir(tmp_path) / "summary.parquet").read_bytes()
-
-    result = run_impact_cli(tmp_path, as_of=["2024-03-01"])
-
-    assert result.exit_code == 0, result.output
-    assert (impact_dir(tmp_path) / "summary.parquet").read_bytes() == full_summary
-    early = et_midnight(date(2024, 3, 1))
-    partial = pq.read_table(impact_dir(tmp_path) / "summary-partial.parquet")
-    rows = pq.read_table(impact_dir(tmp_path) / f"{stamp(early)}.parquet")
-    keys = load_baseline(tmp_path / "baseline.txt")
-    assert partial.equals(summarize(keys, [(early, rows)]))
-
-
-def test_cli_full_run_removes_instant_files_of_earlier_runs(tmp_path: Path) -> None:
-    # an instant dropped from --instants must not linger beside the run's own files, where a
-    # reader of the directory would take it for part of this run
-    write_liquid_store(market_root(tmp_path))
-    impact_dir(tmp_path).mkdir(parents=True)
-    stale = impact_dir(tmp_path) / "20190101T000000000000.parquet"
-    pq.write_table(IMPACT_SCHEMA.empty_table(), stale)
-
-    result = run_impact_cli(tmp_path)
-
-    assert result.exit_code == 0, result.output
-    assert not stale.exists()
-    expected = [f"{stamp(datetime.fromisoformat(t))}.parquet" for t in CLI_INSTANTS]
-    assert list(instant_files(tmp_path)) == expected
-
-
-@pytest.mark.parametrize(
-    ("baseline", "unmatched"), [(CLI_BASELINE, 0), ([AAA_KEY], 2)], ids=["all_named", "aaa_only"]
-)
-def test_cli_reports_the_leak_rows_matching_no_baseline_key(
-    tmp_path: Path, baseline: list[str], unmatched: int
-) -> None:
-    # By hand (see test_cli_summary_is_summarize_of_the_instant_files): the run's leak rows are
-    # two, both at 2024-03-01: CYCN@2024-01-02 through CYCN (segment CYCN:2024-01-02) and through
-    # KRSA (KRSA:2024-01-02). CLI_BASELINE names both segments (OTHER_KEY, LEAK_KEYS): 0 rows
-    # match no key. AAA's key alone matches neither: 2.
-    write_liquid_store(market_root(tmp_path))
-
-    result = run_impact_cli(tmp_path, baseline=baseline)
-
-    assert result.exit_code == 0, result.output
-    lines = [line for line in result.output.splitlines() if "no baseline key" in line]
-    assert lines, result.output
-    numbers = [int(n.replace(",", "")) for line in lines for n in re.findall(r"\d[\d,]*", line)]
-    assert unmatched in numbers, lines
-
-
-def no_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    def refuse(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("built although a precondition failed")
-
-    monkeypatch.setattr(sm, "build_security_master", refuse)
-    monkeypatch.setattr(cli, "build_from_inputs", refuse)
-
-
-def refused_cleanly(tmp_path: Path, result: Any, name: str) -> None:
-    assert result.exit_code != 0, result.output
-    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
-    assert name in result.output, result.output
-    assert not impact_dir(tmp_path).exists() or not list(impact_dir(tmp_path).glob("*"))
-
-
-@pytest.mark.parametrize("missing", [sm.MASTER_FILE, CLASS_FILE], ids=["master", "class"])
-def test_cli_refuses_a_missing_master_or_class_file_before_any_build(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
-) -> None:
-    root = write_liquid_store(market_root(tmp_path))
-    (root / missing).unlink()
-    no_build(monkeypatch)
-
-    result = run_impact_cli(tmp_path)
-
-    refused_cleanly(tmp_path, result, Path(missing).name)
-
-
-def test_cli_refuses_a_missing_split_file(tmp_path: Path) -> None:
-    # without it every split reads as "none": a price leak through a split would vanish
-    root = write_liquid_store(market_root(tmp_path))
-    (root / "corporate_actions" / "splits.parquet").unlink()
-
-    result = run_impact_cli(tmp_path)
-
-    refused_cleanly(tmp_path, result, "splits")
-
-
-def test_cli_refuses_a_baseline_file_that_does_not_exist(tmp_path: Path) -> None:
-    # a mistyped --baseline would otherwise summarise zero keys and look like "nothing matters"
-    write_liquid_store(market_root(tmp_path))
-    missing = tmp_path / "no_such_baseline.txt"
-
-    result = run_impact_cli(tmp_path, baseline_file=missing)
-
-    refused_cleanly(tmp_path, result, "no_such_baseline.txt")
-
-
-def test_cli_files_do_not_depend_on_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_cores", lambda: 4)
-    written = {}
-    for jobs in ("1", "2"):
-        here = tmp_path / f"jobs_{jobs}"
-        here.mkdir()
-        write_liquid_store(market_root(here))
-        result = run_impact_cli(here, jobs=jobs)
-        assert result.exit_code == 0, result.output
-        summary = pq.read_table(impact_dir(here) / "summary.parquet")
-        written[jobs] = (instant_files(here), summary)
-    (serial, serial_summary), (pooled, pooled_summary) = written["1"], written["2"]
-    assert serial.keys() == pooled.keys()
-    for name, table in serial.items():
-        assert table.equals(pooled[name]), name
-    assert serial_summary.equals(pooled_summary)
-
-
-@pytest.mark.parametrize(("cores", "expected"), [(2, 2), (32, 4)])
-def test_cli_default_jobs_is_the_smaller_of_4_and_the_cores(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cores: int, expected: int
-) -> None:
-    monkeypatch.setattr(cli, "_cores", lambda: cores)
-    used: list[int] = []
-    real = cli.run_impact
-
-    def spy(*args: Any, **kwargs: Any) -> Any:
-        used.append(kwargs["jobs"])
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(cli, "run_impact", spy)
-    write_liquid_store(market_root(tmp_path))
-    result = run_impact_cli(tmp_path)
-    assert result.exit_code == 0, result.output
-    assert used == [expected]
-
-
-def test_cli_refuses_more_jobs_than_cores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_cores", lambda: 2)
-    write_liquid_store(market_root(tmp_path))
-    result = run_impact_cli(tmp_path, jobs="3")
-    assert result.exit_code != 0, result.output
-    assert "between 1 and 2" in result.output
-
-
-@pytest.mark.parametrize("jobs", ["0", "-2"])
-def test_cli_refuses_fewer_than_one_job_before_any_build(
-    tmp_path: Path, jobs: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    write_liquid_store(market_root(tmp_path))
-
-    def no_build(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("built although --jobs was refused")
-
-    monkeypatch.setattr(sm, "build_security_master", no_build)
-    result = run_impact_cli(tmp_path, jobs=jobs)
-
-    assert result.exit_code != 0, result.output
-    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
-    assert "jobs" in result.output
-    assert not impact_dir(tmp_path).exists() or not list(impact_dir(tmp_path).glob("*"))
 
 
 # =============================================================================================
@@ -1556,7 +1312,9 @@ class RealStore:
         return self._truncated[key]
 
     def impact(self, t: datetime, **kwargs: Any) -> pa.Table:
-        return impact_at(self.full, self.truncated(t), self.inputs.bars, self.splits, t, **kwargs)
+        out = impact_at(self.full, self.truncated(t), self.inputs.bars, self.splits, t, **kwargs)
+        check_sessions(out)
+        return out
 
 
 @pytest.fixture(scope="module")
