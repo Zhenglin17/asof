@@ -269,8 +269,6 @@ l_xper|2022-10-04T00:00:00+00:00|XPER:2022-10-03:grouping_differs
 l_xper|2022-11-05T03:59:59.999999+00:00|ADEA:2022-10-03:fields_differ:cusip
 l_xper|2022-11-05T03:59:59.999999+00:00|ADEA:2022-10-03:grouping_differs
 l_xper|2022-11-05T03:59:59.999999+00:00|XPER:2022-10-03:grouping_differs
-n_unit_spelling|2021-01-05T01:00:00+00:00|BRK.B:2021-01-04:fields_differ:cik+cik_available_at
-n_unit_spelling|2021-07-05T03:59:59.999999+00:00|BRK.B:2021-01-04:fields_differ:cik+cik_available_at
 r4|2021-01-02T01:00:00+00:00|PRV:2020-01-02:fields_differ:end_available_at+valid_to
 r4|2021-01-02T01:00:00+00:00|TKR:2020-01-02:fields_differ:end_available_at+valid_to
 r4|2021-01-04T04:59:59.999999+00:00|PRV:2020-01-02:fields_differ:end_available_at+valid_to
@@ -299,8 +297,6 @@ r_gold_b|2025-12-02T05:00:00+00:00|B:2020-01-02:fields_differ:available_at+cik+c
 r_gold_b|2025-12-02T05:00:00+00:00|B:2025-05-09:grouping_differs
 r_gold_b|2025-12-03T00:59:59.999999+00:00|B:2020-01-02:fields_differ:available_at+cik+cik_available_at+end_available_at
 r_gold_b|2025-12-03T00:59:59.999999+00:00|B:2025-05-09:grouping_differs
-world|2020-01-13T05:00:00+00:00|BRK.B:2020-01-02:fields_differ:cik+cik_available_at
-world|2022-09-06T03:59:59.999999+00:00|BRK.B:2020-01-02:fields_differ:cik+cik_available_at
 world|2024-06-03T03:59:59.999999+00:00|GMGI:2020-01-02:fields_differ:end_available_at+valid_to
 z_resumed_89|2021-07-01T03:59:59.999999+00:00|RSM:2021-06-01:only_in_full
 z_resumed_89|2021-07-01T04:00:00+00:00|RSM:2021-06-01:only_in_full

@@ -230,7 +230,12 @@ trades from 2020-01-02, the SEC lists it from 2020-07-10), so the CIK now has it
 `cik_available_at` and stays hidden until then. The second found segments stamped knowable
 at 00:00 of the event that created them although the build needs their own first bar, which
 is knowable only at 20:00 (CXAIV -> CXAI on 2023-03-15): a segment is now never knowable
-before its first bar, and a takeover's relabelled history not before the taker's. The
+before its first bar, and a takeover's relabelled history not before the taker's. The third
+found share classes whose CIK came through a spelling the SEC only adopted later (`BRKB`
+until 2020-06-01, `BRK.B` from 2020-07-10): such a CIK is now knowable from the first
+snapshot that writes the label's own spelling. Matching spellings by their letters alone
+would link stale rows to other companies (the SEC's `LGCU` is Luna Gold, the store's `LGC.U`
+Legacy Acquisition). The
 default instants are fixed in `configs/truncation_instants.txt`: computed ones move whenever
 the master changes, and a leak seen only at an instant that moved away would look fixed.
 The store is read once and the 66 rebuilds run in forked worker processes (about 12
@@ -250,8 +255,8 @@ Barrick's CIK (Barrick took the ticker B in 2025) changes 1,345 days of filings.
 differing (security, day) price cell and (symbol, day) CIK cell is attributed to the leak
 keys of the same instant whose segments its rows name; `configs/truncation_impact_baseline.txt`
 holds the cells each known key covers summed over the fixed instants (`KEY price=N cik=M`, so
-one more wrong cell at any instant raises it; 44 of the real store's 248 leak keys change
-anything) and the fingerprint of that instant list. The command exits 2 on a key with impact
+one more wrong cell at any instant raises it; 44 of the real store's 248 leak keys changed
+anything, 36 after the spelling fix) and the fingerprint of that instant list. The command exits 2 on a key with impact
 not in the baseline, a number above it, or a cell no key names; on the default instants also
 on a listed key without impact (`--prune-baseline` deletes those and lowers numbers that
 shrank; lines are only added by hand). A run on instants outside the list judges only new

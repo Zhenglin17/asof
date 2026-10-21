@@ -88,14 +88,19 @@ tell whether they are right:
     M2 "A" rows go to 0; HONA -> golden case.
 """
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pyarrow as pa
 import pytest
 
 from asof.ingest import security_master as sm
-from asof.ingest.security_master import build_security_master, normalize_spelling
+from asof.ingest.master_truncation import mask_master, truncate_inputs
+from asof.ingest.security_master import (
+    build_security_master,
+    normalize_spelling,
+    spelling_known_since,
+)
 from tests.ingest.test_security_master import (
     Life,
     Rename,
@@ -1072,3 +1077,189 @@ def test_v_bankruptcy_suffix_record_is_kept_and_the_label_is_vacated() -> None:
     new = segment_at(master, "BKRP", date(2021, 9, 1))
     assert old["security_id"] != new["security_id"]
     assert new["valid_from"] == record and new["evidence"] == "name_change"
+
+
+# =============================================================================================
+# S: a spelling join is knowable only once the store's spelling is in the SEC table
+# =============================================================================================
+# normalize_spelling joins BRKB to BRK.B only when both spellings are in the table. A build
+# from the snapshots up to 2020-02-13 sees BRKB alone and cannot give the BRK.B segment a CIK,
+# while the full build dates the CIK from the first BRKB row inside the segment (2020-01-13):
+# look-ahead. Matching by letters alone is not an option (stale SEC rows: LGCU = Luna Gold vs
+# the store's LGC.U = Legacy Acquisition; NEWS = NewStar vs NE.WS = Noble warrants), so the CIK
+# is delayed to the first snapshot that writes the store's spelling.
+#
+# Proposed API:
+#     spelling_known_since(raw, normalized) -> dict[(canonical ticker, cik), date]
+#         For each (ticker, cik) with at least one renamed row: the earliest snapshot whose RAW
+#         ticker already is the canonical one. build_security_master never dates a segment's
+#         cik_available_at before 00:00 New York of that day (inside rows and the "opening
+#         segment predates our bars" fallback alike).
+#
+# Fake data provenance: BRKB 2019-10-02..2020-06-01 and BRK.B from 2020-07-10 under 1067983
+# (real, SEC snapshots); BRK.B bars from 2020-01-02 (real). KINZ.U / KINZU: real CIK, dates
+# simplified (real KINZU rows start 2021-07-05). The closed-segment world (S_BRKX) is
+# constructed. Real-data checks: the eight real groups (BRK.A, BRK.B, HEI.A, JW.A, MOG.A,
+# PBR.A, RDS.A, RDS.B) must show no "cik" diff in the truncation audit after the fix.
+
+S_CIK = 1067983  # real
+S_SNAPSHOTS = [
+    date(2019, 10, 2),
+    date(2020, 1, 13),
+    date(2020, 6, 1),
+    date(2020, 7, 10),  # real: first snapshot spelling it BRK.B
+    date(2020, 8, 3),
+]
+S_SPELLING_DAY = date(2020, 7, 10)
+S_LIVES: list[Life] = [
+    ("BRKB", S_CIK, date(2019, 10, 2), date(2020, 6, 1)),  # real
+    ("BRK.B", S_CIK, S_SPELLING_DAY, None),  # real
+]
+S_FIRST_BAR = date(2020, 1, 2)  # real
+
+
+def s_sec(lives: list[Life] = S_LIVES, snapshots: list[date] = S_SNAPSHOTS) -> pa.Table:
+    return sec_table(snapshots, lives)
+
+
+def s_bars() -> pa.Table:
+    return bars_table(bar_rows("BRK.B", S_FIRST_BAR, date(2020, 12, 31), 200.0))
+
+
+def s_build(sec: pa.Table, bars: pa.Table | None = None) -> pa.Table:
+    master, _ = build_security_master(
+        bars=s_bars() if bars is None else bars,
+        sec_history=sec,
+        name_changes=name_changes_table([]),
+    )
+    return master
+
+
+def known_since(raw: pa.Table, store: set[str]) -> dict[tuple[str, int], date]:
+    return spelling_known_since(raw, normalize_spelling(raw, store_symbols=store))
+
+
+def test_s_known_since_is_the_first_snapshot_with_the_store_spelling() -> None:
+    assert known_since(s_sec(), {"BRK.B"}) == {("BRK.B", S_CIK): S_SPELLING_DAY}
+
+
+def test_s_known_since_reverse_direction_dotted_to_undotted() -> None:
+    raw = sec_table(
+        [date(2020, 11, 3), date(2020, 12, 1), date(2021, 1, 4)],
+        [
+            ("KINZ.U", N_KINZ_CIK, date(2020, 11, 3), date(2020, 11, 3)),
+            ("KINZU", N_KINZ_CIK, date(2020, 12, 1), None),
+        ],
+    )
+    assert known_since(raw, {"KINZU"}) == {("KINZU", N_KINZ_CIK): date(2020, 12, 1)}
+
+
+def test_s_known_since_canonical_spelling_first_means_no_delay() -> None:
+    # boundary: the store's spelling came first, the other one later -> already known then
+    raw = sec_table(
+        [date(2020, 1, 13), date(2020, 6, 1)],
+        [
+            ("BRK.B", S_CIK, date(2020, 1, 13), date(2020, 1, 13)),
+            ("BRKB", S_CIK, date(2020, 6, 1), None),
+        ],
+    )
+    assert known_since(raw, {"BRK.B"}) == {("BRK.B", S_CIK): date(2020, 1, 13)}
+
+
+def test_s_known_since_is_empty_without_renamed_rows() -> None:
+    # boundary: one spelling only; and two CIKs whose tickers match without dots stay apart
+    only_dotted = sec_table(S_SNAPSHOTS, [("BRK.B", S_CIK, date(2019, 10, 2), None)])
+    assert known_since(only_dotted, {"BRK.B"}) == {}
+    two_ciks = sec_table(
+        S_SNAPSHOTS,
+        [
+            ("LGCU", 1001, date(2019, 10, 2), date(2020, 1, 13)),  # Luna Gold, stale (real shape)
+            ("LGC.U", 1002, date(2020, 6, 1), None),  # Legacy Acquisition (real shape)
+        ],
+    )
+    assert known_since(two_ciks, {"LGC.U"}) == {}
+
+
+def test_s_brkb_segment_cik_is_dated_by_the_brk_b_spelling() -> None:
+    # normal path. Today: cik_available_at 2020-01-13 05:00 UTC (the first BRKB row inside).
+    [seg] = segments(s_build(s_sec()), "BRK.B")
+
+    assert seg["cik"] == S_CIK
+    assert seg["cik_available_at"] == et_midnight(S_SPELLING_DAY)
+    assert seg["cik_available_at"] == datetime(2020, 7, 10, 4, 0, tzinfo=UTC)  # EDT
+    assert seg["available_at"] == bar_available_at(S_FIRST_BAR)  # the segment itself: unchanged
+
+
+def test_s_without_a_spelling_change_the_cik_date_is_unchanged() -> None:
+    # guard (passes today, must keep passing): the SEC writes BRK.B from 2020-01-13
+    sec = s_sec([("BRK.B", S_CIK, date(2020, 1, 13), None)])
+    [seg] = segments(s_build(sec), "BRK.B")
+
+    assert seg["cik"] == S_CIK
+    assert seg["cik_available_at"] == datetime(2020, 1, 13, 5, 0, tzinfo=UTC)  # EST
+
+
+S_LEAK_AS_OF = et_midnight(date(2020, 2, 14))
+S_LATE_AS_OF = et_midnight(date(2020, 8, 4))
+
+
+def _brk_b_seen(master: pa.Table, as_of: datetime) -> dict[str, Any]:
+    [row] = [r for r in mask_master(master, as_of).to_pylist() if r["symbol"] == "BRK.B"]
+    return row
+
+
+def _truncated_build(as_of: datetime) -> pa.Table:
+    bars, sec, changes, _ = truncate_inputs(
+        bars=s_bars(),
+        sec_history=s_sec(),
+        name_changes=name_changes_table([]),
+        overrides=(),
+        as_of=as_of,
+    )
+    return s_build(sec, bars)
+
+
+def test_s_leak_cik_from_a_later_spelling_is_not_visible_before_it() -> None:
+    # Leakage: on 2020-02-14 the SEC table holds BRKB only (2019-10-02, 2020-01-13); BRK.B
+    # appears 2020-07-10. The truncated build cannot link them; the full build, read at the
+    # same as_of, must not show the CIK either.
+    truncated = _truncated_build(S_LEAK_AS_OF)
+    assert _brk_b_seen(truncated, S_LEAK_AS_OF)["cik"] is None
+    assert _brk_b_seen(s_build(s_sec()), S_LEAK_AS_OF)["cik"] is None
+
+
+def test_s_after_the_spelling_both_builds_show_the_cik() -> None:
+    full = _brk_b_seen(s_build(s_sec()), S_LATE_AS_OF)
+    truncated = _brk_b_seen(_truncated_build(S_LATE_AS_OF), S_LATE_AS_OF)
+
+    assert full["cik"] == truncated["cik"] == S_CIK
+    assert full["cik_available_at"] == truncated["cik_available_at"] == et_midnight(S_SPELLING_DAY)
+
+
+def test_s_opening_segment_fallback_is_delayed_too() -> None:
+    # The "opening segment predates our bars" branch (constructed): BRK.B trades 2020-01-02..
+    # 03-31 and is renamed to BRKX on 04-01 (Alpaca record). No SEC row falls inside BRK.B's
+    # segment; the only rows are BRKB on 2019-10-02 (before valid_from) and BRK.B on 2020-07-10
+    # (after valid_to). Today the CIK is dated 2019-10-02 (clamped to the first bar); a reader
+    # before 07-10 could not have matched BRKB to BRK.B.
+    rename_day = date(2020, 4, 1)
+    sec = s_sec(
+        [
+            ("BRKB", S_CIK, date(2019, 10, 2), date(2019, 10, 2)),
+            ("BRK.B", S_CIK, S_SPELLING_DAY, S_SPELLING_DAY),
+        ],
+        [date(2019, 10, 2), S_SPELLING_DAY],
+    )
+    master, _ = build_security_master(
+        bars=bars_table(
+            bar_rows("BRK.B", S_FIRST_BAR, date(2020, 3, 31), 200.0)
+            + bar_rows("BRKX", rename_day, date(2020, 12, 31), 200.1)
+        ),
+        sec_history=sec,
+        name_changes=name_changes_table([("BRK.B", "BRKX", rename_day, "084670702", "084670799")]),
+    )
+
+    [seg] = segments(master, "BRK.B")
+    assert seg["valid_to"] == rename_day
+    assert seg["cik"] == S_CIK
+    assert seg["cik_available_at"] == et_midnight(S_SPELLING_DAY)

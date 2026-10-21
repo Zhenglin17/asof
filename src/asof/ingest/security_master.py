@@ -47,6 +47,8 @@ all (ABAT: the SEC snapshot of 2023-10-03 shows the label under a new CIK, the n
 bar is knowable that evening). The CIK is a third fact with its own instant,
 ``cik_available_at``: the SEC table may list a label months after it starts trading (AAAU: bars
 from 2020-01-02, listed from 2020-07-10), and ``visible_master`` hides the CIK until then.
+A CIK reached through another spelling is not known before the SEC writes the label's own
+(BRK.B: ``BRKB`` until 2020-06-01, ``BRK.B`` from 2020-07-10, so 2020-07-10 and not 01-13).
 """
 
 import os
@@ -174,6 +176,28 @@ def normalize_spelling(
     return sec_history.set_column(
         sec_history.schema.get_field_index("ticker"), "ticker", pa.array(fixed, pa.string())
     )
+
+
+def spelling_known_since(raw: pa.Table, normalized: pa.Table) -> dict[tuple[str, int], date]:
+    """For each (ticker, cik) that took rows from another spelling: the first snapshot that
+    writes the ticker itself. ``normalized`` is ``normalize_spelling(raw, ...)``, row for row.
+
+    The join is only possible from then on. Until 2020-07-10 the SEC wrote only ``BRKB``, and
+    letters alone do not prove a match (``LGCU`` is a stale Luna Gold row, the store's ``LGC.U``
+    is Legacy Acquisition), so a CIK learned through a renamed row is not known before this day.
+    """
+    days: list[date] = raw.column("snapshot_date").to_pylist()
+    before: list[str] = raw.column("ticker").to_pylist()
+    after: list[str] = normalized.column("ticker").to_pylist()
+    ciks: list[int] = raw.column("cik").to_pylist()
+    renamed: set[tuple[str, int]] = set()
+    first: dict[tuple[str, int], date] = {}
+    for day, old, new, cik in zip(days, before, after, ciks, strict=True):
+        if old != new:
+            renamed.add((new, cik))
+        elif (new, cik) not in first or day < first[(new, cik)]:
+            first[(new, cik)] = day
+    return {key: first[key] for key in renamed}
 
 
 # -- edges -------------------------------------------------------------------------------------
@@ -1736,14 +1760,29 @@ def _continuous(around: tuple[date | None, float | None, date | None, float | No
 
 
 def _segment_cik(
-    seg: _Segment, presence: list[tuple[date, int]], left: int | None = None
+    seg: _Segment,
+    presence: list[tuple[date, int]],
+    left: int | None = None,
+    spelled: Mapping[int, date] | None = None,
 ) -> tuple[int | None, datetime | None]:
     """The segment's CIK and the snapshot instant that first showed it (00:00 New York).
 
     ``left``: the CIK of the holder that vacated this label by a rename on the day this
     segment starts (rule L). Its rows still sit on the label for a snapshot or two of SEC lag
     (XPER under Adeia's 1803696 on 2022-10-03, ARNC under Arconic Inc's 4281 until 07-10) and
-    are not the new holder's."""
+    are not the new holder's.
+
+    ``spelled``: per CIK, the first snapshot writing this label's own spelling when some rows
+    reached it from another one (``spelling_known_since``); the CIK is not known before it."""
+    cik, since = _segment_cik_rows(seg, presence, left)
+    if cik is not None and since is not None and spelled and cik in spelled:
+        since = max(since, _midnight(spelled[cik]))
+    return cik, since
+
+
+def _segment_cik_rows(
+    seg: _Segment, presence: list[tuple[date, int]], left: int | None
+) -> tuple[int | None, datetime | None]:
     inside = [
         (day, cik)
         for day, cik in presence
@@ -1753,7 +1792,8 @@ def _segment_cik(
     ]
     # Known from the first snapshot inside the segment, even when an earlier one listed the CIK:
     # matching that earlier row to the label may need a later spelling (BRKB until 2020, BRK.B
-    # after; normalize_spelling joins them only once both are in the table).
+    # after; normalize_spelling joins them only once both are in the table, and _segment_cik
+    # dates the CIK no earlier than that).
     if inside:
         cik = inside[-1][1]
         return cik, _midnight(min(day for day, c in inside if c == cik))
@@ -1823,7 +1863,11 @@ def build_security_master(
         con.register("_ident", identical_days(bars, con))
         stats = _symbol_stats(con)
         first_traded = _first_traded(con)
-        sec = drop_table_corrections(normalize_spelling(sec_history, stats))
+        spelled = normalize_spelling(sec_history, stats)
+        spelled_since: dict[str, dict[int, date]] = {}
+        for (symbol, cik), day in spelling_known_since(sec_history, spelled).items():
+            spelled_since.setdefault(symbol, {})[cik] = day
+        sec = drop_table_corrections(spelled)
         presence = _sec_presence(sec)
         snapshots = sorted(set(sec.column("snapshot_date").to_pylist()))
         ciks_of = {symbol: {cik for _, cik in rows} for symbol, rows in presence.items()}
@@ -1912,7 +1956,9 @@ def build_security_master(
             # let a reader who may not yet know the end see that one is coming.
             leaver = leavers.get((p.symbol, p.valid_from)) if p.start is not None else None  # type: ignore[arg-type]
             left = leaver.cik if leaver is not None and not _round_trip(leaver, p) else None
-            p.cik, p.cik_since = _segment_cik(p, presence.get(p.symbol, []), left)
+            p.cik, p.cik_since = _segment_cik(
+                p, presence.get(p.symbol, []), left, spelled_since.get(p.symbol)
+            )
             if p.end is not None and p.valid_to is not None:
                 leavers[(p.symbol, p.valid_to)] = p
             p.cusip = p.start.new_cusip if p.start else None
