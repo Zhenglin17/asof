@@ -279,11 +279,10 @@ def test_arnc_two_events_on_one_day_leave_no_overlap(con: duckdb.DuckDBPyConnect
 
 
 def test_abat_new_cik_piece_appears_with_its_first_bar(con: duckdb.DuckDBPyConnection) -> None:
-    # Store reads 2026-10-20, a regression guard for the first-bar rule only: the SEC snapshot of
-    # 2023-10-03 lists ABAT under CIK 1576873 (American Battery Technology, ex-ABML); the
-    # 2023-10-03 bar is knowable at 20:00 New York. Not asserted, and wrong: the 2023-09-21 piece
-    # carries CIK 745651, Advanced Battery Technologies, last listed under ABAT on 2020-06-01 --
-    # a stale SEC row, open in PROGRESS.
+    # Store reads 2026-10-21. ABAT trades again from 2023-09-21 (American Battery Technology,
+    # ex-ABML); the SEC lists it under 1576873 from the 2023-10-03 snapshot, whose first bar is
+    # knowable at 20:00 New York. The 2023-09-21 piece has no CIK: until 2026-10-21 it took 745651
+    # (Advanced Battery Technologies, last listed under ABAT on 2020-06-01) from a stale row.
     old = sid(con, "ABAT", date(2023, 9, 22))
     assert segments(con, ny(2023, 10, 3, 8), "ABAT") == [
         (old, "ABAT", date(2023, 9, 21), date(2023, 10, 3))
@@ -292,6 +291,12 @@ def test_abat_new_cik_piece_appears_with_its_first_bar(con: duckdb.DuckDBPyConne
     assert [(s, f, t) for _, s, f, t in evening] == [
         ("ABAT", date(2023, 9, 21), date(2023, 10, 3)),
         ("ABAT", date(2023, 10, 3), None),
+    ]
+    assert sid(con, "ABAT", date(2023, 10, 4)) == old
+    rows = [r for r in visible_master(con, ROOT, NOW).to_pylist() if r["symbol"] == "ABAT"]
+    assert [(r["valid_from"], r["cik"]) for r in rows] == [
+        (date(2023, 9, 21), None),
+        (date(2023, 10, 3), 1576873),
     ]
 
 

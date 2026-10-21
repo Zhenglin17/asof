@@ -58,6 +58,7 @@ from asof.ingest.security_master import (
     WHEN_ISSUED,
     drop_table_corrections,
     normalize_spelling,
+    traded_runs,
 )
 from asof.ingest.tickers import is_valid_symbol
 from asof.ingest.universe import ASSET_SCHEMA, assets_snapshots
@@ -397,7 +398,6 @@ class _Audit:
         con.register(_RES, resolved)
         con.register(_SPLITS, splits)
         con.register(_NAMES, self._names())
-        con.register(_SEC, self._sec())
         con.register(_LIQ_IDS, pa.table({"security_id": pa.array(sorted(liquid_ids), pa.string())}))
         con.register(
             _QUAL_IDS, pa.table({"security_id": pa.array(sorted(qualified_ids), pa.string())})
@@ -419,6 +419,7 @@ class _Audit:
             )
             con.register("_audit_raw_empty", empty)
             con.execute(f"CREATE OR REPLACE TEMP VIEW {_RAW} AS SELECT * FROM _audit_raw_empty")
+        con.register(_SEC, self._sec())
         if files:
             con.execute(
                 f"CREATE OR REPLACE TEMP VIEW {_ALPACA_KEYS} AS "
@@ -514,7 +515,9 @@ class _Audit:
             return HISTORY_SCHEMA.empty_table()
         # the same preparation the master was built from: one spelling per ticker, and the
         # SEC's table clean-ups (AFC still listed under Allied Capital until 2020-07) dropped
-        return drop_table_corrections(normalize_spelling(pq.read_table(path)))
+        return drop_table_corrections(
+            normalize_spelling(pq.read_table(path)), traded_runs(self.con, _RAW)
+        )
 
     def _listed(self) -> pa.Table:
         """Alpaca's listing as of the audit: the newest assets snapshot dated on or before

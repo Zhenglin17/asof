@@ -991,7 +991,37 @@ def _cik_switches(presence: list[tuple[date, int]]) -> list[tuple[date, date]]:
     ]
 
 
-def drop_table_corrections(sec_history: pa.Table) -> pa.Table:
+def traded_runs(
+    con: duckdb.DuckDBPyConnection, relation: str
+) -> dict[str, list[tuple[date, date]]]:
+    """Per symbol, its runs of traded bars (volume > 0) whose consecutive sessions are at most
+    ``MAX_GAP_DAYS`` apart, as (first, last) session; ``relation`` holds bars."""
+    rows = con.execute(
+        f"""
+        SELECT symbol, min(session_date), max(session_date)
+        FROM (
+            SELECT symbol, session_date, sum(brk) OVER (PARTITION BY symbol ORDER BY session_date) g
+            FROM (
+                SELECT symbol, session_date,
+                       CASE WHEN session_date - lag(session_date)
+                                 OVER (PARTITION BY symbol ORDER BY session_date) > {MAX_GAP_DAYS}
+                            THEN 1 ELSE 0 END AS brk
+                FROM (SELECT DISTINCT symbol, session_date FROM {relation} WHERE volume > 0)
+            )
+        )
+        GROUP BY symbol, g
+        ORDER BY 1, 2
+        """
+    ).fetchall()
+    out: dict[str, list[tuple[date, date]]] = {}
+    for symbol, first, last in rows:
+        out.setdefault(symbol, []).append((first, last))
+    return out
+
+
+def drop_table_corrections(
+    sec_history: pa.Table, traded_runs: Mapping[str, Sequence[tuple[date, date]]] | None = None
+) -> pa.Table:
     """Remove zombie rows exposed by a mass correction of the SEC table.
 
     A consecutive snapshot pair in which ``TABLE_CORRECTION_MIN_SWITCHES`` or more tickers change
@@ -999,6 +1029,14 @@ def drop_table_corrections(sec_history: pa.Table) -> pa.Table:
     whose old CIK is in no snapshot from the correction on, the rows before the correction are
     dropped (the later CIK applied all along). Old CIKs that continue under another ticker are
     real reorganisations and are left alone.
+
+    ``traded_runs`` (``traded_runs()`` of the bars): a (ticker, CIK) that the correction drops
+    without a replacement, whose CIK never appears again, loses its earlier rows too when the
+    ticker traded continuously across the correction (2020-07-10 dropped ICLN under InterCallNet,
+    DRIV under Digital River while the ETFs traded on). A ticker that stopped trading before it is
+    a real delisting (Achillion's ACHN, last bar 2020-01-27), and one that only shows flat
+    zero-volume bars until a new company lists under it (NCI) must stay apart from that company;
+    both keep their rows.
     """
     presence = _sec_presence(sec_history)
     by_pair: dict[tuple[date, date], list[str]] = {}
@@ -1008,6 +1046,7 @@ def drop_table_corrections(sec_history: pa.Table) -> pa.Table:
     snapshot_dates: list[date] = sec_history.column("snapshot_date").to_pylist()
     ciks: list[int] = sec_history.column("cik").to_pylist()
     drop_before: dict[str, date] = {}
+    vanished_before: dict[tuple[str, int], date] = {}
     for (lower, upper), tickers in by_pair.items():
         if len(tickers) < TABLE_CORRECTION_MIN_SWITCHES:
             continue
@@ -1016,12 +1055,22 @@ def drop_table_corrections(sec_history: pa.Table) -> pa.Table:
             old = {c for d, c in presence[ticker] if d == lower}
             if not old & later:
                 drop_before[ticker] = max(upper, drop_before.get(ticker, upper))
-    if not drop_before:
+        if traded_runs is None:
+            continue
+        for ticker, rows in presence.items():
+            if not any(first < upper <= last for first, last in traded_runs.get(ticker, ())):
+                continue
+            at_upper = {c for d, c in rows if d == upper}
+            for cik in {c for d, c in rows if d == lower} - at_upper - later:
+                key = (ticker, cik)
+                vanished_before[key] = max(upper, vanished_before.get(key, upper))
+    if not drop_before and not vanished_before:
         return sec_history
     tickers_col: list[str] = sec_history.column("ticker").to_pylist()
     keep = [
         not (t in drop_before and d < drop_before[t])
-        for t, d in zip(tickers_col, snapshot_dates, strict=True)
+        and not ((t, c) in vanished_before and d < vanished_before[(t, c)])
+        for t, d, c in zip(tickers_col, snapshot_dates, ciks, strict=True)
     ]
     return sec_history.filter(pa.array(keep, pa.bool_()))
 
@@ -1880,7 +1929,7 @@ def build_security_master(
         spelled_since: dict[str, dict[int, date]] = {}
         for (symbol, cik), day in spelling_known_since(sec_history, spelled).items():
             spelled_since.setdefault(symbol, {})[cik] = day
-        sec = drop_table_corrections(spelled)
+        sec = drop_table_corrections(spelled, traded_runs(con, "_bars"))
         presence = _sec_presence(sec)
         snapshots = sorted(set(sec.column("snapshot_date").to_pylist()))
         ciks_of = {symbol: {cik for _, cik in rows} for symbol, rows in presence.items()}

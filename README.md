@@ -151,7 +151,10 @@ along, however long the SEC table keeps listing it there (Xperi Holding became A
 the spun-off Xperi Inc. took XPER). A segment takes a CIK from snapshots before it only
 while the label is still listed in the last snapshot before it: ABAT trading again in 2023 is
 American Battery Technology, not Advanced Battery Technologies, last listed under ABAT in
-2020. Every conflict the build reports carries a `resolution`
+2020. When the SEC replaced its table on 2020-07-10, rows that vanished for good on a ticker
+that kept trading across the change are dropped from the old table as well (the ICLN ETF had
+been listed under InterCallNet); a ticker that only shows flat zero-volume bars until a new
+company lists under it keeps them, so the two stay apart. Every conflict the build reports carries a `resolution`
 (`new_security`, `bridged`, `ignored`, `relabelled`, `unresolved`); the unresolved ones wait
 for a human, and so does each relabelled merge, once, since a coincidence of prices could
 produce the same absence of bars. `asof market instruments` then tags each segment with an

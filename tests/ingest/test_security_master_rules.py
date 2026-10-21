@@ -1582,3 +1582,466 @@ def test_z_leak_full_and_truncated_builds_agree_there_is_no_cik() -> None:
 
     assert abat_seen(truncated) == [{"cik": None, "cik_available_at": None}]
     assert abat_seen(full) == abat_seen(truncated)
+
+
+# =============================================================================================
+# C: in a mass correction, a (ticker, cik) that vanishes for good while the ticker trades
+#    ACROSS the correction is a zombie too
+# =============================================================================================
+# drop_table_corrections only treats tickers that SWITCH CIK in a mass-correction pair. A
+# (ticker, cik) that simply stops being listed at the correction keeps its earlier rows. Real
+# store (2026-10-21): in the 2020-06-01 -> 2020-07-10 pair 6,861 (ticker, cik) vanish for good;
+# 687 belong to tickers with bars after 2020-07-10. Some are stale rows on labels others use
+# while trading on (ICLN under 1112987 INTERCALLNET INC, DRIV under 1062530 Digital River, REMX
+# under RemedyTemp, CURE under Curative Health). Others are labels whose bars before a NEW
+# company are Alpaca's zero-volume placeholders (NCI, IHS, FRSH): there the vanished CIK is the
+# old holder, and dropping it removes the CIK switch that keeps the placeholders apart from the
+# new company -- years of flat fake bars glued to it. "Has a bar after the correction" cannot
+# tell the two apart; "traded continuously across the correction" can.
+#
+# Proposed API:
+#     drop_table_corrections(sec_history,
+#                            traded_runs: Mapping[str, Sequence[tuple[date, date]]] | None = None)
+#         traded_runs[ticker] = the ticker's runs of traded bars (volume > 0, consecutive traded
+#         sessions at most MAX_GAP_DAYS = 10 calendar days apart) as (first, last) session;
+#         build_security_master computes them from the bars. In a mass-correction pair
+#         (lower, upper), a (ticker, cik) listed at lower, not at upper, whose cik is in no
+#         snapshot >= upper, loses all its rows dated < upper only if the ticker has a run with
+#         first < upper <= last. traded_runs None -> the old behaviour.
+#         Switching tickers keep the old rule whatever traded_runs says. The function takes the
+#         runs as given (it does not re-merge runs that are close together).
+#
+# Fake data provenance: the snapshot dates 2020-01-13, 2020-06-01, 2020-07-10, 2021-03-01,
+# 2021-06-03 are real SEC snapshot dates (store 2026-10-21); 2021-01-04 is NOT (the real one is
+# 2021-01-03), it is a constructed later snapshot kept from R2 of test_security_master.py and
+# only needs to be >= the correction. ICLN / 1112987 and its absence from 2020-07-10 on are
+# real, its first row on 2020-01-13 is constructed; ICLN's traded run 2020-01-02..2026-10-16 is
+# real (one run under MAX_GAP_DAYS, measured 2026-10-21; DRIV, REMX, CURE the same); the bars
+# 2020-01-02..2021-12-31 of the build world are a constructed stretch with a constructed level.
+# ACHN / 1070336 and its single run 2020-01-02..2020-01-27 are real, its listing up to
+# 2020-06-01 is ASSUMED (the note says it vanishes at the correction). NCI (world a): real
+# shape (store 2026-10-21) -- SEC 1019737 to 2020-06-01, then nothing until 1916331 from
+# 2023-12-03; volume-0 bars frozen at 27.99 from 2020-01-02 to 2024-04-22, the first traded bar
+# 2024-04-23 at 9.50, one run from there; IHS (placeholders at 117.25 2020-01-02..2020-12-31,
+# 1316360 to 2020-06-01, 1876183 from 2021-10-01, first traded 2021-10-14) and FRSH (6.45,
+# 1592379 / 1544522 from 2021-09-03, first traded 2021-09-22) have the same shape. The world
+# COMPRESSES the dates (placeholders to 2021-06-30, new company trading from 2021-07-01, SEC
+# 1916331 from 2021-06-03, keeping the real order: SEC lists the new company before it
+# trades, as NCI 2023-12-03 / 2024-04-23, IHS 2021-10-01 / 10-14, FRSH 2021-09-03 / 09-22);
+# levels and CIKs are NCI's. World b (A's ticker reused by B after a
+# gap with no bars at all) is constructed. The 60 switching tickers T000..T059 (CIKs
+# 900_000+i -> 800_000+i) are constructed, standing in for the 142 real switches of that pair.
+# The reorganisation (OLDR -> NEWR under 555_555), the two-CIK ticker DUPE and the few-switch
+# world are constructed boundaries.
+#
+# Real-data checks (the fake worlds cannot show these): after the change, rebuild the real
+# store and confirm
+#  1. the trading zombies lose their pre-2020-07-10 rows: ICLN, DRIV, REMX, CURE segments have
+#     no CIK from those rows (golden case on ICLN / DRIV); split the 687 into "a run crosses
+#     2020-07-10" (dropped) and "no run crosses" (kept) and eyeball the kept ones;
+#  2. NCI, IHS, FRSH: the placeholder bars and the new company are NOT one security, and the
+#     new company's segment does not start on 2020-01-02 (today's master: S005231 NCI
+#     2020-01-02.. cik 1916331, S003917 IHS, S002968 FRSH, each one segment from 2020-01-02)
+#     -> golden case on NCI;
+#  3. the tickers whose bars stop before 2020-07-10 keep their rows (ACHN keeps 1070336,
+#     MDCO / TIVO / WCG / INXN keep theirs);
+#  4. the 6,148 bar-less tickers are unchanged (no bars -> no runs -> kept);
+#  5. MAX_GAP_DAYS = 10 as the run gap is an ASSUMPTION for this rule: a thin ETF with more than
+#     10 calendar days without volume around 2020-07-10 is cut into two runs and keeps its
+#     zombie CIK -- list the 687 tickers that have bars on both sides of 2020-07-10 but no run
+#     crossing it, and check none is a continuously listed fund;
+#  6. the audit passes traded_runs of its own (as_of-filtered) bars: check it drops the same
+#     groups as the build at the default instant;
+#  7. the truncation audit shows no new "cik" diff; a truncated build before 2020-07-10 may
+#     still show these CIKs (it cannot see the correction yet): a delay, not a leak; note a
+#     truncated build's runs end at its as_of, so a run "crossing" 2020-07-10 needs a traded
+#     bar on or after 2020-07-10 to be visible;
+#  8. the two-CIK case (DUPE, one CIK of two vanishes) follows the rule's (ticker, cik)
+#     wording; count how many real groups are in that shape before accepting it.
+
+C_SNAPSHOTS = [date(2020, 1, 13), date(2020, 6, 1), date(2020, 7, 10), date(2021, 1, 4)]
+C_LOWER = date(2020, 6, 1)  # real
+C_UPPER = date(2020, 7, 10)  # real: the correction
+C_N_SWITCH = 60  # >= TABLE_CORRECTION_MIN_SWITCHES
+C_ICLN_CIK = 1112987  # real: INTERCALLNET INC
+C_ICLN_LAST_BAR = date(2026, 10, 16)  # real
+C_ACHN_CIK = 1070336  # real: Achillion
+C_ACHN_LAST_BAR = date(2020, 1, 27)  # real
+C_FIRST = date(2020, 1, 13)
+C_FIRST_BAR = date(2020, 1, 2)  # real: first session of the store
+
+Run = tuple[date, date]
+C_ICLN_RUN: Run = (C_FIRST_BAR, C_ICLN_LAST_BAR)  # real: one traded run
+C_ACHN_RUN: Run = (C_FIRST_BAR, C_ACHN_LAST_BAR)  # real: one traded run
+
+
+def c_switchers(n: int = C_N_SWITCH) -> list[Life]:
+    lives: list[Life] = []
+    for i in range(n):
+        lives.append((f"T{i:03d}", 900_000 + i, C_FIRST, C_LOWER))
+        lives.append((f"T{i:03d}", 800_000 + i, C_UPPER, None))
+    return lives
+
+
+def c_sec(
+    extra: list[Life], n_switch: int = C_N_SWITCH, snapshots: list[date] | None = None
+) -> pa.Table:
+    return sec_table(snapshots or C_SNAPSHOTS, [*c_switchers(n_switch), *extra])
+
+
+def c_rows(table: pa.Table) -> set[tuple[date, str, int]]:
+    return {(r["snapshot_date"], r["ticker"], r["cik"]) for r in table.to_pylist()}
+
+
+def c_old_rule(table: pa.Table) -> set[tuple[date, str, int]]:
+    """What today's rule leaves: the switchers' rows before the correction dropped."""
+    return {(d, t, c) for d, t, c in c_rows(table) if not (t.startswith("T") and d < C_UPPER)}
+
+
+C_ICLN: Life = ("ICLN", C_ICLN_CIK, C_FIRST, C_LOWER)
+C_ACHN: Life = ("ACHN", C_ACHN_CIK, C_FIRST, C_LOWER)
+C_ICLN_KEPT = {(C_FIRST, "ICLN", C_ICLN_CIK), (C_LOWER, "ICLN", C_ICLN_CIK)}
+
+
+def test_c_trading_zombie_loses_its_rows_before_the_correction() -> None:
+    # Normal path: ICLN is listed under 1112987 at 2020-06-01, gone from 2020-07-10 on, 1112987
+    # never comes back, and ICLN trades in one run 2020-01-02..2026-10-16, across the
+    # correction -> both ICLN rows go. The switchers keep the old rule even though their runs
+    # end 2020-01-31, before the correction; the filler FILL (listed throughout) is untouched.
+    # Today: TypeError (no traded_runs parameter).
+    sec = c_sec([C_ICLN, ("FILL", 777, C_FIRST, None)])
+    runs: dict[str, list[Run]] = {"ICLN": [C_ICLN_RUN], "FILL": [C_ICLN_RUN]}
+    runs |= {f"T{i:03d}": [(C_FIRST_BAR, date(2020, 1, 31))] for i in range(C_N_SWITCH)}
+
+    out = sm.drop_table_corrections(sec, traded_runs=runs)
+
+    expected = {r for r in c_old_rule(sec) if r[1] != "ICLN"}
+    assert c_rows(out) == expected
+    assert not [r for r in c_rows(out) if r[1] == "ICLN"]
+    assert {r for r in c_rows(out) if r[1] == "FILL"} == {(d, "FILL", 777) for d in C_SNAPSHOTS}
+
+
+@pytest.mark.parametrize(
+    ("runs", "dropped"),
+    [
+        # a run ending the day before the correction: did not trade across it
+        ([(C_FIRST_BAR, C_UPPER - timedelta(days=1))], False),
+        # boundary: a run whose last session is the correction day itself crosses it
+        ([(C_FIRST_BAR, C_UPPER)], True),
+        # boundary: a run that STARTS on the correction day, nothing traded before -> the
+        # NCI shape (placeholders, then a new company), not a ticker trading across
+        ([(C_UPPER, C_ICLN_LAST_BAR)], False),
+        # two separate runs, one ending the day before, one starting the day after: neither
+        # crosses; the function takes the runs as given and does not merge them
+        (
+            [
+                (C_FIRST_BAR, C_UPPER - timedelta(days=1)),
+                (C_UPPER + timedelta(days=1), C_ICLN_LAST_BAR),
+            ],
+            False,
+        ),
+        # a later run crossing among several: any crossing run counts
+        ([(C_FIRST_BAR, date(2020, 2, 28)), (date(2020, 5, 1), C_ICLN_LAST_BAR)], True),
+    ],
+    ids=["ends_day_before", "last_eq_upper", "first_eq_upper", "two_runs_around", "second_run"],
+)
+def test_c_run_boundary_at_the_correction(runs: list[Run], dropped: bool) -> None:
+    sec = c_sec([C_ICLN])
+    out = sm.drop_table_corrections(sec, traded_runs={"ICLN": runs})
+
+    icln = {r for r in c_rows(out) if r[1] == "ICLN"}
+    assert icln == (set() if dropped else C_ICLN_KEPT)
+
+
+def test_c_real_delisting_before_the_correction_keeps_its_rows() -> None:
+    # Boundary: ACHN (Achillion) trades 2020-01-02..2020-01-27, long before the correction; its
+    # vanishing from the SEC table is the delisting, not a zombie -> rows kept.
+    sec = c_sec([C_ACHN])
+    out = sm.drop_table_corrections(sec, traded_runs={"ACHN": [C_ACHN_RUN]})
+
+    assert c_rows(out) == c_old_rule(sec)
+    assert {r for r in c_rows(out) if r[1] == "ACHN"} == {
+        (C_FIRST, "ACHN", C_ACHN_CIK),
+        (C_LOWER, "ACHN", C_ACHN_CIK),
+    }
+
+
+@pytest.mark.parametrize("runs", [{}, {"ICLN": []}], ids=["no_entry", "empty_list"])
+def test_c_ticker_without_traded_bars_keeps_its_rows(runs: dict[str, list[Run]]) -> None:
+    # Boundary (the 6,148 bar-less tickers; also a label with only volume-0 bars): no runs ->
+    # kept.
+    sec = c_sec([C_ICLN])
+    out = sm.drop_table_corrections(sec, traded_runs=runs)
+
+    assert c_rows(out) == c_old_rule(sec)
+
+
+def test_c_cik_continuing_under_another_ticker_is_a_reorganisation() -> None:
+    # Boundary: OLDR / 555_555 vanishes at the correction but 555_555 is listed under NEWR
+    # from 2021-01-04 (any snapshot >= upper counts) -> a real reorganisation, rows kept,
+    # even though OLDR trades across the correction.
+    sec = c_sec([("OLDR", 555_555, C_FIRST, C_LOWER), ("NEWR", 555_555, date(2021, 1, 4), None)])
+    out = sm.drop_table_corrections(sec, traded_runs={"OLDR": [C_ICLN_RUN], "NEWR": [C_ICLN_RUN]})
+
+    assert c_rows(out) == c_old_rule(sec)
+
+
+def test_c_vanishing_outside_a_mass_correction_keeps_its_rows() -> None:
+    # Boundary: the same ICLN rows in a pair with only 10 switches (no table correction) ->
+    # nothing dropped at all.
+    sec = c_sec([C_ICLN], n_switch=10)
+    out = sm.drop_table_corrections(sec, traded_runs={"ICLN": [C_ICLN_RUN]})
+
+    assert c_rows(out) == c_rows(sec)
+
+
+def test_c_vanishing_before_the_pair_is_not_this_rule() -> None:
+    # Boundary: ICLN's last row is 2020-01-13, not the lower snapshot of the correction ->
+    # it did not vanish AT the correction; rows kept.
+    sec = c_sec([("ICLN", C_ICLN_CIK, C_FIRST, C_FIRST)])
+    out = sm.drop_table_corrections(sec, traded_runs={"ICLN": [C_ICLN_RUN]})
+
+    assert c_rows(out) == c_old_rule(sec)
+
+
+def test_c_one_of_two_ciks_vanishing_is_dropped_per_ticker_cik() -> None:
+    # Boundary (constructed; rule wording is per (ticker, cik)): DUPE sits under 111_111 and
+    # 222_222 up to the lower snapshot and under 222_222 alone from the correction on. That is
+    # no switch (the CIK sets overlap), but (DUPE, 111_111) vanishes for good while DUPE
+    # trades across the correction -> its rows go; (DUPE, 222_222) keeps all of them.
+    sec = c_sec([("DUPE", 111_111, C_FIRST, C_LOWER), ("DUPE", 222_222, C_FIRST, None)])
+    out = sm.drop_table_corrections(sec, traded_runs={"DUPE": [C_ICLN_RUN]})
+
+    dupe = {r for r in c_rows(out) if r[1] == "DUPE"}
+    assert dupe == {(d, "DUPE", 222_222) for d in C_SNAPSHOTS}
+
+
+def test_c_one_of_two_ciks_kept_when_the_ticker_does_not_trade_across() -> None:
+    # Same DUPE shape, but its only run starts after the correction -> both CIKs keep rows.
+    sec = c_sec([("DUPE", 111_111, C_FIRST, C_LOWER), ("DUPE", 222_222, C_FIRST, None)])
+    out = sm.drop_table_corrections(sec, traded_runs={"DUPE": [(date(2020, 8, 3), C_BAR_END)]})
+
+    assert c_rows(out) == c_old_rule(sec)
+
+
+def test_c_without_traded_runs_the_old_behaviour_is_unchanged() -> None:
+    # Guard (passes today, must keep passing): called without traded_runs -> the
+    # vanishing ICLN rows stay, the switchers lose theirs.
+    sec = c_sec([C_ICLN, C_ACHN])
+    out = sm.drop_table_corrections(sec)
+
+    assert c_rows(out) == c_old_rule(sec)
+    assert (C_LOWER, "ICLN", C_ICLN_CIK) in c_rows(out)
+
+
+def test_c_explicit_none_equals_no_argument() -> None:
+    # Today: TypeError (no traded_runs parameter).
+    sec = c_sec([C_ICLN, C_ACHN])
+    assert c_rows(sm.drop_table_corrections(sec, traded_runs=None)) == c_old_rule(sec)
+
+
+C_BAR_END = date(2021, 12, 31)  # constructed
+
+
+def c_build_sec() -> pa.Table:
+    return c_sec([C_ICLN])
+
+
+def c_build_bars() -> pa.Table:
+    return bars_table(bar_rows("ICLN", C_FIRST_BAR, C_BAR_END, 20.0))
+
+
+def c_build(sec: pa.Table, bars: pa.Table) -> pa.Table:
+    master, _ = build_security_master(
+        bars=bars, sec_history=sec, name_changes=name_changes_table([])
+    )
+    return master
+
+
+def test_c_icln_segment_has_no_cik_after_the_build() -> None:
+    # End to end: ICLN trades 2020-01-02..2021-12-31 (one run across the correction); its only
+    # SEC rows are under 1112987 up to the lower snapshot of the correction.
+    # build_security_master computes the runs from the bars and passes them, so the rows go
+    # and the segment has no CIK.
+    [seg] = segments(c_build(c_build_sec(), c_build_bars()), "ICLN")
+
+    assert seg["valid_from"] == C_FIRST_BAR
+    assert seg["cik"] is None
+    assert seg["cik_available_at"] is None
+
+
+C_AFTER_AS_OF = et_midnight(date(2020, 8, 17))  # correction visible, ICLN bars past it visible
+C_INSTANTS = [
+    et_midnight(date(2020, 1, 14)),
+    et_midnight(date(2020, 6, 2)),
+    et_midnight(date(2020, 7, 1)),
+    et_midnight(C_UPPER),
+    C_AFTER_AS_OF,
+    et_midnight(date(2021, 1, 5)),
+    et_midnight(date(2022, 1, 3)),
+]
+
+
+def c_seen(master: pa.Table, as_of: datetime, symbol: str = "ICLN") -> list[Any]:
+    return [r["cik"] for r in mask_master(master, as_of).to_pylist() if r["symbol"] == symbol]
+
+
+def c_icln_seen(master: pa.Table, as_of: datetime) -> list[Any]:
+    return c_seen(master, as_of, "ICLN")
+
+
+def c_truncated(
+    as_of: datetime, sec: pa.Table | None = None, bars: pa.Table | None = None
+) -> pa.Table:
+    bars_t, sec_t, _, _ = truncate_inputs(
+        bars=c_build_bars() if bars is None else bars,
+        sec_history=c_build_sec() if sec is None else sec,
+        name_changes=name_changes_table([]),
+        overrides=(),
+        as_of=as_of,
+    )
+    return c_build(sec_t, bars_t)
+
+
+def test_c_leak_truncated_build_after_the_correction_shows_no_cik() -> None:
+    # Leakage / consistency: on 2020-08-17 a reader has the 2020-07-10 snapshot (the
+    # correction) and ICLN's bars of 07-10..08-14 (so the run crossing 07-10 is visible); the
+    # 2021-01-04 snapshot and later bars are in the future. Both the truncated build and the
+    # full build read at that instant show ICLN without 1112987.
+    assert c_icln_seen(c_truncated(C_AFTER_AS_OF), C_AFTER_AS_OF) == [None]
+    assert c_icln_seen(c_build(c_build_sec(), c_build_bars()), C_AFTER_AS_OF) == [None]
+
+
+def test_c_full_build_never_shows_the_zombie_cik() -> None:
+    # Before 2020-07-10 a truncated build cannot see the correction and may still give ICLN
+    # 1112987 while the full build shows None: the full build withholds, it does not leak.
+    # The full build must show no 1112987 at any instant.
+    full = c_build(c_build_sec(), c_build_bars())
+    for as_of in C_INSTANTS:
+        assert C_ICLN_CIK not in c_icln_seen(full, as_of), as_of
+
+
+# --- world a: placeholders under a label, then a new company (NCI shape) ---------------------
+
+CA_SNAPSHOTS = [*C_SNAPSHOTS, date(2021, 6, 3)]  # 2021-06-03: real snapshot date
+CA_NEW_LISTED = date(2021, 6, 3)  # compressed (real 2023-12-03): SEC lists before trading
+CA_OLD_CIK = 1019737  # real: NCI's holder up to 2020-06-01
+CA_NEW_CIK = 1916331  # real: NCI's new company
+CA_PLACEHOLDER_CLOSE = 27.99  # real: NCI's frozen volume-0 close
+CA_PLACEHOLDER_END = date(2021, 6, 30)  # compressed (real 2024-04-22)
+CA_NEW_FIRST = date(2021, 7, 1)  # compressed (real 2024-04-23, close 9.50)
+
+
+def ca_sec() -> pa.Table:
+    return c_sec(
+        [("NCI", CA_OLD_CIK, C_FIRST, C_LOWER), ("NCI", CA_NEW_CIK, CA_NEW_LISTED, None)],
+        snapshots=CA_SNAPSHOTS,
+    )
+
+
+def ca_bars() -> pa.Table:
+    return bars_table(
+        [
+            *filler_rows(
+                {"symbol": "NCI", "close": CA_PLACEHOLDER_CLOSE}, C_FIRST_BAR, CA_PLACEHOLDER_END
+            ),
+            *bar_rows("NCI", CA_NEW_FIRST, C_BAR_END, 9.5),
+        ]
+    )
+
+
+def test_c_drop_keeps_the_placeholder_holder_when_no_run_crosses() -> None:
+    # Unit view of world a: NCI's only run starts 2021-07-01, a year after the correction ->
+    # (NCI, 1019737) keeps its rows (and with them the switch to 1916331).
+    out = sm.drop_table_corrections(ca_sec(), traded_runs={"NCI": [(CA_NEW_FIRST, C_BAR_END)]})
+
+    assert {r for r in c_rows(out) if r[1] == "NCI"} == {
+        (C_FIRST, "NCI", CA_OLD_CIK),
+        (C_LOWER, "NCI", CA_OLD_CIK),
+        (CA_NEW_LISTED, "NCI", CA_NEW_CIK),
+    }
+
+
+def test_c_placeholders_are_not_glued_to_the_new_company() -> None:
+    # End to end (the reviewer's NCI / IHS / FRSH finding): volume-0 bars frozen at 27.99 from
+    # 2020-01-02 to 2021-06-30, SEC lists 1916331 from 2021-06-03, the new company trades from
+    # 2021-07-01. The placeholder stretch (2020) and the new company are not one security.
+    # Today (has-a-bar-after rule): one segment from 2020-01-02 with 1916331.
+    master = c_build(ca_sec(), ca_bars())
+
+    new = segment_at(master, "NCI", date(2021, 8, 2))
+    assert new["cik"] == CA_NEW_CIK
+    assert segment_at(master, "NCI", CA_NEW_FIRST) == new
+    for day in (C_FIRST_BAR, date(2020, 3, 2), C_UPPER, date(2021, 3, 1)):
+        for seg in covering(master, "NCI", day):
+            assert seg["security_id"] != new["security_id"], day
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="open since before the vanish rule: a CIK switch cuts at the SEC snapshot listing the "
+    "new CIK (NCI 2023-12-03), not at the new holder's first traded bar (2024-04-23)",
+)
+def test_c_new_company_segment_starts_at_its_first_traded_bar() -> None:
+    # Same world: the new company's segment does not start before 2021-07-01, so it owns none
+    # of the placeholder bars of 2021-06-03..06-30 that follow its SEC listing (real NCI: SEC
+    # 2023-12-03, first trade 2024-04-23 -> 4.5 months of 27.99 bars). NOTE: with today's
+    # switch-only behaviour (traded_runs None) the CIK cut sits on the SEC snapshot 2021-06-03,
+    # so this needs more than the drop_table_corrections change.
+    master = c_build(ca_sec(), ca_bars())
+
+    new = segment_at(master, "NCI", date(2021, 8, 2))
+    assert new["valid_from"] >= CA_NEW_FIRST
+    for seg in covering(master, "NCI", CA_PLACEHOLDER_END):
+        assert seg["security_id"] != new["security_id"]
+
+
+def test_c_leak_placeholder_world_does_not_show_the_new_cik_early() -> None:
+    # Leakage: the new company's SEC rows (2021-06-03) and bars (2021-07-01) exist in the
+    # inputs but are in the future at 2020-08-17 and 2021-06-02. No reader then may see
+    # 1916331 under NCI, in the full build or in a truncated one, and the two must agree.
+    full = c_build(ca_sec(), ca_bars())
+    for as_of in (C_AFTER_AS_OF, et_midnight(CA_NEW_LISTED - timedelta(days=1))):
+        truncated = c_truncated(as_of, ca_sec(), ca_bars())
+        assert CA_NEW_CIK not in c_seen(full, as_of, "NCI"), as_of
+        assert c_seen(full, as_of, "NCI") == c_seen(truncated, as_of, "NCI"), as_of
+
+
+# --- world b: a ticker reused after a gap with no bars at all -------------------------------
+
+CB_SNAPSHOTS = [*C_SNAPSHOTS, date(2021, 3, 1)]  # 2021-03-01: real snapshot date
+CB_A_CIK = 610_001  # constructed
+CB_B_CIK = 610_002  # constructed
+CB_A_LAST = date(2020, 5, 29)  # constructed: A's last session, before the correction
+CB_B_FIRST = date(2021, 3, 1)  # constructed: B lists and trades from here
+
+
+def cb_sec() -> pa.Table:
+    return c_sec(
+        [("RUSE", CB_A_CIK, C_FIRST, C_LOWER), ("RUSE", CB_B_CIK, CB_B_FIRST, None)],
+        snapshots=CB_SNAPSHOTS,
+    )
+
+
+def cb_bars() -> pa.Table:
+    return bars_table(
+        [
+            *bar_rows("RUSE", C_FIRST_BAR, CB_A_LAST, 40.0),
+            *bar_rows("RUSE", CB_B_FIRST, C_BAR_END, 12.0),
+        ]
+    )
+
+
+def test_c_reused_ticker_after_a_gap_is_two_securities() -> None:
+    # End to end: A trades RUSE to 2020-05-29 and vanishes at the correction (SEC 610_001 up to
+    # 2020-06-01); nothing trades for nine months; B lists (610_002 from 2021-03-01) and trades
+    # from 2021-03-01. RUSE has bars after the correction but no run crossing it -> A's rows
+    # stay, A's bars and B's bars are two securities, A's under 610_001.
+    master = c_build(cb_sec(), cb_bars())
+
+    a = segment_at(master, "RUSE", date(2020, 3, 2))
+    b = segment_at(master, "RUSE", CB_B_FIRST)
+    assert a["security_id"] != b["security_id"]
+    assert a["cik"] == CB_A_CIK
+    assert b["cik"] == CB_B_CIK
+    assert b["valid_from"] >= CB_B_FIRST
