@@ -12,13 +12,29 @@ import duckdb
 import httpx
 import pyarrow.parquet as pq
 import typer
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from asof import __version__
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
 from asof.ingest.bar_imports import import_bars, load_bar_imports
 from asof.ingest.bars import ET, Partition, backfill, windows_for_requests
 from asof.ingest.corporate_actions import build_tables, download_all
+from asof.ingest.edgar import (
+    REQUESTS_PER_SECOND,
+    Throttled,
+    audit_filings,
+    cik_windows,
+    coverage_gaps,
+    load_coverage_exceptions,
+    missing_filings,
+    periodic_gaps,
+    rate_limited,
+    retrying,
+    security_segments,
+    stale_reports,
+    sync_company,
+    trading_segments,
+)
 from asof.ingest.http import make_fetch
 from asof.ingest.instrument_class import (
     CLASS_FILE,
@@ -88,9 +104,10 @@ from asof.store.audit import (
     write_report,
 )
 from asof.store.db import default_data_dir, default_db_path, init_db, make_engine
+from asof.store.documents import audit_documents
 from asof.store.entities import EntityConflict, upsert_entities
-from asof.store.market import bars_status, market_root, visible_splits
-from asof.store.models import EntityKind
+from asof.store.market import bars_status, market_root, visible_bars, visible_splits
+from asof.store.models import Entity, EntityKind
 from asof.store.universe import (
     LIQUID_CLASSES,
     MIN_ADV_USD,
@@ -117,6 +134,8 @@ market_app = typer.Typer(
     help="Market data: symbol universe and bar backfill.", no_args_is_help=True
 )
 app.add_typer(market_app, name="market")
+docs_app = typer.Typer(help="Text documents: SEC filings and their chunks.", no_args_is_help=True)
+app.add_typer(docs_app, name="docs")
 
 
 def _fail(message: str) -> NoReturn:
@@ -1116,3 +1135,187 @@ def market_truncation(
     if not verdict.ok:
         raise typer.Exit(code=2)
     typer.echo("every leak impact within the baseline and named by a key")
+
+
+def _docs_dirs(data_dir: Path | None) -> tuple[Path, Path]:
+    root = data_dir or default_data_dir()
+    return root / "raw" / "sec" / "filings", root / "docs" / "sec"
+
+
+@docs_app.command("sync")
+def docs_sync(
+    since: Annotated[
+        datetime, typer.Option("--since", help="First filing date to store.")
+    ] = datetime(2023, 1, 1),
+    tickers: Annotated[
+        str | None,
+        typer.Option("--tickers", help="Comma-separated companies. Default: every company entity."),
+    ] = None,
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite file to write. Defaults to $ASOF_DATA_DIR/meta.db."),
+    ] = None,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Store the earnings 8-Ks, 6-Ks and periodic reports of every company since --since.
+
+    Raw files are written once and reused; a company is committed as soon as it is done, so an
+    interrupted run picks up where it stopped. Needs $ASOF_SEC_USER_AGENT.
+    """
+    user_agent = os.environ.get(SEC_USER_AGENT_ENV)
+    if not user_agent:
+        _fail(f"Set {SEC_USER_AGENT_ENV} to a contact address; the SEC requires one.")
+    raw_dir, text_dir = _docs_dirs(data_dir)
+    master_path = market_root(data_dir or default_data_dir()) / MASTER_FILE
+    if not master_path.exists():
+        _fail(f"{master_path}: no security master; run `asof market identity` first")
+    master = pq.read_table(master_path)
+    market = market_root(data_dir or default_data_dir())
+    con = duckdb.connect()
+    now = datetime.now(UTC)
+
+    def traded(symbol: str, start: date, end: date | None) -> tuple[date, date] | None:
+        bars = visible_bars(
+            con,
+            market,
+            "1Day",
+            now,
+            symbols=[symbol],
+            start=datetime.combine(start, datetime.min.time(), tzinfo=ET),
+            end=datetime.combine(end, datetime.min.time(), tzinfo=ET) if end else None,
+            resolve=False,
+        )
+        days = [t.astimezone(ET).date() for t in bars.column("t").to_pylist()]
+        return (min(days), max(days)) if days else None
+
+    fetch = retrying(rate_limited(make_fetch({"User-Agent": user_agent}), REQUESTS_PER_SECOND))
+    engine = make_engine(db or default_db_path())
+    init_db(engine)
+    wanted_tickers = set(_parse_symbols(tickers)) if tickers else None
+    totals = [0, 0, 0, 0]
+    errors: list[str] = []
+    try:
+        with Session(engine) as session:
+            companies = [
+                e
+                for e in session.exec(
+                    select(Entity).where(Entity.kind == EntityKind.COMPANY).order_by(Entity.ticker)
+                ).all()
+                if wanted_tickers is None or e.ticker in wanted_tickers
+            ]
+            if wanted_tickers is not None:
+                unknown = wanted_tickers - {e.ticker for e in companies}
+                if unknown:
+                    _fail(f"Not company entities: {', '.join(sorted(unknown))}")
+            for n, company in enumerate(companies, 1):
+                assert company.cik is not None
+                segments = security_segments(master, company.ticker)
+                if not segments:
+                    typer.echo(f"{company.ticker}: no open master segment, only CIK {company.cik}")
+                windows = cik_windows(company.cik, trading_segments(company.cik, segments, traded))
+                started = time.monotonic()
+                try:
+                    result = sync_company(
+                        session,
+                        fetch,
+                        entity=company,
+                        windows=windows,
+                        since=since.date(),
+                        raw_dir=raw_dir,
+                        text_dir=text_dir,
+                        now=now,
+                    )
+                except Throttled as error:
+                    session.rollback()
+                    _fail(f"{company.ticker}: {error}. Earlier companies are stored.")
+                except (RuntimeError, httpx.HTTPError, ValueError) as error:
+                    # The listing itself failed; the company is retried on the next run.
+                    session.rollback()
+                    errors.append(f"{company.ticker}: {error}")
+                    continue
+                session.commit()
+                totals = [
+                    totals[0] + result.added,
+                    totals[1] + result.skipped,
+                    totals[2] + result.files,
+                    totals[3] + result.empty,
+                ]
+                errors.extend(f"{company.ticker} {e}" for e in result.errors)
+                ciks = ",".join(str(w.cik) for w in windows)
+                typer.echo(
+                    f"[{n}/{len(companies)}] {company.ticker:<6} ciks {ciks:<16} "
+                    f"+{result.added} docs, {result.skipped} known, {result.files} files, "
+                    f"{result.empty} empty, {len(result.errors)} errors, "
+                    f"{time.monotonic() - started:.0f}s"
+                )
+    finally:
+        engine.dispose()
+        con.close()
+    for error in errors:
+        typer.echo(f"error: {error}")
+    typer.echo(
+        f"{totals[0]} documents added, {totals[1]} already stored, {totals[2]} files "
+        f"downloaded, {totals[3]} empty files skipped, {len(errors)} errors"
+    )
+    if errors:
+        raise typer.Exit(code=2)
+
+
+@docs_app.command("audit")
+def docs_audit(
+    exceptions: Annotated[Path, typer.Option(help="Reviewed coverage gaps.")] = Path(
+        "configs/docs_exceptions.yaml"
+    ),
+    since: Annotated[
+        datetime, typer.Option("--since", help="First filing date the sync stored.")
+    ] = datetime(2023, 1, 1),
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite file to read. Defaults to $ASOF_DATA_DIR/meta.db."),
+    ] = None,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Check that every stored citation can be re-read and nothing was public too early.
+
+    Exit 0 when clean; 2 when a chunk, text file or availability time is wrong, a filing on a
+    company's saved EDGAR listing is not stored, or a company lacks earnings or periodic
+    filings outside the reviewed exceptions.
+    """
+    raw_dir, text_dir = _docs_dirs(data_dir)
+    try:
+        excused = load_coverage_exceptions(exceptions)
+    except ValueError as error:
+        _fail(str(error))
+    engine = make_engine(db or default_db_path())
+    try:
+        with Session(engine) as session:
+            problems = audit_documents(session, text_dir) + audit_filings(session, raw_dir)
+            problems += missing_filings(session, raw_dir, since.date())
+            gaps = [f"{ticker}:{kind}" for ticker, kind in coverage_gaps(session)]
+            gaps += [
+                f"{ticker}:periodic-gap:{later.isoformat()}"
+                for ticker, _, later in periodic_gaps(session)
+            ]
+            gaps += [
+                f"{ticker}:periodic-stale:{latest.isoformat()}"
+                for ticker, latest in stale_reports(session, datetime.now(UTC).date())
+            ]
+    finally:
+        engine.dispose()
+    for problem in problems:
+        typer.echo(problem)
+    unexcused = [gap for gap in gaps if gap not in excused]
+    for gap in unexcused:
+        typer.echo(f"coverage: {gap} is missing")
+    for gap in gaps:
+        if gap in excused:
+            typer.echo(f"coverage: {gap} excused ({excused[gap]})")
+    for stale in sorted(set(excused) - set(gaps)):
+        typer.echo(f"stale exception: {stale} is covered now")
+    typer.echo(f"{len(problems)} integrity problems, {len(unexcused)} unexcused coverage gaps")
+    if problems or unexcused:
+        raise typer.Exit(code=2)

@@ -43,7 +43,11 @@ Any violation is look-ahead leakage and is treated as a bug.
       instant and compared with what the full master shows then; every identity fact (a
       segment, its end, its CIK) carries the instant it became knowable; gated on what each
       leak changes in the price rows and CIKs a backtest reads
-- [ ] Historical backfill: minute bars, SEC EDGAR filings and XBRL facts, FRED
+- [x] Filings: every earnings release and Reg FD item (8-K Items 2.02 and 7.01, 6-K) and periodic report
+      (10-K, 10-Q, 20-F, 40-F and transition reports) of the 218 watchlist companies since
+      2023, about 9,400 documents in 685,000 citable chunks, each stamped with the instant
+      EDGAR made it public; audited for integrity and for missing quarters
+- [ ] Historical backfill: minute bars, SEC EDGAR XBRL facts, FRED
 - [ ] Scanner, evidence retrieval, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
 
@@ -278,6 +282,46 @@ keys and unmatched cells; once the list itself changes, every default run fails 
 `$ASOF_DATA_DIR/market/audit/truncation/<instant>.parquet`, impact rows to
 `$ASOF_DATA_DIR/market/audit/truncation_impact/<instant>.parquet`.
 
+### Filings
+
+```bash
+export ASOF_SEC_USER_AGENT="your-project your-email@example.com"   # SEC asks every client for one
+uv run asof docs sync                     # every wanted filing since 2023-01-01; reruns add only new ones
+uv run asof docs sync --tickers NVDA,XOM --since 2024-01-01
+uv run asof docs audit                    # integrity, the store vs. the saved listings, coverage gaps
+```
+
+`asof docs sync` reads each company's EDGAR submission list (and its predecessor's: XOM's
+filings before the 2026 holding-company move sit under Exxon Mobil Corp's CIK 34088, which the
+security master carries on the days it traded) and keeps 8-Ks with Item 2.02 (results) or
+7.01 (Reg FD: guidance, investor-day decks and, at UEC and Energy Fuels, the results
+themselves), 6-Ks, 10-Ks, 10-Qs, 20-Fs, 40-Fs, transition reports and their amendments. The
+text of a filing is
+its EX-99 exhibits for an 8-K, 6-K or 40-F (the 8-K body only says "see Exhibit 99.1"), its
+primary document for a periodic report, plus EX-13 for a 10-K (Wells Fargo puts the whole
+annual report there). PDF-only exhibits are skipped; EDGAR treats them as unofficial copies.
+Amendments are separate documents and supersede nothing: a 10-K/A often carries only Part III.
+An 8-K's title names its items (`8-K 2.02,9.01 EX-99.1 PRESS RELEASE`).
+
+A document's `available_at` is the later of the "Accepted" time on the filing's EDGAR index
+page and 06:00 New York on its filing date: a filing accepted after 17:30 is dated, and
+disseminated, the next business day (NVDA's 10-Q accepted 2023-08-25 19:36 is available
+2023-08-28 06:00). The `acceptanceDateTime` field of the submissions JSON is not used: for
+most filers it is New York time labelled UTC, four or five hours late.
+
+Raw files and index pages are kept under `$ASOF_DATA_DIR/raw/sec/filings/<cik>/<accession>/`,
+written once. Each document's text is a file under `$ASOF_DATA_DIR/docs/sec/`; the database
+keeps its hash and the chunks, each an exact slice `text[char_start:char_end]` so a citation
+can be re-read. Periodic reports are cut at PART / ITEM headings (section paths such as
+`Part I > Item 2`) and every chunk is at most 2,000 characters, never across a section.
+
+Each sync also saves the EDGAR listing it read under `<cik>/submissions/`, replacing the last
+copy, and `asof docs audit` reconciles the store against it. The audit exits 2 on a text file
+that no longer matches its hash or chunks, a filing whose stored time is earlier than its
+acceptance, a wanted filing on a company's saved listing that is not stored, a company with no
+earnings release or no periodic report, a skipped quarter or an overdue latest report, unless
+`configs/docs_exceptions.yaml` excuses it with a reason.
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.
@@ -305,7 +349,8 @@ configs/             watchlist.yaml (instruments that get filings and fundamenta
                      audit_exceptions.yaml (reviewed audit findings),
                      bar_imports.yaml (bars imported from a second source),
                      truncation_instants.txt (instants the truncation test rebuilds at),
-                     truncation_impact_baseline.txt (known leak impact, a ratchet)
+                     truncation_impact_baseline.txt (known leak impact, a ratchet),
+                     docs_exceptions.yaml (reviewed filing coverage gaps)
 docs/                public documentation                                  (planned)
 ```
 

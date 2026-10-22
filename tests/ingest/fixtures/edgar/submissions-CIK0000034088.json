@@ -1,0 +1,170 @@
+{
+ "cik": "0000034088",
+ "entityType": "operating",
+ "sic": "2911",
+ "sicDescription": "Petroleum Refining",
+ "ownerOrg": "01 Energy & Transportation",
+ "insiderTransactionForOwnerExists": 1,
+ "insiderTransactionForIssuerExists": 1,
+ "name": "EXXON MOBIL CORP",
+ "tickers": [],
+ "exchanges": [],
+ "ein": "135409005",
+ "lei": null,
+ "description": "",
+ "website": "",
+ "investorWebsite": "",
+ "category": "Large accelerated filer",
+ "fiscalYearEnd": "1231",
+ "stateOfIncorporation": "NJ",
+ "stateOfIncorporationDescription": "NJ",
+ "addresses": {
+  "mailing": {
+   "street1": "22777 SPRINGWOODS VILLAGE PARKWAY",
+   "street2": null,
+   "city": "SPRING",
+   "stateOrCountry": "TX",
+   "zipCode": "77389-1425",
+   "stateOrCountryDescription": "TX",
+   "isForeignLocation": 0,
+   "foreignStateTerritory": null,
+   "country": null,
+   "countryCode": null
+  },
+  "business": {
+   "street1": "22777 SPRINGWOODS VILLAGE PARKWAY",
+   "street2": null,
+   "city": "SPRING",
+   "stateOrCountry": "TX",
+   "zipCode": "77389-1425",
+   "stateOrCountryDescription": "TX",
+   "isForeignLocation": null,
+   "foreignStateTerritory": null,
+   "country": null,
+   "countryCode": null
+  }
+ },
+ "phone": "9729406000",
+ "flags": "",
+ "formerNames": [
+  {
+   "name": "EXXON CORP",
+   "from": "1994-05-11T00:00:00.000Z",
+   "to": "1999-11-30T00:00:00.000Z"
+  }
+ ],
+ "filings": {
+  "recent": {
+   "accessionNumber": [
+    "0000034088-26-000093",
+    "0001193125-26-291986",
+    "0000034088-26-000065",
+    "0000034088-22-000071"
+   ],
+   "filingDate": [
+    "2026-08-03",
+    "2026-07-01",
+    "2026-05-01",
+    "2022-12-05"
+   ],
+   "reportDate": [
+    "2026-06-30",
+    "2026-07-01",
+    "2026-05-01",
+    "2022-11-30"
+   ],
+   "acceptanceDateTime": [
+    "2026-08-03T18:55:38.000Z",
+    "2026-07-01T16:34:56.000Z",
+    "2026-05-01T10:31:52.000Z",
+    "2022-12-02T23:11:09.000Z"
+   ],
+   "act": [
+    "34",
+    "34",
+    "34",
+    "34"
+   ],
+   "form": [
+    "10-Q",
+    "8-K",
+    "8-K",
+    "8-K"
+   ],
+   "fileNumber": [
+    "001-02256",
+    "001-02256",
+    "001-02256",
+    "001-02256"
+   ],
+   "filmNumber": [
+    "261232241",
+    "261143831",
+    "26928777",
+    "221443245"
+   ],
+   "items": [
+    "",
+    "1.01,2.01,3.01,3.03,5.02,5.03,9.01",
+    "2.02,7.01",
+    "5.02"
+   ],
+   "core_type": [
+    "XBRL",
+    "XBRL",
+    "XBRL",
+    "XBRL"
+   ],
+   "size": [
+    14847031,
+    316427,
+    2497766,
+    252700
+   ],
+   "isXBRL": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "isInlineXBRL": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "isXBRLNumeric": [
+    1,
+    0,
+    0,
+    null
+   ],
+   "primaryDocument": [
+    "xom-20260630.htm",
+    "d70995d8k.htm",
+    "xom-20260501.htm",
+    "xom-20221130.htm"
+   ],
+   "primaryDocDescription": [
+    "FORM 10-Q",
+    "8-K",
+    "FORM 8-K",
+    "FORM 8-K"
+   ]
+  },
+  "files": [
+   {
+    "name": "CIK0000034088-submissions-001.json",
+    "filingCount": 2002,
+    "filingFrom": "2005-10-04",
+    "filingTo": "2020-01-02"
+   },
+   {
+    "name": "CIK0000034088-submissions-002.json",
+    "filingCount": 554,
+    "filingFrom": "1994-03-04",
+    "filingTo": "2005-10-03"
+   }
+  ]
+ }
+}

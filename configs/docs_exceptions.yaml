@@ -1,0 +1,9 @@
+# Coverage gaps `asof docs audit` accepts, each with the reason found in the company's filings:
+#
+#   - key: 'UUUU:earnings'       # the gap exactly as the audit prints it
+#     reason: 'results furnished only under an item that is not ingested'
+#     added: 2026-10-22
+#     by: greyson
+#
+# A key no longer reported is listed as stale; remove it then.
+[]
