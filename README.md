@@ -307,7 +307,8 @@ A document's `available_at` is the later of the "Accepted" time on the filing's 
 page and 06:00 New York on its filing date: a filing accepted after 17:30 is dated, and
 disseminated, the next business day (NVDA's 10-Q accepted 2023-08-25 19:36 is available
 2023-08-28 06:00). The `acceptanceDateTime` field of the submissions JSON is not used: for
-most filers it is New York time labelled UTC, four or five hours late.
+most filers it is the New York clock shifted to UTC twice, four or five hours late (NVDA's
+Q2 FY27 release: JSON 2026-08-27T00:21:19Z, accepted 2026-08-26 16:21:19 New York).
 
 Raw files and index pages are kept under `$ASOF_DATA_DIR/raw/sec/filings/<cik>/<accession>/`,
 written once. Each document's text is a file under `$ASOF_DATA_DIR/docs/sec/`; the database
