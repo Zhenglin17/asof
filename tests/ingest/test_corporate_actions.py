@@ -33,6 +33,13 @@ raw download it kept):
 - TWTR cash_merger 2022-10-28 rate 54.2 with no acquirer fields (real)
 - APE->AMC stock_merger 2023-08-25 acquirer_rate 0.1 (real)
 - AGN->ABBV stock_and_cash_merger 2020-05-08 acquirer_rate 0.866 cash_rate 120.3 (real)
+- CS->UBS stock_merger 2023-06-12 acquiree_rate 22.48 acquirer_rate 1 (real rates and dates;
+  cusip / id / process_date filled in to match the other fixtures). 22.48 CS shares buy one
+  UBS share, so stock_rate must be 1 / 22.48, not the raw acquirer_rate 1.0.
+- QGEN->QGEN stock_and_cash_merger 2025-01-29 acquiree_rate 36 acquirer_rate 35 cash_rate
+  1.26 (real rates and dates; cusip / id / process_date filled in). Qiagen's own reverse split
+  plus capital return, not a real merger. UNVERIFIED: whether Alpaca quotes cash_rate per old
+  share or per 36 old shares; the test pins the raw per-row value, not a known truth.
 - cash_dividend "A" 2020-03-30 without sub_type; AEBI 2026-06-05 with sub_type
   return_of_capital (real: the field appears from record 225,367 on)
 - YOKEY cash_dividend with ex_date 3026-03-31 (real bad row)
@@ -197,6 +204,32 @@ AGN_STOCK_AND_CASH = {
     "effective_date": "2020-05-08",
     "id": "dfd703bf-adad-46e4-bd18-c4fcbc6ed81d",
     "process_date": "2020-05-08",
+    "_kind": "stock_and_cash_mergers",
+}
+CS_STOCK_MERGER = {
+    "acquiree_cusip": "225401108",
+    "acquiree_rate": 22.48,
+    "acquiree_symbol": "CS",
+    "acquirer_cusip": "H42097107",
+    "acquirer_rate": 1,
+    "acquirer_symbol": "UBS",
+    "effective_date": "2023-06-12",
+    "id": "3b1f7c52-8d0e-4a6b-9c1e-2f5a7d9e4b10",
+    "payable_date": "2023-06-12",
+    "process_date": "2023-06-12",
+    "_kind": "stock_mergers",
+}
+QGEN_STOCK_AND_CASH = {
+    "acquiree_cusip": "N72482123",
+    "acquiree_rate": 36,
+    "acquiree_symbol": "QGEN",
+    "acquirer_cusip": "N72482149",
+    "acquirer_rate": 35,
+    "acquirer_symbol": "QGEN",
+    "cash_rate": 1.26,
+    "effective_date": "2025-01-29",
+    "id": "a7c4e2d9-1f3b-4e8a-b6d0-5c9f8e2a7b31",
+    "process_date": "2025-01-29",
     "_kind": "stock_and_cash_mergers",
 }
 A_DIVIDEND = {
@@ -622,29 +655,138 @@ def test_parse_name_changes_rejects_a_missing_new_symbol_or_bad_date() -> None:
     assert [json.loads(r["raw_json"]) for r in rejects.to_pylist()] == [bad_symbol, bad_date]
 
 
+MERGER_COLUMNS = [
+    "acquiree_symbol",
+    "acquirer_symbol",
+    "kind",
+    "effective_date",
+    "stock_rate",
+    "cash_rate",
+    "available_at",
+]
+
+
 def test_parse_mergers_covers_cash_stock_and_mixed_deals() -> None:
     table, rejects = parse_mergers([TWTR_CASH_MERGER, APE_STOCK_MERGER, AGN_STOCK_AND_CASH])
 
-    assert table.schema.names == [
-        "acquiree_symbol",
-        "acquirer_symbol",
-        "kind",
-        "effective_date",
-        "rate",
-        "available_at",
-    ]
+    assert table.schema.names == MERGER_COLUMNS
+    assert table.schema.field("stock_rate").type == pa.float64()
+    assert table.schema.field("cash_rate").type == pa.float64()
     assert rejects.num_rows == 0
     rows = {r["acquiree_symbol"]: r for r in table.to_pylist()}
     assert rows["TWTR"]["acquirer_symbol"] is None
     assert rows["TWTR"]["kind"] == "cash_merger"
-    assert rows["TWTR"]["rate"] == pytest.approx(54.2)
+    assert rows["TWTR"]["stock_rate"] is None
+    assert rows["TWTR"]["cash_rate"] == pytest.approx(54.2)  # dollars per TWTR share
     assert rows["TWTR"]["effective_date"] == date(2022, 10, 28)
     assert rows["TWTR"]["available_at"] == datetime(2022, 10, 28, 4, 0, tzinfo=UTC)
     assert rows["APE"]["acquirer_symbol"] == "AMC"
     assert rows["APE"]["kind"] == "stock_merger"
-    assert rows["APE"]["rate"] == pytest.approx(0.1)  # shares of acquirer per acquiree share
+    assert rows["APE"]["stock_rate"] == pytest.approx(0.1)  # AMC shares per APE share
+    assert rows["APE"]["cash_rate"] is None
     assert rows["AGN"]["kind"] == "stock_and_cash_merger"
     assert rows["AGN"]["acquirer_symbol"] == "ABBV"
+    assert rows["AGN"]["stock_rate"] == pytest.approx(0.866)
+    assert rows["AGN"]["cash_rate"] == pytest.approx(120.3)
+
+
+def test_parse_mergers_divides_by_the_acquiree_rate() -> None:
+    # Regression: CS quotes 22.48 CS shares for 1 UBS share. Storing the raw acquirer_rate
+    # (1.0) would value each CS share at a whole UBS share, 22x too much.
+    table, rejects = parse_mergers([CS_STOCK_MERGER])
+
+    assert rejects.num_rows == 0
+    [row] = table.to_pylist()
+    assert (row["acquiree_symbol"], row["acquirer_symbol"]) == ("CS", "UBS")
+    assert row["kind"] == "stock_merger"
+    assert row["stock_rate"] == pytest.approx(1 / 22.48)
+    assert row["stock_rate"] == pytest.approx(0.04448, abs=1e-5)
+    assert row["cash_rate"] is None
+
+
+def test_parse_mergers_keeps_a_mixed_deal_cash_leg_as_given() -> None:
+    # QGEN -> QGEN: Qiagen's reverse split plus capital return, filed as a stock-and-cash
+    # merger. The cash leg is per ONE old share, not per 36 (measured on our bars): one old
+    # share = 35/36 x 44.86 (2025-01-29 open) + 1.26 = 44.87 vs the 2025-01-28 close 45.14;
+    # per 36 it would be 43.65. The feed's 2024-01-30 QGEN record of the same kind quotes
+    # 0.97 shares + 1.28 dollars for acquiree_rate 1.
+    table, rejects = parse_mergers([QGEN_STOCK_AND_CASH])
+
+    assert rejects.num_rows == 0
+    [row] = table.to_pylist()
+    assert (row["acquiree_symbol"], row["acquirer_symbol"]) == ("QGEN", "QGEN")
+    assert row["kind"] == "stock_and_cash_merger"
+    assert row["stock_rate"] == pytest.approx(35 / 36)
+    assert row["cash_rate"] == pytest.approx(1.26)
+    assert row["effective_date"] == date(2025, 1, 29)
+
+
+def _without(row: dict[str, Any], key: str) -> dict[str, Any]:
+    return {k: v for k, v in row.items() if k != key}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {**APE_STOCK_MERGER, "acquiree_rate": 0},
+        _without(CS_STOCK_MERGER, "acquiree_rate"),
+        {**APE_STOCK_MERGER, "acquirer_rate": -0.1},
+        _without(AGN_STOCK_AND_CASH, "cash_rate"),
+        {**TWTR_CASH_MERGER, "rate": "abc"},
+        {**TWTR_CASH_MERGER, "rate": "nan"},
+        {**APE_STOCK_MERGER, "acquirer_rate": True},
+    ],
+    ids=[
+        "stock_acquiree_rate_zero",
+        "stock_acquiree_rate_missing",
+        "stock_acquirer_rate_negative",
+        "mixed_cash_rate_missing",
+        "cash_rate_not_numeric",
+        "cash_rate_nan",
+        "stock_acquirer_rate_bool",
+    ],
+)
+def test_parse_mergers_quarantines_a_bad_rate_with_the_original_json(
+    bad: dict[str, Any],
+) -> None:
+    good = [TWTR_CASH_MERGER, APE_STOCK_MERGER, AGN_STOCK_AND_CASH]
+    good = [g for g in good if g["acquiree_symbol"] != bad["acquiree_symbol"]]
+
+    table, rejects = parse_mergers([*good, bad])
+
+    assert table.schema.names == MERGER_COLUMNS
+    assert sorted(table.column("acquiree_symbol").to_pylist()) == sorted(
+        g["acquiree_symbol"] for g in good
+    )
+    assert rejects.schema.names == REJECT_COLUMNS
+    [reject] = rejects.to_pylist()
+    assert reject["kind"] == bad["_kind"].rstrip("s")
+    assert json.loads(reject["raw_json"]) == bad
+    assert "rate" in reject["reason"].lower()
+
+
+def test_parse_mergers_rejects_an_unknown_merger_kind_by_its_kind() -> None:
+    # Without its own check this row would be rejected for a "missing cash_rate", which
+    # points the reader at the wrong field.
+    bad = {**APE_STOCK_MERGER, "_kind": "spin_off_mergers"}
+
+    table, rejects = parse_mergers([TWTR_CASH_MERGER, bad])
+
+    assert table.column("acquiree_symbol").to_pylist() == ["TWTR"]
+    [reject] = rejects.to_pylist()
+    assert json.loads(reject["raw_json"]) == bad
+    assert "kind" in reject["reason"].lower()
+
+
+def test_parse_mergers_new_rows_become_visible_at_new_york_midnight() -> None:
+    # Leakage: a merger effective 2023-06-12 must not be known on 2023-06-11 evening New York
+    # time; 00:00 EDT is 04:00 UTC (EST in winter: 05:00 UTC).
+    table, _ = parse_mergers([CS_STOCK_MERGER, QGEN_STOCK_AND_CASH])
+
+    rows = {r["acquiree_symbol"]: r for r in table.to_pylist()}
+    assert rows["CS"]["available_at"] == datetime(2023, 6, 12, 4, 0, tzinfo=UTC)
+    assert rows["QGEN"]["available_at"] == datetime(2025, 1, 29, 5, 0, tzinfo=UTC)
+    assert rows["CS"]["available_at"] > datetime(2023, 6, 12, 3, 59, tzinfo=UTC)
 
 
 def test_parse_mergers_rejects_a_missing_acquiree() -> None:
@@ -734,7 +876,11 @@ def test_every_parser_puts_available_at_at_new_york_midnight_of_the_effective_da
             ["2024-06-10", "2025-08-01", "2020-12-10"],
         ),
         (parse_name_changes, [MMC_RENAME], ["2026-01-14"]),
-        (parse_mergers, [TWTR_CASH_MERGER, APE_STOCK_MERGER], ["2022-10-28", "2023-08-25"]),
+        (
+            parse_mergers,
+            [TWTR_CASH_MERGER, APE_STOCK_MERGER, CS_STOCK_MERGER, QGEN_STOCK_AND_CASH],
+            ["2022-10-28", "2023-08-25", "2023-06-12", "2025-01-29"],
+        ),
         (parse_dividends, [A_DIVIDEND, VNO_FUTURE_DIVIDEND], ["2020-03-30", "2026-12-15"]),
     ]
     for parse, rows, days in cases:

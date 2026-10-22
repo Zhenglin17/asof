@@ -14,6 +14,7 @@ first pre-market print is already at the post-split price and a 09:35 scan must 
 """
 
 import json
+import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, time
@@ -62,7 +63,8 @@ MERGER_SCHEMA = pa.schema(
         ("acquirer_symbol", pa.string()),
         ("kind", pa.string()),
         ("effective_date", pa.date32()),
-        ("rate", pa.float64()),
+        ("stock_rate", pa.float64()),
+        ("cash_rate", pa.float64()),
         ("available_at", TS_UTC),
     ]
 )
@@ -229,10 +231,14 @@ def _rate(row: Mapping[str, Any], key: str) -> float:
     value = row.get(key)
     if value is None:
         raise Rejected(f"missing {key} rate")
+    if isinstance(value, bool):
+        raise Rejected(f"bad {key} rate {value!r}")
     try:
         rate = float(value)
     except (TypeError, ValueError) as error:
         raise Rejected(f"bad {key} rate {value!r}") from error
+    if not math.isfinite(rate):
+        raise Rejected(f"bad {key} rate {value!r}")
     if rate <= 0:
         raise Rejected(f"{key} rate {rate} is not positive")
     return rate
@@ -331,18 +337,29 @@ def parse_name_changes(rows: Iterable[Mapping[str, Any]]) -> tuple[pa.Table, pa.
 
 def _merger_row(row: Mapping[str, Any]) -> dict[str, Any]:
     kind = _kind_of(row)
+    if kind not in MERGER_KINDS:
+        raise Rejected(f"unknown merger kind {kind!r}")
     day = _optional_date(row, "effective_date") or _date(row, "process_date")
-    # Cash deals quote dollars per share; stock deals quote acquirer shares per share. A mixed
-    # deal keeps its share leg here; its cash leg stays in the raw JSON.
-    rate = _optional_float(row, "rate" if kind == "cash_merger" else "acquirer_rate")
+    # Both legs are per ONE acquiree share. The feed quotes the share leg as acquirer_rate
+    # acquirer shares for acquiree_rate acquiree shares (CS -> UBS: 1 for 22.48), so divide.
+    # Cash deals put dollars in `rate`, mixed deals in `cash_rate`.
+    stock_rate = cash_rate = None
+    if kind != "cash_merger":
+        stock_rate = _rate(row, "acquirer_rate") / _rate(row, "acquiree_rate")
+    if kind != "stock_merger":
+        cash_rate = _rate(row, "rate" if kind == "cash_merger" else "cash_rate")
     return {
         "acquiree_symbol": _symbol(row, "acquiree_symbol"),
         "acquirer_symbol": _optional_symbol(row, "acquirer_symbol"),
         "kind": kind,
         "effective_date": day,
-        "rate": rate,
+        "stock_rate": stock_rate,
+        "cash_rate": cash_rate,
         "available_at": available_at(day),
     }
+
+
+MERGER_KINDS = ("cash_merger", "stock_merger", "stock_and_cash_merger")
 
 
 def parse_mergers(rows: Iterable[Mapping[str, Any]]) -> tuple[pa.Table, pa.Table]:
