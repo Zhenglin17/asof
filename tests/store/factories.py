@@ -83,14 +83,20 @@ def new_document(
     return add(session, doc)
 
 
-def new_chunk(session: Session, *, document_id: int, ordinal: int = 0) -> Chunk:
-    text = "Total net sales increased 5% year over year."
+def new_chunk(
+    session: Session,
+    *,
+    document_id: int,
+    ordinal: int = 0,
+    text: str = "Total net sales increased 5% year over year.",
+    section_path: str = "Part I > Item 2 > Results of Operations",
+) -> Chunk:
     return add(
         session,
         Chunk(
             document_id=document_id,
             ordinal=ordinal,
-            section_path="Part I > Item 2 > Results of Operations",
+            section_path=section_path,
             char_start=0,
             char_end=len(text),
             text=text,

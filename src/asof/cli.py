@@ -1,6 +1,7 @@
 """Command-line entry point. Subcommands are added as each pipeline stage lands."""
 
 import dataclasses
+import json
 import os
 import time
 from concurrent.futures.process import BrokenProcessPool
@@ -15,6 +16,8 @@ import typer
 from sqlmodel import Session, select
 
 from asof import __version__
+from asof.evidence.retrieve import search
+from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
 from asof.ingest.bar_imports import import_bars, load_bar_imports
 from asof.ingest.bars import ET, Partition, backfill, windows_for_requests
@@ -106,6 +109,7 @@ from asof.store.audit import (
 from asof.store.db import default_data_dir, default_db_path, init_db, make_engine
 from asof.store.documents import audit_documents
 from asof.store.entities import EntityConflict, upsert_entities
+from asof.store.fts import chunk_index_integrity, chunk_index_mismatch, rebuild_chunk_index
 from asof.store.market import bars_status, market_root, visible_bars, visible_splits
 from asof.store.models import Entity, EntityKind
 from asof.store.universe import (
@@ -136,6 +140,11 @@ market_app = typer.Typer(
 app.add_typer(market_app, name="market")
 docs_app = typer.Typer(help="Text documents: SEC filings and their chunks.", no_args_is_help=True)
 app.add_typer(docs_app, name="docs")
+evidence_app = typer.Typer(
+    help="Evidence: search what was public at a moment, check a decision's citations.",
+    no_args_is_help=True,
+)
+app.add_typer(evidence_app, name="evidence")
 
 
 def _fail(message: str) -> NoReturn:
@@ -1294,6 +1303,14 @@ def docs_audit(
     try:
         with Session(engine) as session:
             problems = audit_documents(session, text_dir) + audit_filings(session, raw_dir)
+            unindexed = chunk_index_mismatch(session)
+            if unindexed is not None:
+                problems.append(
+                    f"chunk index: {unindexed:+,} chunks not indexed, run `asof evidence index`"
+                )
+            elif (broken := chunk_index_integrity(session)) is not None:
+                problems.append(f"chunk index: {broken}, run `asof evidence index`")
+            session.rollback()
             problems += missing_filings(session, raw_dir, since.date())
             gaps = [f"{ticker}:{kind}" for ticker, kind in coverage_gaps(session)]
             gaps += [
@@ -1319,3 +1336,139 @@ def docs_audit(
     typer.echo(f"{len(problems)} integrity problems, {len(unexcused)} unexcused coverage gaps")
     if problems or unexcused:
         raise typer.Exit(code=2)
+
+
+def _db_option_help() -> str:
+    return "SQLite file. Defaults to $ASOF_DATA_DIR/meta.db."
+
+
+@evidence_app.command("index")
+def evidence_index(
+    force: Annotated[bool, typer.Option(help="Rebuild even when the index checks clean.")] = False,
+    db: Annotated[Path | None, typer.Option("--db", help=_db_option_help())] = None,
+) -> None:
+    """Make sure the full-text index covers every chunk; rebuild it when it does not.
+
+    Creating the index fills it, and new chunks are indexed on insert, so a rebuild is needed
+    only after something went wrong (or with --force).
+    """
+    engine = make_engine(db or default_db_path())
+    try:
+        init_db(engine)
+        with Session(engine) as session:
+            stale = chunk_index_mismatch(session) is not None
+            stale = stale or chunk_index_integrity(session) is not None
+            session.rollback()
+            started = time.monotonic()
+            if stale or force:
+                indexed = rebuild_chunk_index(session)
+                session.commit()
+                typer.echo(f"indexed {indexed:,} chunks in {time.monotonic() - started:.0f}s")
+            mismatch = chunk_index_mismatch(session)
+            broken = chunk_index_integrity(session)
+            session.rollback()
+    finally:
+        engine.dispose()
+    if mismatch is not None:
+        _fail(f"index and chunk table differ by {mismatch:+,} rows")
+    if broken is not None:
+        _fail(f"index does not match the chunk text: {broken}")
+    typer.echo("index complete")
+
+
+def _entity_by_ticker(session: Session, ticker: str) -> Entity:
+    # A command-line convenience: today's ticker of a watchlist entity. Code that reads a
+    # historical moment resolves securities to entities by as_of instead.
+    rows = session.exec(select(Entity).where(Entity.ticker == ticker.upper())).all()
+    if len(rows) != 1:
+        _fail(f"{ticker}: {len(rows)} entities have this ticker, expected 1")
+    return rows[0]
+
+
+@evidence_app.command("search")
+def evidence_search(
+    query: Annotated[str, typer.Argument(help="Plain words; operators are not interpreted.")],
+    as_of: Annotated[
+        datetime,
+        typer.Option("--as-of", help="Only what was public by then (naive = New York time)."),
+    ],
+    ticker: Annotated[str | None, typer.Option(help="Restrict to one company.")] = None,
+    form: Annotated[
+        list[str] | None, typer.Option("--form", help="Base form, e.g. 8-K, 10-Q; repeatable.")
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1)] = 10,
+    db: Annotated[Path | None, typer.Option("--db", help=_db_option_help())] = None,
+) -> None:
+    """Rank the chunks that were public at --as-of by BM25 over that moment's documents."""
+    as_of = _as_of_option(as_of)
+    engine = make_engine(db or default_db_path())
+    try:
+        with Session(engine) as session:
+            entity_id = _entity_by_ticker(session, ticker).id if ticker else None
+            started = time.monotonic()
+            try:
+                hits = search(
+                    session, as_of, query, entity_id=entity_id, base_forms=form, limit=limit
+                )
+            except RuntimeError as error:
+                _fail(str(error))
+            elapsed = time.monotonic() - started
+    finally:
+        engine.dispose()
+    for hit in hits:
+        public = hit.available_at.astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
+        typer.echo(
+            f"{hit.score:7.3f}  chunk {hit.chunk_id}  {hit.doc_type:<6} {public}  "
+            f"{hit.section_path}"
+        )
+        typer.echo(f"         {' '.join(hit.text.split())[:200]}")
+    typer.echo(f"{len(hits)} hits in {elapsed:.2f}s")
+
+
+@evidence_app.command("validate")
+def evidence_validate(
+    draft_file: Annotated[Path, typer.Argument(help="JSON: as_of, ticker, citations[].")],
+    db: Annotated[Path | None, typer.Option("--db", help=_db_option_help())] = None,
+) -> None:
+    """Check a decision draft's citations. Exit 0 when every citation holds, 2 otherwise.
+
+    Each citation is {claim, evidence_kind, chunk_id, quote}; as_of is ISO 8601 with offset.
+    """
+    try:
+        raw = json.loads(draft_file.read_text())
+        unknown = set(raw) - {"as_of", "ticker", "citations"} if isinstance(raw, dict) else set()
+        if not isinstance(raw, dict) or unknown:
+            raise ValueError(f"expected an object with as_of, ticker, citations; got {unknown}")
+        as_of = datetime.fromisoformat(raw["as_of"])
+        citations = [ClaimCitation(**c) for c in raw["citations"]]
+        for c in citations:
+            if not (
+                isinstance(c.claim, str)
+                and isinstance(c.evidence_kind, str)
+                and (c.chunk_id is None or type(c.chunk_id) is int)
+                and (c.quote is None or isinstance(c.quote, str))
+                and (c.evidence_ref is None or isinstance(c.evidence_ref, str))
+            ):
+                raise TypeError(f"citation fields have the wrong types: {c}")
+        ticker = raw["ticker"]
+        if not isinstance(ticker, str):
+            raise TypeError(f"ticker must be a string, got {ticker!r}")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        _fail(f"{draft_file}: not a valid draft ({type(error).__name__}: {error})")
+    engine = make_engine(db or default_db_path())
+    try:
+        with Session(engine) as session:
+            draft = DecisionDraft(
+                as_of=as_of, entity_id=_entity_by_ticker(session, ticker).id, citations=citations
+            )
+            result = validate(session, draft)
+    except ValueError as error:
+        _fail(str(error))
+    finally:
+        engine.dispose()
+    for failure in result.failures:
+        typer.echo(f"citation {failure.index}: {failure.reason} - {failure.detail}")
+    if not result.ok:
+        typer.echo(f"rejected: {len(result.failures)} of {len(draft.citations)} citations fail")
+        raise typer.Exit(code=2)
+    typer.echo(f"ok: {len(draft.citations)} citations hold")

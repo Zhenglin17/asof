@@ -39,10 +39,18 @@ EXPECTED_TABLES = {
     "strategy_version",
     "feedback",
 }
+# The full-text index over chunk.text: one FTS5 virtual table plus the shadow tables it owns.
+FTS_TABLES = {
+    "chunk_fts",
+    "chunk_fts_data",
+    "chunk_fts_idx",
+    "chunk_fts_docsize",
+    "chunk_fts_config",
+}
 
 
-def test_init_db_creates_exactly_the_eleven_tables(engine: Engine) -> None:
-    assert set(inspect(engine).get_table_names()) == EXPECTED_TABLES
+def test_init_db_creates_exactly_the_eleven_tables_and_the_chunk_index(engine: Engine) -> None:
+    assert set(inspect(engine).get_table_names()) == EXPECTED_TABLES | FTS_TABLES
 
 
 def test_foreign_keys_are_enforced(session: Session, apple: Entity) -> None:
@@ -86,6 +94,7 @@ def test_citation_to_existing_chunk_is_accepted(
             claim="Revenue grew 5% year over year.",
             evidence_kind="chunk",
             chunk_id=pk(chunk),
+            quote="Revenue increased 5% compared with the prior year.",
         ),
     )
 

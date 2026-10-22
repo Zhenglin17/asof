@@ -45,10 +45,13 @@ Any violation is look-ahead leakage and is treated as a bug.
       leak changes in the price rows and CIKs a backtest reads
 - [x] Filings: every earnings release and Reg FD item (8-K Items 2.02 and 7.01, 6-K) and periodic report
       (10-K, 10-Q, 20-F, 40-F and transition reports) of the 218 watchlist companies since
-      2023, about 9,400 documents in 685,000 citable chunks, each stamped with the instant
+      2023, 11,522 documents in 703,614 citable chunks, each stamped with the instant
       EDGAR made it public; audited for integrity and for missing quarters
+- [x] Evidence: full-text search over what was public at a given instant, ranked with
+      statistics of that instant only; a citation validator that rejects a conclusion unless
+      every claim quotes, word for word, a chunk of the right company that was public then
 - [ ] Historical backfill: minute bars, SEC EDGAR XBRL facts, FRED
-- [ ] Scanner, evidence retrieval, judge, executor, attribution
+- [ ] Scanner, judge, executor, attribution
 - [ ] Strategy evolution: replay, permutation gate, approval
 
 ## Development
@@ -323,6 +326,54 @@ acceptance, a wanted filing on a company's saved listing that is not stored, a c
 earnings release or no periodic report, a skipped quarter or an overdue latest report, unless
 `configs/docs_exceptions.yaml` excuses it with a reason.
 
+### Evidence
+
+```bash
+uv run asof evidence index                # build the full-text index once; new chunks are indexed on insert
+uv run asof evidence search "data center revenue" --as-of 2024-05-22T16:30:00 --ticker NVDA
+uv run asof evidence search "guidance" --as-of 2025-01-31 --form 8-K --limit 5
+uv run asof evidence validate draft.json  # exit 0 when every citation holds, 2 otherwise
+```
+
+Search returns chunks whose document was public at `--as-of` (a naive time is New York) and
+not yet replaced by a revision. The SQLite FTS5 index says which chunks contain a word and how
+often (its own tokenizer, so `EYLEA™` counts as `eylea`); ranking is BM25 computed from the chunks visible at that instant: how many there are, how many
+contain each word, and their average length. FTS5's built-in ranking counts every indexed
+chunk, so a word that becomes common only later would already weigh less, and the same
+instant would rank differently as filings are added. Top results are exact; words are taken
+rarest first and chunks that contain only common words are skipped once they provably cannot
+reach the top. `--form` takes base forms: `10-K` includes `10-K/A` and `10-KT`. Search refuses
+to run on an incomplete index; `asof docs audit` also runs FTS5's own integrity check.
+
+A draft for validation names an instant, a company and its citations (the chunk id is an
+example; ids are assigned when filings are stored):
+
+```json
+{"as_of": "2026-08-26T16:22:00-04:00", "ticker": "NVDA", "citations": [
+  {"claim": "NVIDIA returned about $26 billion in the second quarter of fiscal 2027.",
+   "evidence_kind": "chunk", "chunk_id": 463647,
+   "quote": "During the second quarter of fiscal 2027, NVIDIA returned approximately $26.0 billion to shareholders"}]}
+```
+
+Each citation must quote its chunk word for word (whitespace aside, 20 to 500 characters,
+starting and ending on word boundaries, so "5.2 million" cannot be cut out of "$15.2
+million"), the chunk's document must belong to the company and be public at `as_of`, and
+every piece of the claim that holds a digit must appear in the quote in the same shape: as
+written, up to thousands commas and trailing decimal zeros, together with a scale word after
+it. `$26 billion` matches `$26.0 billion`, but `$26bn`, `C$26 billion`, `12%` for `-12%` and
+`Q3` against a second-quarter release do not. A currency written as a word or code (`USD`,
+`RMB`, `dollars`) must appear in the quote as well, and a quantity in words ("twenty-seven
+billion", "fifty basis points", "doubled") is rejected. Numbers are
+compared by shape rather than interpreted, so an unfamiliar notation is rejected, not passed;
+a table figure split over cells (`(281 | )`, `19 | %`) is joined first. An unknown chunk and
+one not yet public get the same answer, so a retry learns nothing about later filings. One failing citation rejects the draft; every
+failure is listed with its reason. Only text chunks can be cited for now. Whether a quote
+supports a claim is decided by these checks, not by another model, so a draft gets the same
+verdict every time. They do not catch a claim that keeps the numbers but changes the words
+around them ("fell 12%" for "grew 12%"), a bare table figure whose unit and currency are only
+in the table's header ("in millions"), or a figure moved to another row of a table inside the
+same quote, which the 500-character limit keeps small.
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.
@@ -334,7 +385,7 @@ src/asof/
   store/      SQLite + SQLModel metadata and the as_of read path
   features/   shared feature registry: technical, fundamental, macro, event   (planned)
   scan/       pure-code daily scanner
-  evidence/   as-of document retrieval and chunking
+  evidence/   as-of retrieval over filing chunks and the citation validator
   judge/      cited conclusions with citation validation
   execute/    pure-code paper-trading executor and ledger
   attribute/  P&L attribution

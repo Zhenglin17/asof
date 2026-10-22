@@ -301,6 +301,12 @@ class DecisionCitation(_Table, table=True):
             "OR (chunk_id IS NULL AND evidence_ref IS NOT NULL)",
             name="ck_non_chunk_requires_ref",
         ),
+        # The verbatim passage the claim rests on; the Citation Validator checks it is really
+        # in the chunk, so "supports the claim" is decided by code, not by another model.
+        CheckConstraint(
+            f"evidence_kind != '{EvidenceKind.CHUNK}' OR quote IS NOT NULL",
+            name="ck_chunk_requires_quote",
+        ),
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -309,6 +315,7 @@ class DecisionCitation(_Table, table=True):
     evidence_kind: str
     evidence_ref: str | None = None
     chunk_id: int | None = Field(default=None, foreign_key="chunk.id", index=True)
+    quote: str | None = None
 
 
 class Attribution(_Table, table=True):

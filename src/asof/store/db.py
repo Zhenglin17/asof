@@ -4,11 +4,14 @@ import os
 import sqlite3
 from pathlib import Path
 
-from sqlalchemy import Engine, event
+from sqlalchemy import Connection, Engine, event, inspect
 from sqlalchemy.pool import ConnectionPoolEntry
 from sqlmodel import SQLModel, create_engine
 
-from asof.store import models  # noqa: F401  (registers every table on SQLModel.metadata)
+from asof.store import (
+    fts,
+    models,  # noqa: F401  (registers every table on SQLModel.metadata)
+)
 
 DEFAULT_DATA_DIR = Path("/data/asof")
 
@@ -35,6 +38,35 @@ def make_engine(path: Path) -> Engine:
     return engine
 
 
+def _upgrade_citation_table(conn: Connection) -> None:
+    # create_all never alters an existing table, and ALTER cannot add a CHECK constraint. A
+    # citation table built before `quote` existed is rebuilt from the model with its rows; a
+    # row the new constraints reject (a chunk citation without a quote) fails the upgrade.
+    sql = conn.exec_driver_sql(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'decision_citation'"
+    ).scalar_one()
+    if "ck_chunk_requires_quote" in sql:
+        return
+    old = [c["name"] for c in inspect(conn).get_columns("decision_citation")]
+    rows = [dict(r._mapping) for r in conn.exec_driver_sql("SELECT * FROM decision_citation")]
+    conn.exec_driver_sql("DROP TABLE decision_citation")
+    table = SQLModel.metadata.tables["decision_citation"]
+    table.create(conn)
+    if rows:
+        conn.execute(table.insert(), [{name: row[name] for name in old} for row in rows])
+
+
 def init_db(engine: Engine) -> None:
-    """Create all tables that do not exist yet. Safe to run repeatedly."""
+    """Create or upgrade the schema and the chunk index. Safe to run repeatedly."""
+    with engine.connect() as conn:
+        # Readers are not blocked by a long write (a docs sync) in WAL mode. Must run outside
+        # a transaction; an in-memory database answers "memory" and stays as it is.
+        conn.exec_driver_sql("PRAGMA journal_mode=WAL")
     SQLModel.metadata.create_all(engine)
+    with engine.begin() as conn:
+        # Python's sqlite3 opens a transaction only before INSERT/UPDATE/DELETE, so DROP and
+        # CREATE would each commit on their own and a failed upgrade would lose the old rows.
+        # An explicit BEGIN makes the rebuild all or nothing.
+        conn.exec_driver_sql("BEGIN")
+        _upgrade_citation_table(conn)
+        fts.create_chunk_index(conn)
