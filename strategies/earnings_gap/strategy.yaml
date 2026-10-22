@@ -1,0 +1,6 @@
+# Post-earnings gap, long only: buy the open after an up-gap on an earnings release, hold on a
+# trailing ATR zone stop, re-enter once if the pre-earnings close holds as support.
+name: earnings_gap
+cadence: daily
+universe: watchlist_with_documents
+direction: long

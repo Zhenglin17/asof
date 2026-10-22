@@ -19,6 +19,7 @@ Two more things happen on the way out, both decided by the user on 2026-10-08:
   ``traded`` is ``volume > 0`` and untraded bars are dropped unless asked for.
 """
 
+import functools
 import re
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
@@ -127,23 +128,32 @@ def bars_source_sql(
     does not hide a vendor row that is. At least one list must be non-empty. Used as a subquery
     by ``visible_bars`` and by the audit's raw view, so both see one bar per key.
     """
+    return _bars_source_sql(
+        _source(files) if files else None, _source(ext_files) if ext_files else None, as_of
+    )
+
+
+def _bars_source_sql(alpaca: str | None, ext: str | None, as_of: str | None) -> str:
+    """``bars_source_sql`` over two relations (Parquet readers or tables holding the same
+    columns plus ``year``), so a cache of the files runs the very same query."""
     columns = ", ".join(BAR_SCHEMA.names)
     knowable = f"available_at <= {as_of}" if as_of else None
-    alpaca = f"SELECT {columns}, CAST(year AS BIGINT) AS year, 'alpaca' AS source FROM "
-    ext = f"SELECT {columns}, CAST(year AS BIGINT) AS year, source FROM {_source(ext_files)}"
+    alpaca_select = f"SELECT {columns}, CAST(year AS BIGINT) AS year, 'alpaca' AS source FROM "
+    ext_select = f"SELECT {columns}, CAST(year AS BIGINT) AS year, source FROM {ext}"
     if knowable:
-        ext += f" WHERE {knowable}"
-    if not ext_files:
-        return alpaca + _source(files) + (f" WHERE {knowable}" if knowable else "")
-    if not files:
-        return ext
+        ext_select += f" WHERE {knowable}"
+    if ext is None:
+        assert alpaca is not None
+        return alpaca_select + alpaca + (f" WHERE {knowable}" if knowable else "")
+    if alpaca is None:
+        return ext_select
     not_overridden = (
-        f"NOT EXISTS (SELECT 1 FROM {_source(ext_files)} e WHERE "
+        f"NOT EXISTS (SELECT 1 FROM {ext} e WHERE "
         + (f"{knowable.replace('available_at', 'e.available_at')} AND " if knowable else "")
         + "e.symbol = a.symbol AND e.t = a.t)"
     )
     alpaca_where = f"{knowable.replace('available_at', 'a.available_at')} AND " if knowable else ""
-    return f"{alpaca}{_source(files)} a WHERE {alpaca_where}{not_overridden} UNION ALL {ext}"
+    return f"{alpaca_select}{alpaca} a WHERE {alpaca_where}{not_overridden} UNION ALL {ext_select}"
 
 
 def visible_bars(
@@ -183,32 +193,61 @@ def visible_bars(
     ext_files = _ext_files(root, timeframe)
     if not files and not ext_files:
         return (RESOLVED_BAR_SCHEMA if resolve else UNRESOLVED_BAR_SCHEMA).empty_table()
+    splits = visible_splits(con, root, as_of_utc, symbols) if master is not None else None
+    return select_bars(
+        con,
+        _source(files) if files else None,
+        _source(ext_files) if ext_files else None,
+        as_of_utc,
+        master=master,
+        splits=splits,
+        symbols=symbols,
+        start=start_utc,
+        end=end_utc,
+        include_untraded=include_untraded,
+    )
 
+
+def select_bars(
+    con: duckdb.DuckDBPyConnection,
+    alpaca: str | None,
+    ext: str | None,
+    as_of: datetime,
+    *,
+    master: pa.Table | None,
+    splits: pa.Table | None,
+    symbols: Sequence[str] | None,
+    start: datetime | None,
+    end: datetime | None,
+    include_untraded: bool,
+) -> pa.Table:
+    """The body of ``visible_bars`` over given bar relations, master and splits (all already
+    cut at ``as_of``), shared with the replay's cache so both answer identically."""
     clauses = ["available_at <= $as_of"]
-    params: dict[str, Any] = {"as_of": as_of_utc}
+    params: dict[str, Any] = {"as_of": as_of}
     if symbols is not None:
         clauses.append("symbol IN (SELECT UNNEST($symbols))")
         params["symbols"] = list(symbols)
-    if start_utc is not None:
+    if start is not None:
         clauses.append("t >= $start")
-        params["start"] = start_utc
-    if end_utc is not None:
+        params["start"] = start
+    if end is not None:
         clauses.append("t < $end")
-        params["end"] = end_utc
+        params["end"] = end
     if not include_untraded:
         clauses.append("volume > 0")
 
     con.execute("SET TimeZone = 'UTC'")
     columns = ", ".join(f"b.{name}" for name in (*BAR_SCHEMA.names, "source"))
     bars = (
-        f"(SELECT * FROM ({bars_source_sql(files, ext_files, '$as_of')}) "
+        f"(SELECT * FROM ({_bars_source_sql(alpaca, ext, '$as_of')}) "
         f"WHERE {' AND '.join(clauses)}) b"
     )
     if master is None:
         query = f"SELECT {columns}, b.volume > 0 AS traded FROM {bars} ORDER BY b.symbol, b.t"
         return con.execute(query, params).to_arrow_table().cast(UNRESOLVED_BAR_SCHEMA)
 
-    splits = visible_splits(con, root, as_of_utc, symbols)
+    assert splits is not None
     con.register(_MASTER_VIEW, master)
     con.register(_SPLITS_VIEW, splits.select(["symbol", "ex_date"]))
     try:
@@ -249,7 +288,30 @@ def visible_master(con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime) 
     if not path.exists():
         raise FileNotFoundError(f"{path}: no security master; run `asof market identity`")
     con.execute("SET TimeZone = 'UTC'")
-    on_disk = pq.read_table(path)
+    stat = path.stat()
+    return _visible_master_cached(str(path), stat.st_mtime_ns, stat.st_size, as_of_utc)
+
+
+@functools.lru_cache(maxsize=16)
+def _visible_master_cached(path: str, mtime_ns: int, size: int, as_of: datetime) -> pa.Table:
+    """One masking per (file version, as_of): a replay evening asks for the same master from
+    the scanner, every candidate's bars and the bar cache. The file's mtime and size are in the
+    key, so a rebuilt master is read again. Arrow tables are immutable, so sharing is safe."""
+    con = duckdb.connect()
+    try:
+        return master_as_of(con, pq.read_table(path), as_of, label=path)
+    finally:
+        con.close()
+
+
+def master_as_of(
+    con: duckdb.DuckDBPyConnection, on_disk: pa.Table, as_of: datetime, *, label: str
+) -> pa.Table:
+    """``visible_master`` over a master table already read from disk (the replay reads it
+    once). ``label`` names the source in error messages."""
+    as_of_utc = _aware_utc(as_of, "as_of")
+    path = label
+    con.execute("SET TimeZone = 'UTC'")
     missing = [name for name in MASTER_SCHEMA.names if name not in on_disk.schema.names]
     if missing:
         raise ValueError(
@@ -379,15 +441,24 @@ def visible_splits(
     path = _actions_file(root, "splits")
     if path is None:
         return SPLIT_SCHEMA.empty_table()
+    return splits_as_of(con, _source([path]), as_of_utc, symbols)
+
+
+def splits_as_of(
+    con: duckdb.DuckDBPyConnection,
+    relation: str,
+    as_of: datetime,
+    symbols: Sequence[str] | None = None,
+) -> pa.Table:
+    """``visible_splits`` over a given relation holding the split columns (a cached table)."""
     clauses = ["available_at <= $as_of"]
-    params: dict[str, Any] = {"as_of": as_of_utc}
+    params: dict[str, Any] = {"as_of": _aware_utc(as_of, "as_of")}
     if symbols is not None:
         clauses.append("symbol IN (SELECT UNNEST($symbols))")
         params["symbols"] = list(symbols)
     con.execute("SET TimeZone = 'UTC'")
     columns = ", ".join(SPLIT_SCHEMA.names)
     query = (
-        f"SELECT {columns} FROM {_source([path])} WHERE {' AND '.join(clauses)} "
-        "ORDER BY symbol, ex_date"
+        f"SELECT {columns} FROM {relation} WHERE {' AND '.join(clauses)} ORDER BY symbol, ex_date"
     )
     return con.execute(query, params).to_arrow_table()

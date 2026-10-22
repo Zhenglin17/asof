@@ -99,6 +99,7 @@ from asof.ingest.universe import (
 )
 from asof.ingest.watchlist import load_watchlist, resolve_watchlist
 from asof.ingest.yahoo import YahooClient, YahooError
+from asof.replay import build_report, close_of, run_replay
 from asof.store.audit import (
     CHECKS,
     load_exceptions,
@@ -119,6 +120,7 @@ from asof.store.universe import (
     month_starts,
     tier_union,
 )
+from asof.strategy import apply_overrides, load_strategy
 
 SEC_USER_AGENT_ENV = "ASOF_SEC_USER_AGENT"
 ALPACA_KEY_ENV = "ALPACA_API_KEY"
@@ -1472,3 +1474,104 @@ def evidence_validate(
         typer.echo(f"rejected: {len(result.failures)} of {len(draft.citations)} citations fail")
         raise typer.Exit(code=2)
     typer.echo(f"ok: {len(draft.citations)} citations hold")
+
+
+replay_app = typer.Typer(
+    help="Replay a strategy over history and report what it would have done.",
+    no_args_is_help=True,
+)
+app.add_typer(replay_app, name="replay")
+
+
+def _benchmark(root: Path, start: date, end: date, symbol: str = "SPY") -> tuple[str, float] | None:
+    """Price return of buying ``symbol`` at the first session's open and holding to the last
+    session's close (dividends not included)."""
+    con = duckdb.connect()
+    try:
+        bars = visible_bars(
+            con,
+            root,
+            "1Day",
+            close_of(end),
+            symbols=[symbol],
+            start=datetime.combine(start, datetime.min.time(), tzinfo=ET),
+            end=close_of(end),
+        ).to_pylist()
+    finally:
+        con.close()
+    if not bars:
+        return None
+    return f"{symbol} buy-and-hold (price only)", bars[-1]["close"] / bars[0]["open"] - 1
+
+
+@replay_app.command("run")
+def replay_run(
+    strategy: Annotated[
+        str, typer.Option("--strategy", help="Directory name under --strategies-dir.")
+    ],
+    start: Annotated[datetime, typer.Option("--start", formats=["%Y-%m-%d"])],
+    end: Annotated[datetime, typer.Option("--end", formats=["%Y-%m-%d"])],
+    overrides: Annotated[
+        list[str] | None,
+        typer.Option("--set", help="Override one setting, e.g. execute.stop.trail_atr=1.0."),
+    ] = None,
+    strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """Replay a strategy session by session. Every distinct --set combination is registered as
+    a strategy version, so it counts as one more attempt."""
+    first, last = start.date(), end.date()
+    if last < first:
+        _fail(f"--end {last} is before --start {first}")
+    path = strategies_dir / strategy
+    try:
+        apply_overrides(load_strategy(path), overrides or [])
+    except (FileNotFoundError, ValueError) as error:
+        _fail(f"Strategy {strategy!r}: {error}")
+    root = _market_root(data_dir)
+    engine = make_engine(db or default_db_path())
+    con = duckdb.connect()
+    try:
+        init_db(engine)
+        with Session(engine) as session:
+            try:
+                run_id = run_replay(session, con, root, path, first, last, overrides or [])
+            except (FileNotFoundError, ValueError) as error:
+                _fail(
+                    f"Replay failed, no run was written (the parameter set is registered): {error}"
+                )
+            report = build_report(session, run_id, benchmark=_benchmark(root, first, last))
+    finally:
+        con.close()
+        engine.dispose()
+    out = (data_dir or default_data_dir()) / "reports" / f"replay-{run_id}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report)
+    typer.echo(f"run {run_id}")
+    typer.echo(f"report {out}")
+
+
+@replay_app.command("report")
+def replay_report(
+    run: Annotated[int, typer.Option("--run", help="Run id printed by `asof replay run`.")],
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """Print the markdown report of a replay run."""
+    engine = make_engine(db or default_db_path())
+    try:
+        init_db(engine)
+        with Session(engine) as session:
+            try:
+                text = build_report(session, run)
+            except LookupError as error:
+                _fail(str(error))
+    finally:
+        engine.dispose()
+    typer.echo(text, nl=False)

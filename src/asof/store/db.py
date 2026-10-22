@@ -56,6 +56,12 @@ def _upgrade_citation_table(conn: Connection) -> None:
         conn.execute(table.insert(), [{name: row[name] for name in old} for row in rows])
 
 
+def _upgrade_trade_table(conn: Connection) -> None:
+    # A trade table from before `symbol` existed gains the nullable column; old rows keep NULL.
+    if "symbol" not in {c["name"] for c in inspect(conn).get_columns("trade")}:
+        conn.exec_driver_sql("ALTER TABLE trade ADD COLUMN symbol VARCHAR")
+
+
 def init_db(engine: Engine) -> None:
     """Create or upgrade the schema and the chunk index. Safe to run repeatedly."""
     with engine.connect() as conn:
@@ -69,4 +75,5 @@ def init_db(engine: Engine) -> None:
         # An explicit BEGIN makes the rebuild all or nothing.
         conn.exec_driver_sql("BEGIN")
         _upgrade_citation_table(conn)
+        _upgrade_trade_table(conn)
         fts.create_chunk_index(conn)

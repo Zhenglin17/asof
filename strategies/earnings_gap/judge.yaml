@@ -1,0 +1,2 @@
+# take_all: every candidate becomes a trade decision. The baseline an LLM judge must beat.
+kind: take_all

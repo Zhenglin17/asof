@@ -20,7 +20,15 @@ from sqlalchemy.orm import aliased
 from sqlmodel import Session, col, select
 
 from asof.store import fts
-from asof.store.models import Attribution, Chunk, Decision, Document, Event, StrategyVersion
+from asof.store.models import (
+    Attribution,
+    Chunk,
+    Decision,
+    Document,
+    Event,
+    StrategyVersion,
+    Trade,
+)
 
 
 def _require_aware(as_of: datetime) -> None:
@@ -48,9 +56,15 @@ def visible_documents(
     *,
     entity_id: int | None = None,
     doc_type: str | None = None,
+    since: datetime | None = None,
 ) -> list[Document]:
+    """Documents public at ``as_of``; ``since`` keeps only those that became public at or after
+    it (a lower bound, for readers that only want what is new)."""
     _require_aware(as_of)
     stmt = select(Document).where(_document_is_visible(as_of))
+    if since is not None:
+        _require_aware(since)
+        stmt = stmt.where(col(Document.available_at) >= since)
     if entity_id is not None:
         stmt = stmt.where(col(Document.entity_id) == entity_id)
     if doc_type is not None:
@@ -306,6 +320,18 @@ def visible_attributions(
     if strategy_id is not None:
         stmt = stmt.where(col(Attribution.strategy_id) == strategy_id)
     stmt = stmt.order_by(col(Attribution.outcome_available_at), col(Attribution.id))
+    return list(session.exec(stmt).all())
+
+
+def visible_trades(
+    session: Session, as_of: datetime, *, strategy_id: str | None = None
+) -> list[Trade]:
+    """Closed legs whose exit bar was final at as_of."""
+    _require_aware(as_of)
+    stmt = select(Trade).where(col(Trade.available_at) <= as_of)
+    if strategy_id is not None:
+        stmt = stmt.where(col(Trade.strategy_id) == strategy_id)
+    stmt = stmt.order_by(col(Trade.available_at), col(Trade.id))
     return list(session.exec(stmt).all())
 
 

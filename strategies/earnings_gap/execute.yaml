@@ -1,0 +1,35 @@
+# Leg 1 buys the next open; its key level is the gap-day low. Every stop is a zone around a key
+# level: close inside it is watched for observe_days, close below it exits at the next open, and
+# a hard stop hard_atr ATRs below the key exits at once. The key trails the highest close by
+# trail_atr ATRs and never falls.
+entry:
+  kind: next_open
+  key: gap_day_low
+stop:
+  kind: atr_zone_stop
+  zone_atr: 0.25
+  zone_cap_pct: 1.0
+  hard_atr: 1.0
+  observe_days: 3
+  trail_atr: 1.5
+# After leg 1 exits, a close back above the pre-earnings-close zone after touching it, within
+# window_sessions of the reaction day, buys once more. shared: both legs together risk one budget.
+reentry:
+  key: pre_earnings_close
+  window_sessions: 20
+  max_count: 1
+  risk_mode: shared
+exit:
+  max_sessions: 60
+sizing:
+  kind: risk_based
+  risk_pct: 0.5
+  max_position_pct: 10.0
+  max_gross_pct: 100.0
+fills:
+  slippage_bps: 5.0
+account:
+  initial_equity: 100000
+data:
+  max_missing_sessions: 5
+  max_jump_ratio: 1.8

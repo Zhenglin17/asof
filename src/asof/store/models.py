@@ -332,6 +332,46 @@ class Attribution(_Table, table=True):
     notes: str | None = None
 
 
+class Trade(_Table, table=True):
+    """One simulated leg of a trade decision, from entry fill to exit fill.
+
+    Written once the leg has closed. ``available_at`` is when the exit became knowable (the
+    20:00 New York close of the exit bar), so no earlier as_of can see the result.
+    """
+
+    __table_args__ = (
+        CheckConstraint("leg IN (1, 2)", name="ck_trade_leg"),
+        CheckConstraint("shares > 0", name="ck_trade_shares"),
+        _one_of("direction", Direction),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    decision_id: int = Field(foreign_key="decision.id", index=True)
+    run_id: int = Field(foreign_key="run.id", index=True)
+    strategy_id: str = Field(index=True)
+    # security_id is the master's id, which a master rebuild may renumber; symbol is the label
+    # the leg traded under, so a row stays readable whatever the ids become.
+    security_id: str = Field(index=True)
+    symbol: str | None = None
+    # 1 = the entry after the gap, 2 = the re-entry on the pre-earnings close.
+    leg: int
+    direction: str
+    entry_at: datetime = Field(sa_type=UTCDateTime)
+    entry_price: float
+    shares: int
+    # The leg's initial key level and hard stop, before any trailing.
+    key_level: float
+    hard_stop: float
+    risk_per_share: float  # entry_price - hard_stop: the R unit
+    exit_at: datetime = Field(sa_type=UTCDateTime)
+    exit_price: float
+    exit_reason: str
+    pnl: float
+    r_multiple: float
+    holding_sessions: int | None = None
+    available_at: datetime = Field(sa_type=UTCDateTime, index=True)
+
+
 class StrategyVersion(_Table, table=True):
     __table_args__ = (
         UniqueConstraint("strategy_id", "content_hash"),

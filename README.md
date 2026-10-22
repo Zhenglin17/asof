@@ -50,9 +50,15 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Evidence: full-text search over what was public at a given instant, ranked with
       statistics of that instant only; a citation validator that rejects a conclusion unless
       every claim quotes, word for word, a chunk of the right company that was public then
+- [x] Fast loop, first strategy: a daily scanner for post-earnings gaps, a take-all
+      baseline judge, a simulated executor with ATR zone stops, a trailing key and one
+      re-entry, a trade ledger and per-decision attribution; replayed session by session
+      over 2023-2026 with every read cut at that evening's 20:00 New York
+- [x] Strategy versions: every parameter set a replay runs under is registered once, so
+      the number of sets tried is on record for the significance gate
 - [ ] Historical backfill: minute bars, SEC EDGAR XBRL facts, FRED
-- [ ] Scanner, judge, executor, attribution
-- [ ] Strategy evolution: replay, permutation gate, approval
+- [ ] Judge that reads the filings (LLM) and cites them, compared with the take-all baseline
+- [ ] Strategy evolution: permutation gate, approval
 
 ## Development
 
@@ -374,6 +380,43 @@ around them ("fell 12%" for "grew 12%"), a bare table figure whose unit and curr
 in the table's header ("in millions"), or a figure moved to another row of a table inside the
 same quote, which the 500-character limit keeps small.
 
+### Replay
+
+```bash
+uv run asof replay run --strategy earnings_gap --start 2023-01-03 --end 2026-10-21
+uv run asof replay run --strategy earnings_gap --start 2025-01-02 --end 2025-12-31 \
+    --set execute.stop.trail_atr=1.0      # any setting can be overridden; each set is recorded
+uv run asof replay report --run 1
+```
+
+A strategy is a directory, `strategies/<name>/`, of six YAML files (`strategy`, `scan`,
+`rules`, `judge`, `execute`, `attribution`); an unknown key is an error. The replay steps
+through the sessions in the range. At 20:00 New York, when the day's bar is final, it first
+gives every open position that day's bar, then scans for new candidates and orders them for
+the next open. Each `--set` combination is registered as a strategy version; the first version
+of a strategy is approved, later ones are proposals.
+
+`earnings_gap` buys the open after an earnings release (8-K Item 2.02) if the first session
+that opened after it gapped up at least 4% on at least twice its 20-day volume. A filing
+accepted at 16:08 reacts the next day; one at 07:00 the same day. Stops are zones, not prices:
+around a key level (the gap-day low) by a quarter ATR, capped at 1% of the price. A close
+inside the zone is watched for three days, a close below it exits at the next open, and a
+hard stop one ATR below the key exits at once. The key trails the highest close by 1.5 ATR and
+never falls. After that exit, a pullback that touches the pre-earnings close and closes back
+above it within 20 sessions buys once more, sharing one risk budget (0.5% of equity) with
+the first leg. Size comes from that budget and the decision-day close, capped at 10% of
+equity per position and 100% overall. ATR and volume windows exclude the reaction day.
+
+Each closed leg is a row in the `trade` table, visible from the 20:00 close of its exit day.
+A decision's outcome becomes visible only after its re-entry window has closed. The report
+(`$ASOF_DATA_DIR/reports/replay-<id>.md`) gives win rate, mean R and P&L by leg, realized
+return next to SPY buy-and-hold, realized drawdown, profit concentration, exit reasons, the
+largest decisions with the filing behind each, and the number of parameter sets and replays
+run so far. The judge here takes every candidate. It is the baseline a reading judge has to
+beat, and its decisions carry no claims. Limits: the universe is today's watchlist (chosen
+with hindsight); bars are daily, so within a bar the worst order is assumed; drawdown counts
+closed trades only; no significance test yet.
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.
@@ -383,16 +426,17 @@ src/asof/
   ingest/     pull raw data from Alpaca, SEC EDGAR, FRED; watchlist, SEC ticker tables,
               corporate actions, security master and instrument classes
   store/      SQLite + SQLModel metadata and the as_of read path
-  features/   shared feature registry: technical, fundamental, macro, event   (planned)
-  scan/       pure-code daily scanner
+  features/   shared features computed from data visible at as_of (daily gap, RVOL, ATR)
+  scan/       pure-code daily scanner (earnings gaps)
   evidence/   as-of retrieval over filing chunks and the citation validator
-  judge/      cited conclusions with citation validation
-  execute/    pure-code paper-trading executor and ledger
-  attribute/  P&L attribution
-  evolve/     strategy proposals, replay, permutation gate, approval
+  judge/      decisions on candidates; a take-all baseline so far
+  execute/    pure-code simulated execution: zone stops, trailing key, re-entry, sizing
+  attribute/  per-decision outcome, hidden until it can no longer change
+  replay/     session-by-session replay, bar cache, report
+  evolve/     strategy proposals, permutation gate, approval
   api/        FastAPI surface
 strategies/<name>/   one strategy per directory (scan, rules, judge, execute,
-                     attribution configs), versioned as a whole            (planned)
+                     attribution configs), versioned as a whole
 tests/               mirrors src/asof
 configs/             watchlist.yaml (instruments that get filings and fundamentals),
                      security_overrides.yaml (human identity decisions),
