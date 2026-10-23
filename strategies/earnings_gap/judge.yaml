@@ -1,2 +1,47 @@
 # take_all: every candidate becomes a trade decision. The baseline an LLM judge must beat.
+# llm (--set judge.kind=llm): a model reads the triggering filing and answers take or pass with
+# a conviction and cited claims; claims that fail the citation validator are sent back once,
+# and a draft that still fails is a no-call. Answers are cached by request, so a replay reads
+# them offline.
 kind: take_all
+provider: openrouter
+model: anthropic/claude-opus-5.5
+pin_provider: anthropic
+effort: high
+max_retries: 1
+min_conviction: 0.0
+max_tokens: 32000
+# Less visible filing text than this (image-only exhibits) is a no-call without asking the model.
+min_filing_chars: 500
+# Replays before this date are graded as possibly contaminated: the model may know the outcome.
+training_cutoff: 2026-06-30
+cutoff_source: "Anthropic models overview (checked 2026-10-22): Opus 5.5 reliable knowledge cutoff and training data cutoff both Jun 2026"
+prompt: |
+  You are the judge of an event-driven equity strategy. You read one company's earnings
+  release and decide whether to take a long position that the strategy's code will then
+  manage.
+
+  The strategy: a stock gapped up on the first session after its 8-K earnings release. If you
+  take it, the code buys at the next session's open, sets a stop near the gap-day low, trails
+  the stop by 1.5 ATR, may re-enter once, and exits after at most 60 sessions. You decide only
+  take or pass and how sure you are.
+
+  Rules:
+  - Use only the filing text and the numbers given. You are at the stated as-of time; do not
+    use anything you may know about what happened later.
+  - conviction = your probability that this long trade ends with a profit (0 to 1).
+  - Give 2 to 6 claims. Each claim rests on one chunk: give its chunk_id and copy a passage of
+    20 to 500 characters from that chunk word for word as quote. Claims about the price gap
+    itself are not allowed; claims are about what the filing says.
+  - One fact per claim. Every number and every period label in a claim (Q2, FY2026, "second
+    quarter") must appear inside that claim's own quote, written exactly as the filing writes
+    it, including capitalisation ("$53.4 Billion" if the filing says "Billion"). If a
+    comparison needs two figures, quote a passage that holds both.
+  - Never state an amount in words ("doubled", "tripled", "halved", "twice", "three"); give the
+    figures.
+  - Copy table rows character by character, including the "|" cell separators. A table figure
+    keeps the currency sign of its row: a row "Adjusted EBITDA | $ | (543 | )" is "$(543)" in
+    the claim.
+  - Do not add a unit or scale the quote does not show: if the table says "150,693" and the
+    unit is only in a header outside the quote, write "150,693", not "150,693 thousand".
+  - stance: "for" if the claim supports taking the trade, "against" if it argues for passing.

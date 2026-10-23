@@ -10,7 +10,7 @@ silently replaced by a default would run a strategy nobody wrote down.
 import hashlib
 import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -56,8 +56,58 @@ class RulesConfig(_Section):
     direction: Literal["follow_gap"]
 
 
+_LLM_FIELDS = (
+    "provider",
+    "model",
+    "pin_provider",
+    "effort",
+    "max_retries",
+    "min_conviction",
+    "max_tokens",
+    "min_filing_chars",
+    "training_cutoff",
+    "cutoff_source",
+    "prompt",
+)
+
+
 class JudgeConfig(_Section):
-    kind: Literal["take_all"]
+    """``take_all`` reads nothing; ``llm`` asks a model through OpenRouter and needs every field
+    below. The model, its effort and the prompt are part of the parameter set, so changing any
+    of them is a new StrategyVersion. ``training_cutoff`` is the model's documented knowledge
+    cutoff: a replay before it is graded as possibly contaminated."""
+
+    kind: Literal["take_all", "llm"]
+    provider: Literal["openrouter"] | None = None
+    model: str | None = None
+    # The upstream provider OpenRouter must route to, with no fallback to another one.
+    pin_provider: str | None = None
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    # Calls after the first, each carrying the validator's failures back to the model.
+    max_retries: int | None = Field(default=None, ge=0)
+    # A take below this conviction is a pass.
+    min_conviction: float | None = Field(default=None, ge=0, le=1)
+    max_tokens: int | None = Field(default=None, gt=0)
+    # A filing with less visible text than this (an image-only exhibit) is a no_call without
+    # asking: the model would have nothing to read, yet could cite a file name.
+    min_filing_chars: int | None = Field(default=None, ge=0)
+    training_cutoff: date | None = None
+    cutoff_source: str | None = None
+    prompt: str | None = None
+
+    @model_validator(mode="after")
+    def _llm_fields(self) -> "JudgeConfig":
+        if self.kind != "llm":
+            return self
+        missing = [
+            name
+            for name in _LLM_FIELDS
+            if getattr(self, name) is None
+            or (isinstance(getattr(self, name), str) and not getattr(self, name).strip())
+        ]
+        if missing:
+            raise ValueError(f"judge kind llm needs {', '.join(missing)}")
+        return self
 
 
 class EntryConfig(_Section):

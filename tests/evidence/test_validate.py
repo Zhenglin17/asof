@@ -1187,3 +1187,107 @@ def test_ordinary_lowercase_word_is_not_a_currency_code(
     _, chunk = filed(session, source, apple, HALF)
     result = check(session, T0, apple, cite(chunk, HALF_QUOTE, "We try to grow in 2024."))
     assert result.ok, result.failures
+
+
+# --- footnote markers glued to a number or a scale word ---
+
+# Real text: Quanta Services (PWR) 8-K EX-99.1 0001193125-26-324855/d56853dex991.htm, chunk
+# 509620 in the store on 2026-10-22. "*" marks a record result ("* = Record quarterly or record
+# second quarter result"); it sits after the scale word ("Billion*") and after a bare amount
+# ("$2.96*").
+QUANTA = (
+    "Second Quarter GAAP Diluted EPS of $2.96* and Adjusted Diluted EPS of $4.24*\n\n"
+    "Net Income Attributable to Common Stock of $451.4 Million*\n\n"
+    "Remaining Performance Obligations (RPO) of $33.6 Billion* and Total Backlog of "
+    "$53.4 Billion*\n\n"
+    "Significantly Increasing 2026 Financial Expectations Across All Metrics\n\n"
+    "* = Record quarterly or record second quarter result"
+)
+QUANTA_RPO = (
+    "Remaining Performance Obligations (RPO) of $33.6 Billion* and Total Backlog of $53.4 Billion*"
+)
+QUANTA_EPS = "GAAP Diluted EPS of $2.96* and Adjusted Diluted EPS of $4.24*"
+
+
+def test_footnote_mark_after_a_scale_word_is_ignored(
+    session: Session, source: Source, apple: Entity
+) -> None:
+    # Failed with number_not_in_quote before: "Billion*" was not read as the scale "billion".
+    _, chunk = filed(session, source, apple, QUANTA)
+    claim = "Total backlog reached $53.4 Billion, alongside RPO of $33.6 Billion."
+    result = check(session, T0, apple, cite(chunk, QUANTA_RPO, claim))
+    assert result.ok, result.failures
+
+
+@pytest.mark.parametrize(
+    ("claim", "quote", "ok"),
+    [
+        ("GAAP diluted EPS was $2.96 and adjusted EPS $4.24.", QUANTA_EPS, True),
+        ("GAAP diluted EPS was $2.96* and adjusted EPS $4.24*.", QUANTA_EPS, True),
+        # The mark is dropped, the digits are still compared exactly.
+        ("GAAP diluted EPS was $2.97.", QUANTA_EPS, False),
+        ("GAAP diluted EPS was $29.6.", QUANTA_EPS, False),
+        ("GAAP diluted EPS was 2.96.", QUANTA_EPS, False),
+        # The same guards after a scale word.
+        ("Total backlog reached $53.5 Billion.", QUANTA_RPO, False),
+        ("Total backlog reached $53.4 Million.", QUANTA_RPO, False),
+        ("Total backlog reached 53.4 Billion.", QUANTA_RPO, False),
+        ("Total backlog reached $534 Billion.", QUANTA_RPO, False),
+    ],
+)
+def test_footnote_mark_does_not_loosen_the_number(
+    session: Session, source: Source, apple: Entity, claim: str, quote: str, ok: bool
+) -> None:
+    _, chunk = filed(session, source, apple, QUANTA)
+    result = check(session, T0, apple, cite(chunk, quote, claim))
+    if ok:
+        assert result.ok, result.failures
+    else:
+        assert reasons(result) == [(0, v.FailureReason.NUMBER_NOT_IN_QUOTE)]
+
+
+@pytest.mark.parametrize("mark", ["*", "†", "‡", "§"])
+def test_each_footnote_mark_is_ignored_at_the_end(
+    session: Session, source: Source, apple: Entity, mark: str
+) -> None:
+    # Made-up sentence in the real layout; only "*" is measured (Quanta above).
+    text = f"Total Backlog of $53.4 Billion{mark} and EPS of $2.96{mark} at quarter end."
+    _, chunk = filed(session, source, apple, text)
+    quote = f"Total Backlog of $53.4 Billion{mark} and EPS of $2.96{mark}"
+    result = check(session, T0, apple, cite(chunk, quote, "Backlog was $53.4 Billion; EPS $2.96."))
+    assert result.ok, result.failures
+
+
+def test_footnote_mark_before_punctuation_is_ignored(
+    session: Session, source: Source, apple: Entity
+) -> None:
+    text = "For the year, total backlog was $53.4 Billion*. Margins were stable."
+    _, chunk = filed(session, source, apple, text)
+    quote = "total backlog was $53.4 Billion*."
+    assert check(session, T0, apple, cite(chunk, quote, "Total backlog was $53.4 Billion.")).ok
+
+
+def test_footnote_mark_in_the_claim_only_is_ignored(
+    session: Session, source: Source, apple: Entity
+) -> None:
+    text = "Remaining performance obligations were $33.6 Billion at quarter end."
+    _, chunk = filed(session, source, apple, text)
+    quote = "Remaining performance obligations were $33.6 Billion"
+    result = check(session, T0, apple, cite(chunk, quote, "RPO was $33.6 Billion*."))
+    assert result.ok, result.failures
+
+
+@pytest.mark.parametrize(
+    ("text", "quote"),
+    [
+        # A mark inside the digits is not at the end: the piece keeps its shape "$5*3.4".
+        ("Total Backlog of $5*3.4 Billion at quarter end.", "Total Backlog of $5*3.4 Billion"),
+        ("Total Backlog of $53*.4 Billion at quarter end.", "Total Backlog of $53*.4 Billion"),
+    ],
+)
+def test_footnote_mark_inside_a_number_is_not_dropped(
+    session: Session, source: Source, apple: Entity, text: str, quote: str
+) -> None:
+    _, chunk = filed(session, source, apple, text)
+    result = check(session, T0, apple, cite(chunk, quote, "Total backlog was $53.4 Billion."))
+    assert reasons(result) == [(0, v.FailureReason.NUMBER_NOT_IN_QUOTE)]

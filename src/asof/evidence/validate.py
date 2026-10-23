@@ -106,6 +106,10 @@ _TABLE_JOINS = [
     (re.compile(r"\$[ \t]*\|[ \t]*(?=[\d(])"), "$"),
 ]
 _TRAILING = ".,;:!?"
+# Footnote marks glued to the end of a figure or its scale word ("$53.4 Billion*", "$2.96†") are
+# dropped like punctuation, but unlike punctuation they do not end a clause. A mark inside the
+# digits ("$5*3.4") is kept, so the figure keeps its shape and fails.
+_FOOTNOTE = "*†‡§"
 
 
 class FailureReason(StrEnum):
@@ -168,10 +172,11 @@ def normalise(s: str) -> str:
 
 
 def _bare(piece: str) -> str:
-    """A piece without sentence punctuation or an unmatched parenthesis around it."""
+    """A piece without sentence punctuation, footnote marks or an unmatched parenthesis around
+    it."""
     while True:
         before = piece
-        piece = piece.rstrip(_TRAILING)
+        piece = piece.rstrip(_TRAILING).rstrip(_FOOTNOTE)
         if piece.endswith(")") and "(" not in piece:
             piece = piece[:-1]
         if piece.startswith("(") and ")" not in piece:

@@ -99,7 +99,11 @@ from asof.ingest.universe import (
 )
 from asof.ingest.watchlist import load_watchlist, resolve_watchlist
 from asof.ingest.yahoo import YahooClient, YahooError
+from asof.judge.cache import CacheMiss
+from asof.judge.client import OpenRouterClient
+from asof.judge.window import judge_window
 from asof.replay import build_report, close_of, run_replay
+from asof.replay.compare import Comparison, Section, compare_runs
 from asof.store.audit import (
     CHECKS,
     load_exceptions,
@@ -1545,6 +1549,11 @@ def replay_run(
                 _fail(
                     f"Replay failed, no run was written (the parameter set is registered): {error}"
                 )
+            except CacheMiss as error:
+                _fail(
+                    "Replay failed, no run was written (the parameter set is registered): "
+                    f"{error}. Run `asof judge run` over the same window first."
+                )
             report = build_report(session, run_id, benchmark=_benchmark(root, first, last))
     finally:
         con.close()
@@ -1575,3 +1584,154 @@ def replay_report(
     finally:
         engine.dispose()
     typer.echo(text, nl=False)
+
+
+def _money(value: float | None) -> str:
+    return "-" if value is None else f"{value:,.2f}"
+
+
+def _r(value: float | None) -> str:
+    return "-" if value is None else f"{value:+.2f}R"
+
+
+def _section_lines(title: str, section: Section) -> list[str]:
+    lines = [f"## {title}"]
+    for name, s in (("take_all", section.base), ("llm", section.run)):
+        lines.append(
+            f"{name:9} decisions {s.decisions}  traded {s.traded}  "
+            f"pnl {_money(s.total_pnl)}  mean {_r(s.mean_r)}"
+        )
+    lines.append("verdict   count  take_all traded  take_all pnl  take_all mean")
+    for verdict, v in section.verdicts.items():
+        lines.append(
+            f"{verdict:9} {v.count:5}  {v.base_outcomes:15}  {_money(v.base_pnl):>12}  "
+            f"{_r(v.base_mean_r):>13}"
+        )
+    lines.append("conviction  count  take_all traded  take_all win rate")
+    for b in section.calibration:
+        rate = "-" if b.base_win_rate is None else f"{b.base_win_rate:.0%}"
+        bracket = "]" if b.high == 1.0 else ")"
+        lines.append(
+            f"[{b.low:.1f}, {b.high:.1f}{bracket}  {b.count:5}  {b.base_outcomes:15}  {rate:>17}"
+        )
+    return lines
+
+
+def _comparison_text(session: Session, c: Comparison) -> str:
+    # Stored as 00:00 UTC of the cutoff date: in New York that is still the evening before.
+    cutoff = c.cutoff.astimezone(UTC).date().isoformat()
+    lines = [
+        f"take_all run {c.base_run_id} vs llm run {c.run_id}; model training cutoff {cutoff}",
+        "",
+        *_section_lines("all decisions", c.all),
+        "",
+        *_section_lines(f"before the cutoff {cutoff} (possibly contaminated)", c.before_cutoff),
+        "",
+        *_section_lines(f"on or after the cutoff {cutoff}", c.after_cutoff),
+        "",
+        f"## unmatched decisions: {len(c.unmatched)}",
+    ]
+    for u in c.unmatched:
+        entity = session.get(Entity, u.entity_id) if u.entity_id is not None else None
+        ticker = entity.ticker if entity is not None else "?"
+        lines.append(f"run {u.run_id}  {ticker}  {u.as_of.astimezone(ET).date().isoformat()}")
+    return "\n".join(lines) + "\n"
+
+
+@replay_app.command("compare")
+def replay_compare(
+    base: Annotated[int, typer.Option("--base", help="Run id of the take_all replay.")],
+    run: Annotated[int, typer.Option("--run", help="Run id of the llm replay.")],
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """Compare an llm replay with the take_all replay of the same window: each verdict scored by
+    what take_all earned on the same candidates, split at the model's training cutoff."""
+    engine = make_engine(db or default_db_path())
+    try:
+        init_db(engine)
+        with Session(engine) as session:
+            try:
+                text = _comparison_text(session, compare_runs(session, base, run))
+            except (LookupError, ValueError) as error:
+                _fail(str(error))
+    finally:
+        engine.dispose()
+    typer.echo(text, nl=False)
+
+
+judge_app = typer.Typer(help="Ask the llm judge and cache its answers.", no_args_is_help=True)
+app.add_typer(judge_app, name="judge")
+
+
+@judge_app.command("run")
+def judge_run(
+    strategy: Annotated[
+        str, typer.Option("--strategy", help="Directory name under --strategies-dir.")
+    ],
+    start: Annotated[datetime, typer.Option("--start", formats=["%Y-%m-%d"])],
+    end: Annotated[datetime, typer.Option("--end", formats=["%Y-%m-%d"])],
+    max_cost: Annotated[
+        float, typer.Option("--max-cost", help="Stop before the next candidate past this, USD.")
+    ],
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="Judge at most this many candidates.")
+    ] = None,
+    overrides: Annotated[
+        list[str] | None,
+        typer.Option("--set", help="Override one setting, e.g. judge.effort=medium."),
+    ] = None,
+    strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """Judge every candidate of a window with the llm judge (judge.kind=llm is forced) and cache
+    the answers, so `asof replay run --set judge.kind=llm` over the window runs offline. Paid
+    calls stop once --max-cost is reached (exit 1); cached answers cost nothing."""
+    first, last = start.date(), end.date()
+    if last < first:
+        _fail(f"--end {last} is before --start {first}")
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not key.strip():
+        _fail("OPENROUTER_API_KEY is not set; nothing was sent.")
+    path = strategies_dir / strategy
+    try:
+        cfg = apply_overrides(load_strategy(path), [*(overrides or []), "judge.kind=llm"])
+    except (FileNotFoundError, ValueError) as error:
+        _fail(f"Strategy {strategy!r}: {error}")
+    model = OpenRouterClient(key)
+    root = _market_root(data_dir)
+    engine = make_engine(db or default_db_path())
+    con = duckdb.connect()
+    try:
+        init_db(engine)
+        with Session(engine) as session:
+            try:
+                result = judge_window(
+                    session, con, root, cfg, first, last, model.complete,
+                    max_cost=max_cost, limit=limit,
+                )  # fmt: skip
+            except ValueError as error:
+                _fail(f"Judging stopped: {error}. Answers paid for so far are cached.")
+    finally:
+        con.close()
+        engine.dispose()
+    for verdict in ("take", "pass", "no_call"):
+        typer.echo(f"{verdict} {sum(1 for o in result.outcomes if o.verdict == verdict)}")
+    typer.echo(f"fresh calls {result.fresh_calls}")
+    typer.echo(f"cached calls {result.cached_calls}")
+    typer.echo(f"spent ${result.spent:.4f}")
+    if result.error is not None:
+        typer.echo(f"error: {result.error}; answers paid for so far are cached, rerun to go on")
+        raise typer.Exit(1)
+    if result.stopped:
+        typer.echo(
+            f"stopped: --max-cost {max_cost} reached in this run (the cap is per run; cached "
+            "answers are free); rerun to continue from the cache"
+        )
+        raise typer.Exit(1)

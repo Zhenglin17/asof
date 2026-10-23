@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from sqlmodel import Session, col, select
 
-from asof.store.models import Attribution, Decision, Document, Entity, Run, Trade
+from asof.store.models import Attribution, Decision, Direction, Document, Entity, Run, Trade
 from asof.strategy import attempt_count, replay_count
 
 ET = ZoneInfo("America/New_York")
@@ -128,8 +128,13 @@ def replay_metrics(
         exit_reasons=dict(Counter(t.exit_reason for t in trades)),
         attempt_count=attempt_count(session, run.strategy_id or ""),
         holding_sessions=[t.holding_sessions for t in trades if t.holding_sessions is not None],
+        # A pass or no-call (direction flat) never opens a position.
         open_decisions=sum(
-            1 for d in decisions if d.id not in attributed and "cancelled" not in d.payload
+            1
+            for d in decisions
+            if d.direction == Direction.LONG.value
+            and d.id not in attributed
+            and "cancelled" not in d.payload
         ),
         cancelled=dict(cancelled),
         replay_count=replay_count(session, run.strategy_id or ""),

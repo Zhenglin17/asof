@@ -57,7 +57,11 @@ Any violation is look-ahead leakage and is treated as a bug.
 - [x] Strategy versions: every parameter set a replay runs under is registered once, so
       the number of sets tried is on record for the significance gate
 - [ ] Historical backfill: minute bars, SEC EDGAR XBRL facts, FRED
-- [ ] Judge that reads the filings (LLM) and cites them, compared with the take-all baseline
+- [x] Judge that reads the filings: an LLM answers take or pass with a conviction and
+      claims that each quote the filing; a claim the citation validator rejects is sent back
+      once, and an answer that still fails is a no-call. Answers are cached by request, so a
+      replay runs offline and gives the same decisions every time; compared candidate by
+      candidate with the take-all baseline, split at the model's training cutoff
 - [ ] Strategy evolution: permutation gate, approval
 
 ## Development
@@ -97,6 +101,10 @@ uv run asof evidence index           # full-text index over the chunks
 uv run asof evidence search "..." --as-of 2025-01-31 --ticker NVDA   # what was public then
 uv run asof replay run --strategy earnings_gap --start 2023-01-03 --end 2026-10-21
 uv run asof replay report --run 1    # markdown report of a replay
+uv run asof judge run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 --max-cost 12
+uv run asof replay run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 \
+    --set judge.kind=llm                # the LLM judge, read from the answer cache
+uv run asof replay compare --base 2 --run 3   # LLM replay against take-all, same window
 ```
 
 Create the metadata database:
@@ -441,6 +449,46 @@ beat, and its decisions carry no claims. Limits: the universe is today's watchli
 with hindsight); bars are daily, so within a bar the worst order is assumed; drawdown counts
 closed trades only; no significance test yet.
 
+#### LLM judge
+
+```bash
+export OPENROUTER_API_KEY=...            # only `asof judge run` needs it
+uv run asof judge run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 \
+    --max-cost 12 [--limit 2]           # fill the answer cache; exit 1 if the cap stopped it
+uv run asof replay run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 \
+    --set judge.kind=llm                 # offline: a missing answer is an error, never a call
+uv run asof replay compare --base <take-all run> --run <llm run>
+```
+
+`judge.yaml` holds both judges; `take_all` is the default and `--set judge.kind=llm` switches.
+The LLM judge sees the reaction-day numbers and every chunk of the triggering filing that was
+public at that evening's 20:00 New York close, and nothing else (the ticker, not today's
+company name). It answers in a fixed JSON schema: `take` or `pass`, a conviction (its
+probability that the long ends with a profit) and one to eight claims, each with a chunk id
+and a verbatim quote. Code decides what happens next: the claims go through the citation
+validator at the same instant; failures are sent back once; an answer that still fails, a
+refusal, or a filing with under 500 characters of readable text (an image-only exhibit) is a
+no-call. Same-day takes enter by conviction. Every decision keeps its citations, so each claim
+can be traced to the passage it rests on.
+
+The model, effort, prompt and limits are strategy settings, so changing any of them is a new
+strategy version. Requests go through OpenRouter pinned to one upstream provider with no
+fallback. Each request and its answer are stored under its SHA-256 (`<market root>/llm_cache`);
+the request holds the full filing text, so a revised filing is a new request. `judge run`
+judges every candidate of the window, also ones a replay will skip because the security is
+still held, adds up the cost the provider reports and stops before the next candidate once
+`--max-cost` is reached; a rerun pays only for what is missing. `replay compare` matches the
+two replays' decisions by company and evening and scores every LLM verdict by what take-all
+earned on the same candidate, with conviction bins, before and after the model's training
+cutoff (`judge.training_cutoff`; earlier decisions may be contaminated by what the model
+learned in training).
+
+First run (2026-07-01 to 2026-10-16, after the cutoff): 52 candidates, 89 calls, $8.84; 33
+take, 15 pass, 4 no-call. Mean R per traded decision was -0.07 for the LLM and -0.10 for
+take-all, a gap that comes from four trades take-all had no capital left for, not from
+judgement; the passes' advantage rests on one trade. 51 candidates in one market regime
+cannot tell whether the judge helps. Convictions clustered at 0.5 to 0.6.
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.
@@ -453,10 +501,10 @@ src/asof/
   features/   shared features computed from data visible at as_of (daily gap, RVOL, ATR)
   scan/       pure-code daily scanner (earnings gaps)
   evidence/   as-of retrieval over filing chunks and the citation validator
-  judge/      decisions on candidates; a take-all baseline so far
+  judge/      decisions on candidates: take-all baseline, LLM judge, answer cache
   execute/    pure-code simulated execution: zone stops, trailing key, re-entry, sizing
   attribute/  per-decision outcome, hidden until it can no longer change
-  replay/     session-by-session replay, bar cache, report
+  replay/     session-by-session replay, bar cache, report, comparison of two replays
   evolve/     strategy proposals, permutation gate, approval
   api/        FastAPI surface
 strategies/<name>/   one strategy per directory (scan, rules, judge, execute,

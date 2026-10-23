@@ -62,7 +62,12 @@ def strategy_dir(tmp_path: Path) -> Path:
 def test_load_reads_every_section(strategy_dir: Path) -> None:
     cfg = load_strategy(strategy_dir)
     for section in FILES:
-        assert dumped(getattr(cfg, section)) == DEFAULTS[section], section
+        value = dumped(getattr(cfg, section))
+        if section == "judge":
+            # take_all leaves the llm-only fields unset; they dump as None.
+            assert isinstance(value, dict)
+            value = {k: v for k, v in value.items() if v is not None}
+        assert value == DEFAULTS[section], section
     assert cfg.execute.stop.trail_atr == 1.5
 
 
@@ -86,7 +91,26 @@ def test_repository_earnings_gap_has_the_approved_defaults() -> None:
         "earnings_items": ["2.02"],
     }
     assert dumped(cfg.rules) == {"direction": "follow_gap"}
-    assert dumped(cfg.judge) == {"kind": "take_all"}
+    # 2026-10-22: the llm judge fields joined the approved set (3b); take_all stays the default.
+    judge = dumped(cfg.judge)
+    assert isinstance(judge, dict)
+    assert str(judge.pop("prompt")).strip()
+    assert judge == {
+        "kind": "take_all",
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-5.5",
+        "pin_provider": "anthropic",
+        "effort": "high",
+        "max_retries": 1,
+        "min_conviction": 0.0,
+        "max_tokens": 32000,
+        "min_filing_chars": 500,
+        "training_cutoff": "2026-06-30",
+        "cutoff_source": (
+            "Anthropic models overview (checked 2026-10-22): Opus "
+            "5.5 reliable knowledge cutoff and training data cutoff both Jun 2026"
+        ),
+    }
     assert dumped(cfg.execute) == {
         "entry": {"kind": "next_open", "key": "gap_day_low"},
         "stop": {

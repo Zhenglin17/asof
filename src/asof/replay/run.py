@@ -3,8 +3,10 @@
 1. every open decision gets d's bar of its security (or counts a missing one);
 2. closed legs become Trade rows, finished decisions whose re-entry window is over get their
    Attribution;
-3. the scanner looks for reaction-day candidates, the take-all judge turns each into a Decision,
-   and leg 1 is ordered for the next open.
+3. the scanner looks for reaction-day candidates, the judge turns each into a Decision, and leg
+   1 of each take is ordered for the next open. The take-all judge takes every candidate; the
+   llm judge reads its answers from the offline cache (``<root>/llm_cache``), never the network,
+   and its takes enter by conviction, highest first.
 
 Bars reach the simulator only through ``BarCache.bars_at(as_of)``; the scanner reads through
 ``visible_bars`` itself. A replay ending on day E writes exactly what was knowable at E 20:00:
@@ -31,11 +33,23 @@ from asof.execute import (
     position_shares,
     sell_price,
 )
+from asof.judge.cache import CacheMiss, LLMCache
+from asof.judge.llm import JudgeOutcome, judge_candidate, one_per_security, order_for_entry
 from asof.judge.take_all import judge
 from asof.replay.cache import BarCache
 from asof.scan.earnings_gap import Candidate, scan
 from asof.store.market import visible_master, visible_sessions, visible_splits
-from asof.store.models import Decision, DecisionKind, Direction, Entity, Run, RunMode, Trade
+from asof.store.models import (
+    Decision,
+    DecisionCitation,
+    DecisionKind,
+    Direction,
+    Entity,
+    EvidenceKind,
+    Run,
+    RunMode,
+    Trade,
+)
 from asof.store.queries import visible_documents
 from asof.strategy import StrategyConfig, apply_overrides, load_strategy, register_version
 
@@ -110,6 +124,7 @@ class _Replay:
         self.index = {d: i for i, d in enumerate(calendar)}
         self.realized = 0.0
         self.active: list[_Active] = []
+        self.cache = LLMCache(root / "llm_cache", offline=True)
 
     # ---- portfolio -------------------------------------------------------------------------
 
@@ -250,39 +265,92 @@ class _Replay:
             still.append(a)
         self.active = still
 
+    def _offline(self, body: dict[str, Any]) -> dict[str, Any]:
+        def never(_: dict[str, Any]) -> dict[str, Any]:
+            raise CacheMiss("an offline replay may not call the model")
+
+        return self.cache.call(body, never)
+
+    def _record(
+        self,
+        candidate: Candidate,
+        as_of: datetime,
+        direction: Direction,
+        conviction: float | None,
+        extra: dict[str, Any],
+    ) -> Decision:
+        payload = {**_payload(candidate, self.cfg, self.equity()), **extra}
+        decision = Decision(
+            run_id=self.run.id,  # pyright: ignore[reportArgumentType]
+            kind=DecisionKind.TRADE.value,
+            as_of=as_of,
+            strategy_id=self.cfg.strategy.name,
+            entity_id=candidate.entity_id,
+            direction=direction.value,
+            conviction=conviction,
+            payload=payload,
+        )
+        self.session.add(decision)
+        self.session.flush()
+        return decision
+
+    def _judged(self, outcome: JudgeOutcome, as_of: datetime) -> Decision:
+        """The decision for one llm outcome, with a citation row per validated claim."""
+        long = outcome.verdict == "take"
+        extra = {
+            "verdict": outcome.verdict,
+            "attempts": outcome.attempts,
+            "request_keys": outcome.request_keys,
+            "failures": outcome.failures,
+            "stances": [c.stance for c in outcome.claims],
+        }
+        direction = Direction.LONG if long else Direction.FLAT
+        decision = self._record(outcome.candidate, as_of, direction, outcome.conviction, extra)
+        for claim in outcome.claims:
+            self.session.add(
+                DecisionCitation(
+                    decision_id=decision.id,  # pyright: ignore[reportArgumentType]
+                    claim=claim.claim,
+                    evidence_kind=EvidenceKind.CHUNK.value,
+                    chunk_id=claim.chunk_id,
+                    quote=claim.quote,
+                )
+            )
+        return decision
+
+    def _enter(self, day: date, candidate: Candidate, decision: Decision) -> None:
+        plan = DecisionPlan(
+            reaction_session=candidate.reaction_session,
+            decision_close=candidate.gap_close,
+            gap_low=candidate.gap_low,
+            pre_earnings_close=candidate.pre_earnings_close,
+            atr=candidate.atr,
+            equity=self.equity(),
+        )
+        sim = DecisionSim(plan, self.cfg.execute, self._sizer)
+        window_index = self.index[day] + self.cfg.execute.reentry.window_sessions
+        window_end = self.calendar[window_index] if window_index < len(self.calendar) else None
+        self.active.append(_Active(decision, candidate, sim, window_end))
+
     def decide(self, day: date, as_of: datetime) -> None:
         sessions = self.calendar[: self.index[day] + 1]
         candidates = scan(self.session, self.con, self.root, as_of, self.cfg, sessions=sessions)
         held = {a.candidate.security_id for a in self.active}
+        if self.cfg.judge.kind == "llm":
+            fresh = one_per_security([c for c in candidates if c.security_id not in held])
+            outcomes = [
+                judge_candidate(self.session, c, as_of, self.cfg.judge, self._offline)
+                for c in fresh
+            ]
+            decisions = {id(o): self._judged(o, as_of) for o in outcomes}
+            for outcome in order_for_entry(outcomes):
+                self._enter(day, outcome.candidate, decisions[id(outcome)])
+            return
         for candidate in judge(candidates, self.cfg):
             if candidate.security_id in held:
                 continue  # one live decision per security
-            equity = self.equity()
-            plan = DecisionPlan(
-                reaction_session=candidate.reaction_session,
-                decision_close=candidate.gap_close,
-                gap_low=candidate.gap_low,
-                pre_earnings_close=candidate.pre_earnings_close,
-                atr=candidate.atr,
-                equity=equity,
-            )
-            payload = _payload(candidate, self.cfg, equity)
-            decision = Decision(
-                run_id=self.run.id,  # pyright: ignore[reportArgumentType]
-                kind=DecisionKind.TRADE.value,
-                as_of=as_of,
-                strategy_id=self.cfg.strategy.name,
-                entity_id=candidate.entity_id,
-                direction=Direction.LONG.value,
-                conviction=None,
-                payload=payload,
-            )
-            self.session.add(decision)
-            self.session.flush()
-            sim = DecisionSim(plan, self.cfg.execute, self._sizer)
-            window_index = self.index[day] + self.cfg.execute.reentry.window_sessions
-            window_end = self.calendar[window_index] if window_index < len(self.calendar) else None
-            self.active.append(_Active(decision, candidate, sim, window_end))
+            decision = self._record(candidate, as_of, Direction.LONG, None, {})
+            self._enter(day, candidate, decision)
             held.add(candidate.security_id)
 
 
@@ -338,6 +406,10 @@ def run_replay(
         started_at=datetime.now(UTC),
         git_sha=_git_sha(),
     )
+    if cfg.judge.kind == "llm":
+        assert cfg.judge.training_cutoff is not None
+        run.model_id = cfg.judge.model
+        run.model_training_cutoff = datetime.combine(cfg.judge.training_cutoff, time(0), tzinfo=UTC)
     session.add(run)
     session.flush()
 
