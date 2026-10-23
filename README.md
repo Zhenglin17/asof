@@ -64,6 +64,8 @@ Any violation is look-ahead leakage and is treated as a bug.
       once, and an answer that still fails is a no-call. Answers are cached by request, so a
       replay runs offline and gives the same decisions every time; compared candidate by
       candidate with the take-all baseline, split at the model's training cutoff
+- [x] Demo page: a static page over a grid of real replays, with every cited judgement, a
+      filing time machine and the leakage guards, published to GitHub Pages
 - [ ] Strategy evolution: permutation gate, approval
 
 ## Development
