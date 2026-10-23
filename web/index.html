@@ -1,0 +1,890 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asof · point-in-time market agent</title>
+<meta name="description" content="A market research agent that may only read what was public at each moment, and must quote the filing behind every judgement. Replays, cited decisions and the leakage guards, explorable.">
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f3f2ee;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11, 11, 11, 0.10);
+  --llm: #2a78d6;
+  --base: #eb6834;
+  --nocall: #1baf7a;
+  --spy: #898781;
+  --good: #006300;
+  --bad: #d03b3b;
+  --glow: rgba(42, 120, 214, 0.18);
+  --mark: rgba(237, 161, 0, 0.30);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255, 255, 255, 0.10);
+    --llm: #3987e5;
+    --base: #d95926;
+    --nocall: #199e70;
+    --spy: #898781;
+    --good: #0ca30c;
+    --bad: #e66767;
+    --glow: rgba(57, 135, 229, 0.22);
+    --mark: rgba(201, 133, 0, 0.38);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-2: #232321;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255, 255, 255, 0.10);
+  --llm: #3987e5;
+  --base: #d95926;
+  --nocall: #199e70;
+  --spy: #898781;
+  --good: #0ca30c;
+  --bad: #e66767;
+  --glow: rgba(57, 135, 229, 0.22);
+  --mark: rgba(201, 133, 0, 0.38);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; }
+.wrap { max-width: 1160px; margin: 0 auto; padding: 0 16px; }
+
+/* nav */
+nav {
+  position: sticky; top: 0; z-index: 20;
+  background: color-mix(in srgb, var(--page) 82%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--ring);
+}
+nav .wrap { display: flex; align-items: center; gap: 20px; height: 52px; }
+nav .brand { font-weight: 650; letter-spacing: -0.01em; text-decoration: none; }
+nav .brand span { color: var(--muted); font-weight: 400; }
+nav .links { display: flex; gap: 18px; margin-left: auto; font-size: 14px; }
+nav .links a { color: var(--ink-2); text-decoration: none; }
+nav .links a:hover { color: var(--ink); }
+button.ghost {
+  border: 1px solid var(--ring); background: transparent; color: var(--ink-2);
+  border-radius: 8px; padding: 5px 10px; font: inherit; font-size: 13px; cursor: pointer;
+}
+button.ghost:hover { color: var(--ink); background: var(--surface-2); }
+@media (max-width: 760px) { nav .links a.opt { display: none; } }
+
+/* hero */
+.hero { position: relative; padding: 72px 0 40px; overflow: hidden; }
+.hero::before {
+  content: ""; position: absolute; inset: -40% -10% auto; height: 520px;
+  background: radial-gradient(closest-side, var(--glow), transparent);
+  pointer-events: none;
+}
+.eyebrow { color: var(--muted); font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
+h1 {
+  font-size: clamp(30px, 5vw, 52px); line-height: 1.08; letter-spacing: -0.025em;
+  margin: 12px 0 16px; max-width: 900px; font-weight: 680;
+}
+.lede { color: var(--ink-2); max-width: 720px; font-size: 17px; margin: 0; }
+.counters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 36px 0 22px; }
+.counter { background: var(--surface); border: 1px solid var(--ring); border-radius: 14px; padding: 16px 18px; }
+.counter b { display: block; font-size: 30px; font-weight: 650; letter-spacing: -0.02em; }
+.counter span { color: var(--ink-2); font-size: 13px; }
+@media (max-width: 760px) { .counters { grid-template-columns: repeat(2, 1fr); } }
+.sweep { position: relative; height: 92px; border-radius: 14px; background: var(--surface); border: 1px solid var(--ring); overflow: hidden; }
+.sweep svg { display: block; width: 100%; height: 100%; }
+.sweep .caption { position: absolute; left: 14px; bottom: 8px; font-size: 12px; color: var(--muted); }
+.sweep .now { position: absolute; right: 14px; bottom: 8px; font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+/* sections */
+section.block { padding: 56px 0 8px; }
+h2 { font-size: 28px; letter-spacing: -0.02em; margin: 0 0 6px; font-weight: 650; }
+.sub { color: var(--ink-2); margin: 0 0 22px; max-width: 760px; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 16px; padding: 18px; }
+.note { color: var(--muted); font-size: 12.5px; margin: 10px 2px 0; }
+
+/* lab controls */
+.controls { display: flex; flex-wrap: wrap; gap: 14px 26px; align-items: flex-end; margin-bottom: 16px; }
+.control label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; letter-spacing: 0.02em; }
+.seg { display: inline-flex; background: var(--surface-2); border-radius: 10px; padding: 3px; border: 1px solid var(--ring); }
+.seg button {
+  border: 0; background: transparent; color: var(--ink-2); font: inherit; font-size: 13.5px;
+  padding: 6px 12px; border-radius: 8px; cursor: pointer; transition: background .2s, color .2s;
+}
+.seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--ring); }
+.seg button:disabled { opacity: .4; cursor: not-allowed; }
+.slider { width: 190px; }
+.slider input { width: 100%; accent-color: var(--llm); }
+.slider .ticks { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.slider .ticks span.on { color: var(--ink); font-weight: 600; }
+.slider.off { opacity: .4; }
+
+.stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 14px; }
+@media (max-width: 900px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+.stat { background: var(--surface); border: 1px solid var(--ring); border-radius: 14px; padding: 12px 14px; }
+.stat .label { font-size: 12.5px; color: var(--ink-2); }
+.stat .row { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; }
+.stat .row i { width: 12px; height: 2px; border-radius: 1px; display: inline-block; transform: translateY(-4px); }
+.stat .row b { font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+.stat .row small { color: var(--muted); font-size: 12px; }
+.warn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); margin-top: 6px; }
+.warn::before { content: "!"; display: inline-grid; place-items: center; width: 15px; height: 15px; border-radius: 50%; background: #fab219; color: #0b0b0b; font-weight: 700; font-size: 10px; }
+.charts { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.chart { width: 100%; max-width: 100%; height: 320px; overflow: hidden; }
+.chart.short { height: 190px; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--ink-2); margin: 0 4px 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.legend i.line { width: 16px; height: 2px; border-radius: 1px; }
+.legend i.dot { width: 10px; height: 10px; border-radius: 50%; }
+.legend i.diamond { width: 9px; height: 9px; transform: rotate(45deg); border: 2px solid var(--nocall); }
+.two { display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; margin-top: 12px; }
+@media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+.big { font-size: 40px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.1; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 14px; margin-top: 12px; }
+.kv dt { color: var(--ink-2); }
+.kv dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; }
+
+/* decisions */
+.dec-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.chart.scatter { height: 380px; }
+details.table { margin-top: 12px; }
+details.table summary { cursor: pointer; color: var(--ink-2); font-size: 13.5px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 500; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--surface-2); }
+.table-scroll { max-height: 360px; overflow: auto; }
+
+/* drawer */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.45); opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 30; }
+.scrim.open { opacity: 1; pointer-events: auto; }
+aside.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100%); z-index: 31;
+  background: var(--surface); border-left: 1px solid var(--ring);
+  transform: translateX(102%); transition: transform .32s cubic-bezier(.2,.8,.2,1);
+  overflow-y: auto; padding: 22px 22px 40px;
+}
+aside.drawer.open { transform: none; }
+.drawer h3 { margin: 4px 0 2px; font-size: 26px; letter-spacing: -0.02em; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 99px; background: var(--surface-2); color: var(--ink); border: 1px solid var(--ring); }
+.badge i { width: 8px; height: 8px; border-radius: 50%; }
+.claim { border: 1px solid var(--ring); border-radius: 12px; padding: 12px 14px; margin-top: 10px; background: var(--page); }
+.claim .head { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+.claim .text { margin: 6px 0 8px; font-weight: 550; }
+.claim .src { font-size: 12.5px; color: var(--ink-2); white-space: pre-wrap; line-height: 1.5; max-height: 190px; overflow: auto; border-left: 2px solid var(--axis); padding-left: 10px; }
+.claim mark { background: var(--mark); color: var(--ink); border-radius: 3px; padding: 0 2px; }
+.stance { font-weight: 600; color: var(--ink-2); }
+.stance.for::before { content: "▲ "; color: var(--good); }
+.stance.against::before { content: "▼ "; color: var(--bad); }
+.pos { color: var(--good); }
+.neg { color: var(--bad); }
+
+/* time machine */
+.tm-top { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin-bottom: 14px; }
+.tm-top input[type=range] { flex: 1; min-width: 220px; accent-color: var(--llm); }
+.tm-date { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; min-width: 230px; }
+.tm-date small { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+.tm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 8px; }
+.co {
+  border: 1px solid var(--ring); border-radius: 10px; padding: 8px 9px; background: var(--page);
+  opacity: .35; transition: opacity .35s, background .35s, box-shadow .35s, transform .35s;
+}
+.co b { display: block; font-size: 13px; letter-spacing: .01em; }
+.co span { display: block; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.co.lit { opacity: 1; background: var(--surface-2); }
+.co.fresh { box-shadow: 0 0 0 1px var(--llm), 0 0 18px var(--glow); transform: translateY(-2px); }
+.co.cand { box-shadow: 0 0 0 2px var(--base), 0 0 22px color-mix(in srgb, var(--base) 35%, transparent); }
+.tm-side { display: grid; grid-template-columns: 1fr 300px; gap: 12px; }
+@media (max-width: 900px) { .tm-side { grid-template-columns: 1fr; } }
+.feed { font-size: 13px; }
+.feed div { padding: 7px 0; border-bottom: 1px solid var(--grid); display: flex; gap: 8px; }
+.feed div b { min-width: 52px; }
+.feed div span { color: var(--ink-2); }
+.feed div time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tm-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-2); margin-top: 10px; }
+.tm-legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.tm-legend .l1::before { background: var(--page); border: 1px solid var(--ring); opacity: .5; }
+.tm-legend .l2::before { background: var(--surface-2); border: 1px solid var(--ring); }
+.tm-legend .l3::before { box-shadow: 0 0 0 1px var(--llm); }
+.tm-legend .l4::before { box-shadow: 0 0 0 2px var(--base); }
+
+/* leakage */
+.guards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+@media (max-width: 760px) { .guards { grid-template-columns: 1fr; } }
+.guard { background: var(--surface); border: 1px solid var(--ring); border-radius: 14px; padding: 14px 16px; }
+.guard .q { font-weight: 600; }
+.guard .a { color: var(--ink-2); font-size: 14px; margin-top: 4px; }
+.guard .t { font-size: 12px; color: var(--muted); margin-top: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+ul.limits { margin: 0; padding-left: 18px; color: var(--ink-2); }
+ul.limits li { margin: 6px 0; }
+ul.limits b { color: var(--ink); font-weight: 600; }
+footer { padding: 56px 0 60px; color: var(--muted); font-size: 13px; }
+footer a { color: var(--ink-2); }
+.loading { color: var(--muted); padding: 40px 0; }
+@media (prefers-reduced-motion: reduce) { *, *::before { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
+.charts > *, .two > *, .tm-side > *, .stats > *, .guards > *, .counters > * { min-width: 0; }
+.kv dd { overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  nav .brand span, .sweep .caption { display: none; }
+  .chart { height: 260px; }
+  .chart.scatter { height: 320px; }
+  .slider { width: 100%; }
+}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.6.0/echarts.min.js" integrity="sha512-XSmbX3mhrD2ix5fXPTRQb2FwK22sRMVQTpBP2ac8hX7Dh/605hA2QDegVWiAvZPiXIxOV0CbkmUjGionDpbCmw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+</head>
+<body>
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top">asof <span>· point-in-time market agent</span></a>
+    <div class="links">
+      <a href="#lab">Lab</a>
+      <a href="#decisions">Decisions</a>
+      <a class="opt" href="#time">Time machine</a>
+      <a class="opt" href="#leakage">Leakage</a>
+      <a href="https://github.com/Zhenglin17/asof">GitHub</a>
+    </div>
+    <button class="ghost" id="theme" type="button" aria-label="Toggle colour theme">Light</button>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <div class="eyebrow">Evidence-grounded · replayable · no look-ahead</div>
+    <h1>A market agent that may only read what was public at the time, and must quote it.</h1>
+    <p class="lede">Replayed evening by evening, it scans for post-earnings gaps, a language model reads the filing behind each one and answers take or pass, and code checks that every claim quotes, word for word, a passage that was public at that instant. Below: real replays, every cited judgement, and the guards against seeing the future.</p>
+    <div class="counters">
+      <div class="counter"><b data-count="judgements">–</b><span id="judged-label">candidates judged in the demo window</span></div>
+      <div class="counter"><b data-count="quotes">–</b><span>quotes checked verbatim against the filing</span></div>
+      <div class="counter"><b data-count="documents">–</b><span>SEC filings in the store, each stamped with when EDGAR disseminated it</span></div>
+      <div class="counter"><b data-count="chunks">–</b><span>citable passages in the store</span></div>
+    </div>
+    <div class="sweep" aria-hidden="true">
+      <svg id="sweep" preserveAspectRatio="none"></svg>
+      <div class="caption">each dot is a filing, placed when it became public · the cursor is <i>as_of</i>: the agent sees only what is left of it</div>
+      <div class="now" id="sweep-now"></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="block" id="lab">
+    <h2>Strategy lab</h2>
+    <p class="sub">Change how positions are managed and how sure the model must be. Every combination below was replayed beforehand, evening by evening, by the real pipeline; nothing on this page is simulated in the browser.</p>
+    <div class="controls">
+      <div class="control">
+        <label>Show</label>
+        <div class="seg" id="show">
+          <button type="button" data-v="both" aria-pressed="true">Both</button>
+          <button type="button" data-v="llm" aria-pressed="false">LLM judge</button>
+          <button type="button" data-v="take_all" aria-pressed="false">Take-all</button>
+        </div>
+      </div>
+      <div class="control slider" id="c-trail"><label>Trailing stop (ATR)</label><input type="range" min="0" max="2" step="1" value="1" aria-label="Trailing stop in ATR"><div class="ticks"></div></div>
+      <div class="control slider" id="c-risk"><label>Risk per decision (% equity)</label><input type="range" min="0" max="2" step="1" value="1" aria-label="Risk per decision"><div class="ticks"></div></div>
+      <div class="control slider" id="c-conv"><label>Min conviction (LLM)</label><input type="range" min="0" max="2" step="1" value="0" aria-label="Minimum conviction"><div class="ticks"></div></div>
+    </div>
+    <div class="stats" id="stats"></div>
+    <div class="charts">
+      <div class="card">
+        <div class="legend" id="eq-legend"></div>
+        <div class="chart" id="equity"></div>
+        <div class="chart short" id="drawdown"></div>
+        <p class="note" id="lab-note"></p>
+      </div>
+    </div>
+    <div class="two">
+      <div class="card">
+        <div class="legend"><span><i class="line" style="background:var(--base)"></i>Take-all, defaults</span><span><i class="line" style="background:var(--spy)"></i>SPY, price only</span></div>
+        <div class="chart" id="long"></div>
+      </div>
+      <div class="card">
+        <div class="eyebrow">The baseline over the long run, closed trades</div>
+        <div class="big" id="long-ret">–</div>
+        <dl class="kv" id="long-kv"></dl>
+        <p class="note" id="long-note"></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="decisions">
+    <h2>Every judgement, with its sources</h2>
+    <p class="sub">One dot per candidate judged (a candidate on a stock already held is skipped). Height is how the trade ended in R (multiples of the risk taken). A pass, whether the model declined or its conviction fell below the floor, is placed where take-all ended on the same candidate: what was left out. Click a dot to read the model's claims and the passages they quote.</p>
+    <div class="card">
+      <div class="legend">
+        <span><i class="dot" style="background:var(--llm)"></i>Take</span>
+        <span><i class="dot" style="background:var(--base)"></i>Pass (take-all's result)</span>
+        <span><i class="diamond"></i>No-call (nothing citable)</span>
+        <span style="color:var(--muted)">size = conviction</span>
+      </div>
+      <div class="chart scatter" id="scatter"></div>
+      <p class="note" id="dec-note"></p>
+      <details class="table">
+        <summary>Table view</summary>
+        <div class="table-scroll"><table id="dec-table"><thead><tr><th>Evening</th><th>Symbol</th><th>Verdict</th><th class="num">Conviction</th><th class="num">Gap</th><th class="num">R</th><th class="num">Take-all R</th></tr></thead><tbody></tbody></table></div>
+      </details>
+    </div>
+  </section>
+
+  <section class="block" id="time">
+    <h2>Time machine</h2>
+    <p class="sub">Drag through the window. A company lights up once one of its filings is public by 20:00 New York that evening, the instant the replay decides at. Candidates glow on the evening they are judged. Nothing to the right of the slider exists yet for the agent. Tickers are today's.</p>
+    <div class="card">
+      <div class="tm-top">
+        <button class="ghost" id="play" type="button">Play</button>
+        <input type="range" id="tm" min="0" max="1" value="0" aria-label="Evening">
+        <div class="tm-date" id="tm-date">–<small></small></div>
+      </div>
+      <div class="tm-side">
+        <div>
+          <div class="tm-grid" id="tm-grid"></div>
+          <div class="tm-legend"><span class="l1">nothing public yet in the window</span><span class="l2">has a public filing</span><span class="l3">made public since the previous evening</span><span class="l4">judged this evening</span></div>
+        </div>
+        <div class="feed" id="feed"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="leakage">
+    <h2>How it avoids seeing the future</h2>
+    <p class="sub">A backtest that peeks is worse than none. Each way of peeking below has a mechanism in the code and a test that fails if it comes back.</p>
+    <div class="guards" id="guards"></div>
+  </section>
+
+  <section class="block" id="limits">
+    <h2>What this does not show</h2>
+    <p class="sub">Read the numbers above with these in mind.</p>
+    <div class="card"><ul class="limits" id="limits-list"></ul></div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap" id="foot">Code, tests and the full command manual: <a href="https://github.com/Zhenglin17/asof">github.com/Zhenglin17/asof</a>.</div>
+</footer>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true" aria-label="Decision detail"></aside>
+
+<script>
+"use strict";
+const TRAILS = [1.0, 1.5, 2.0], RISKS = [0.25, 0.5, 1.0], CONVS = [0.0, 0.5, 0.6];
+const state = { show: "both", trail: 1, risk: 1, conv: 0 };
+let D = null;          // loaded data
+const charts = {};
+
+const NY = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
+function nyParts(iso) {
+  const p = Object.fromEntries(NY.formatToParts(new Date(iso)).map(x => [x.type, x.value]));
+  return { date: `${p.year}-${p.month}-${p.day}`, stamp: `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}` };
+}
+// A decision's as_of is 20:00 New York of its evening.
+const evening = iso => nyParts(iso).date;
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const fmtPct = (v, d = 1) => { const t = Math.abs(v * 100).toFixed(d); return (+t === 0 ? "" : v > 0 ? "+" : "−") + t + "%"; };
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmtR = v => v == null ? "–" : (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(2) + "R";
+const fmtInt = n => n.toLocaleString("en-US");
+// Grid keys are written by Python, so 1.0 stays "1.0" (JavaScript would print "1").
+const num = v => Number.isInteger(v) ? v.toFixed(1) : String(v);
+const key = (judge, t, r, c) => judge === "llm"
+  ? `llm|${num(TRAILS[t])}|${num(RISKS[r])}|${num(CONVS[c])}` : `take_all|${num(TRAILS[t])}|${num(RISKS[r])}`;
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v; else if (k === "style") n.style.cssText = v; else n.setAttribute(k, v);
+  }
+  for (const k of kids) n.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return n;
+}
+
+async function load() {
+  const names = ["meta", "runs", "decisions", "chunks", "timeline", "entities"];
+  const got = await Promise.all(names.map(n => fetch(`data/${n}.json`).then(r => {
+    if (!r.ok) throw new Error(`data/${n}.json: ${r.status}`);
+    return r.json();
+  })));
+  D = Object.fromEntries(names.map((n, i) => [n, got[i]]));
+  D.sessions = D.runs.benchmark.map(p => p.date);
+}
+
+/* ---------- theme ---------- */
+function applyThemeLabel() {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  document.getElementById("theme").textContent = dark ? "Light" : "Dark";
+}
+document.getElementById("theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  root.setAttribute("data-theme", root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+  try { localStorage.setItem("asof-theme", root.getAttribute("data-theme")); } catch (e) { /* storage blocked */ }
+  applyThemeLabel();
+  if (D) { renderLab(true); renderLong(); renderScatter(); drawSweep(); }
+});
+try { const t = localStorage.getItem("asof-theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) { /* storage blocked */ }
+applyThemeLabel();
+
+/* ---------- hero ---------- */
+function countUp(node, target) {
+  const t0 = performance.now(), dur = 1400;
+  const step = now => {
+    const k = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - k, 3);
+    node.textContent = fmtInt(Math.round(target * e));
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+function heroCounts() {
+  const base = D.decisions[key("llm", 1, 1, 0)];
+  const quotes = new Set();
+  for (const rows of Object.values(D.decisions)) for (const r of rows) for (const c of r.claims) quotes.add(c.chunk_id + "|" + c.quote);
+  const values = { documents: D.meta.store.documents, chunks: D.meta.store.chunks, judgements: base.length, quotes: quotes.size };
+  const nocall = base.filter(r => r.verdict === "no_call").length;
+  document.getElementById("judged-label").textContent = `candidates judged in the demo window, ${nocall} of them no-calls`;
+  document.querySelectorAll("[data-count]").forEach(n => countUp(n, values[n.dataset.count]));
+}
+let sweepT0 = performance.now();
+function drawSweep() {
+  const svg = document.getElementById("sweep");
+  const w = svg.clientWidth || 1000, h = svg.clientHeight || 92;
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.replaceChildren();
+  const t0 = Date.parse(D.sessions[0]), t1 = Date.parse(D.sessions.at(-1)) + 86400000;
+  const x = t => 14 + (w - 28) * (t - t0) / (t1 - t0);
+  const ns = "http://www.w3.org/2000/svg";
+  const dots = D.timeline.map((d, i) => {
+    const c = document.createElementNS(ns, "circle");
+    c.setAttribute("cx", x(Date.parse(d.available_at)));
+    c.setAttribute("cy", 18 + ((i * 37) % 44));
+    c.setAttribute("r", d.doc_type === "8-K" ? 4 : 3);
+    c.setAttribute("fill", d.doc_type === "8-K" ? css("--llm") : css("--ink-2"));
+    svg.append(c);
+    return [Date.parse(d.available_at), c];
+  });
+  const line = document.createElementNS(ns, "line");
+  line.setAttribute("y1", 6); line.setAttribute("y2", h - 22);
+  line.setAttribute("stroke", css("--base")); line.setAttribute("stroke-width", 2);
+  svg.append(line);
+  const now = document.getElementById("sweep-now");
+  const tick = ts => {
+    const k = ((ts - sweepT0) % 12000) / 12000, t = t0 + (t1 - t0) * k;
+    line.setAttribute("x1", x(t)); line.setAttribute("x2", x(t));
+    for (const [at, c] of dots) c.setAttribute("opacity", at <= t ? 1 : 0.12);
+    now.textContent = "as_of " + nyParts(new Date(t).toISOString()).date;
+    sweepRaf = requestAnimationFrame(tick);
+  };
+  cancelAnimationFrame(sweepRaf);
+  sweepRaf = requestAnimationFrame(tick);
+}
+let sweepRaf = 0;
+
+/* ---------- lab ---------- */
+function setupSliders() {
+  const defs = [["c-trail", TRAILS, "trail", v => v.toFixed(1)], ["c-risk", RISKS, "risk", v => v + "%"], ["c-conv", CONVS, "conv", v => v.toFixed(1)]];
+  for (const [id, values, field, label] of defs) {
+    const box = document.getElementById(id), input = box.querySelector("input"), ticks = box.querySelector(".ticks");
+    values.forEach(v => ticks.append(el("span", {}, label(v))));
+    const sync = () => [...ticks.children].forEach((s, i) => s.classList.toggle("on", i === state[field]));
+    input.value = state[field]; sync();
+    input.addEventListener("input", () => { state[field] = +input.value; sync(); renderLab(); renderScatter(); renderTime(); });
+  }
+  document.querySelectorAll("#show button").forEach(b => b.addEventListener("click", () => {
+    state.show = b.dataset.v;
+    document.querySelectorAll("#show button").forEach(x => x.setAttribute("aria-pressed", x === b));
+    renderLab();
+  }));
+}
+function stepped(curve, endDate) {
+  const pts = curve.map(p => [p.date, p.equity]);
+  if (pts.length && pts.at(-1)[0] < endDate) pts.push([endDate, pts.at(-1)[1]]);
+  return pts;
+}
+function meanR(rows) {
+  const rs = rows.filter(r => r.r != null).map(r => r.r);
+  return rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
+}
+function statCard(label, items, warn) {
+  const card = el("div", { class: "stat" }, el("div", { class: "label" }, label));
+  for (const [color, value, small] of items) {
+    card.append(el("div", { class: "row" }, el("i", { style: `background:${color}` }), el("b", {}, value), el("small", {}, small || "")));
+  }
+  if (warn) card.append(el("div", { class: "warn" }, warn));
+  return card;
+}
+function renderLab(rebuild = false) {
+  const end = D.sessions.at(-1);
+  const kL = key("llm", state.trail, state.risk, state.conv), kB = key("take_all", state.trail, state.risk);
+  const L = D.runs.runs[kL], B = D.runs.runs[kB];
+  const show = { llm: state.show !== "take_all", base: state.show !== "llm" };
+  document.getElementById("c-conv").classList.toggle("off", !show.llm);
+  document.querySelector("#c-conv input").disabled = !show.llm;
+
+  const spyRet = D.runs.benchmark.at(-1).equity / D.meta.initial_equity - 1;
+  const items = [], llmC = css("--llm"), baseC = css("--base");
+  const pick = (fn) => [show.llm && [llmC, ...fn(L, D.decisions[kL], "LLM")], show.base && [baseC, ...fn(B, D.decisions[kB], "take-all")]].filter(Boolean);
+  const stats = document.getElementById("stats");
+  stats.replaceChildren(
+    statCard("Return, closed trades", pick(r => [fmtPct(r.metrics.total_return, 2), ""]).concat([[css("--spy"), fmtPct(spyRet, 2), "SPY"]])),
+    statCard("Max drawdown, closed trades", pick(r => [fmtPct(-r.metrics.max_drawdown, 2), ""])),
+    statCard("Win rate", pick(r => [Math.round(r.metrics.win_rate * 100) + "%", ""])),
+    statCard("Mean R per traded decision", pick((r, rows) => [fmtR(meanR(rows)), ""])),
+    statCard("Traded decisions", pick(r => [String(r.metrics.traded_decisions), `of ${r.metrics.decisions}` + (r.metrics.cancelled.no_size ? ` · ${r.metrics.cancelled.no_size} no cash` : "")]),
+      (show.llm && L.metrics.traded_decisions < 10) || (show.base && B.metrics.traded_decisions < 10) ? "fewer than 10 trades: noise, not evidence" : ""),
+  );
+
+  const legend = document.getElementById("eq-legend");
+  legend.replaceChildren(
+    ...(show.llm ? [el("span", {}, el("i", { class: "line", style: `background:${llmC}` }), "LLM judge")] : []),
+    ...(show.base ? [el("span", {}, el("i", { class: "line", style: `background:${baseC}` }), "Take-all")] : []),
+    el("span", {}, el("i", { class: "line", style: `background:${css("--spy")}` }), "SPY, price only"),
+  );
+
+  const axis = axisStyle();
+  const series = [
+    { id: "llm", name: "LLM judge", type: "line", step: "end", showSymbol: false, lineStyle: { width: 2, color: llmC }, itemStyle: { color: llmC }, data: show.llm ? stepped(L.curve, end) : [] },
+    { id: "base", name: "Take-all", type: "line", step: "end", showSymbol: false, lineStyle: { width: 2, color: baseC }, itemStyle: { color: baseC }, data: show.base ? stepped(B.curve, end) : [] },
+    { id: "spy", name: "SPY", type: "line", showSymbol: false, lineStyle: { width: 1.5, color: css("--spy") }, itemStyle: { color: css("--spy") }, data: D.runs.benchmark.map(p => [p.date, p.equity]) },
+  ];
+  charts.equity.setOption({
+    animationDurationUpdate: 650, animationEasingUpdate: "cubicInOut",
+    grid: { left: 64, right: 18, top: 10, bottom: 26 },
+    tooltip: tooltip(v => "$" + fmtInt(Math.round(v))),
+    xAxis: { type: "time", ...axis, splitLine: { show: false } },
+    yAxis: { type: "value", scale: true, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => "$" + (v / 1000).toFixed(0) + "K" } },
+    series,
+  }, rebuild);
+  const dd = (run) => stepped(run.curve.map(p => ({ date: p.date, equity: -p.drawdown * 100 })), end);
+  charts.drawdown.setOption({
+    animationDurationUpdate: 650,
+    grid: { left: 64, right: 18, top: 8, bottom: 26 },
+    tooltip: tooltip(v => v.toFixed(2) + "%"),
+    xAxis: { type: "time", ...axis, splitLine: { show: false } },
+    yAxis: { type: "value", max: 0, ...axis, name: "drawdown", nameTextStyle: { color: css("--muted"), fontSize: 11 }, axisLabel: { ...axis.axisLabel, formatter: v => v + "%" } },
+    series: [
+      { id: "llm", name: "LLM judge", type: "line", step: "end", showSymbol: false, lineStyle: { width: 2, color: llmC }, areaStyle: { color: llmC, opacity: 0.10 }, data: show.llm ? dd(L) : [] },
+      { id: "base", name: "Take-all", type: "line", step: "end", showSymbol: false, lineStyle: { width: 2, color: baseC }, areaStyle: { color: baseC, opacity: 0.10 }, data: show.base ? dd(B) : [] },
+    ],
+  }, rebuild);
+  const tried = D.meta.research_attempts;
+  document.getElementById("lab-note").textContent =
+    `${D.meta.window.start} to ${D.meta.window.end}, all after the model's training cutoff (${D.meta.training_cutoff}). ` +
+    `Equity counts closed trades only: it moves when a trade closes, and positions still open at the end are left out. ` +
+    `"No cash" counts candidates skipped because the account could not size them: at high risk take-all stops being "all". ` +
+    `These ${D.meta.grid_points} settings are themselves a search; picking the best-looking one overstates it. ` +
+    `Parameter sets tried in research so far: ${tried.attempt_count} (this grid ran on a copy and is not counted).`;
+}
+function axisStyle() {
+  return {
+    axisLine: { lineStyle: { color: css("--axis") } },
+    axisTick: { show: false },
+    axisLabel: { color: css("--muted"), fontSize: 11 },
+    splitLine: { lineStyle: { color: css("--grid"), width: 1 } },
+  };
+}
+function tooltip(fmt) {
+  return {
+    trigger: "axis", backgroundColor: css("--surface"), borderColor: css("--ring"),
+    textStyle: { color: css("--ink"), fontSize: 12 },
+    axisPointer: { type: "line", lineStyle: { color: css("--axis") } },
+    formatter: params => {
+      const date = params[0] ? new Date(params[0].value[0]).toISOString().slice(0, 10) : "";
+      return `<div style="color:${css("--muted")}">${date}</div>` + params.map(p =>
+        `<div><span style="display:inline-block;width:12px;height:2px;background:${p.color};vertical-align:middle;margin-right:6px"></span><b>${fmt(p.value[1])}</b> <span style="color:${css("--ink-2")}">${p.seriesName}</span></div>`).join("");
+    },
+  };
+}
+function renderLong() {
+  const L = D.runs.runs.long, B = D.runs.long_benchmark, end = B.at(-1).date;
+  const axis = axisStyle();
+  charts.long.setOption({
+    grid: { left: 64, right: 18, top: 10, bottom: 26 },
+    tooltip: tooltip(v => "$" + fmtInt(Math.round(v))),
+    xAxis: { type: "time", ...axis, splitLine: { show: false } },
+    yAxis: { type: "value", scale: true, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => "$" + (v / 1000).toFixed(0) + "K" } },
+    series: [
+      { name: "Take-all", type: "line", step: "end", showSymbol: false, lineStyle: { width: 2, color: css("--base") }, itemStyle: { color: css("--base") }, data: stepped(L.curve, end) },
+      { name: "SPY", type: "line", showSymbol: false, lineStyle: { width: 1.5, color: css("--spy") }, itemStyle: { color: css("--spy") }, data: B.map(p => [p.date, p.equity]) },
+    ],
+  }, true);
+  const m = L.metrics, spy = B.at(-1).equity / D.meta.initial_equity - 1;
+  document.getElementById("long-ret").textContent = `${fmtPct(m.total_return)} vs SPY ${fmtPct(spy)}`;
+  const skipped = Object.values(m.cancelled).reduce((a, b) => a + b, 0);
+  document.getElementById("long-note").textContent =
+    `Take-all takes every candidate the scanner finds; ${fmtInt(skipped)} of ${fmtInt(m.decisions)} were never filled ` +
+    `(${m.cancelled.no_size || 0} for lack of cash, ${m.cancelled.entry_below_zone || 0} because the open was already below the stop). ` +
+    `It ${m.total_return < spy ? "trailed" : "beat"} buying and holding SPY over this stretch. Its drawdown counts closed trades only, so it understates ` +
+    `the risk next to SPY's, which is marked every day. The universe is a list picked today, which flatters any long-only result. ` +
+    `The LLM judge only has answers after its training cutoff, so the long run is take-all only.`;
+  const kv = document.getElementById("long-kv");
+  kv.replaceChildren();
+  for (const [k, v] of [["Window", `${D.meta.long_window.start} → ${D.meta.long_window.end}`], ["SPY over the same sessions", fmtPct(spy)], ["Max drawdown, closed trades", fmtPct(-m.max_drawdown)], ["Decisions", fmtInt(m.decisions)], ["Win rate", Math.round(m.win_rate * 100) + "%"]]) {
+    kv.append(el("dt", {}, k), el("dd", {}, v));
+  }
+}
+
+/* ---------- decisions ---------- */
+function decisionRows() {
+  return D.decisions[key("llm", state.trail, state.risk, state.conv)];
+}
+function outcome(row) {
+  return row.verdict === "take" ? row.r : row.base_r;
+}
+function renderScatter() {
+  const rows = decisionRows();
+  const colors = { take: css("--llm"), pass: css("--base"), no_call: css("--nocall") };
+  const points = rows.map((r, i) => {
+    const y = outcome(r);
+    const size = 8 + 18 * (r.conviction ?? 0.3);
+    return {
+      value: [evening(r.as_of), y ?? 0], idx: i,
+      symbol: r.verdict === "no_call" ? "diamond" : "circle", symbolSize: size,
+      itemStyle: r.verdict === "no_call" || y == null
+        ? { color: "transparent", borderColor: colors[r.verdict], borderWidth: 2 }
+        : { color: colors[r.verdict], borderColor: css("--surface"), borderWidth: 2, opacity: 0.92 },
+    };
+  });
+  const axis = axisStyle();
+  charts.scatter.setOption({
+    animationDurationUpdate: 600,
+    grid: { left: 52, right: 18, top: 14, bottom: 28 },
+    tooltip: {
+      trigger: "item", backgroundColor: css("--surface"), borderColor: css("--ring"), textStyle: { color: css("--ink"), fontSize: 12 },
+      formatter: p => {
+        const r = rows[p.data.idx], y = outcome(r);
+        const what = r.verdict === "take" ? "this trade" : "take-all on it";
+        return `<b>${esc(r.symbol)}</b> · ${evening(r.as_of)}<br>${r.verdict.replace("_", "-")}` +
+          (r.conviction != null ? ` · conviction ${r.conviction.toFixed(2)}` : "") +
+          `<br><b>${y == null ? "no closed trade" : fmtR(y)}</b> <span style="color:${css("--ink-2")}">${what}</span><br><span style="color:${css("--muted")}">click for the sources</span>`;
+      },
+    },
+    xAxis: { type: "time", ...axis, splitLine: { show: false } },
+    yAxis: { type: "value", ...axis, name: "R", nameTextStyle: { color: css("--muted") }, axisLabel: { ...axis.axisLabel, formatter: v => (v > 0 ? "+" : "") + v + "R" } },
+    series: [{ id: "dec", type: "scatter", data: points, emphasis: { scale: 1.25 }, markLine: { silent: true, symbol: "none", lineStyle: { color: css("--axis"), type: "solid", width: 1 }, label: { show: false }, data: [{ yAxis: 0 }] } }],
+  }, true);
+  charts.scatter.off("click");
+  charts.scatter.on("click", p => openDrawer(rows[p.data.idx]));
+
+  const n = { take: 0, pass: 0, no_call: 0 };
+  rows.forEach(r => n[r.verdict]++);
+  const mean = xs => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
+  const takes = rows.filter(r => r.verdict === "take" && r.base_r != null).map(r => r.base_r);
+  const passes = rows.filter(r => r.verdict === "pass" && r.base_r != null).map(r => r.base_r);
+  const best = passes.length ? Math.max(...passes) : null;
+  const rest = passes.length > 1 ? mean(passes.filter((v, i) => i !== passes.indexOf(best))) : null;
+  document.getElementById("dec-note").textContent =
+    `${n.take} take · ${n.pass} pass · ${n.no_call} no-call. Scored by what take-all earned on the same candidates: takes ${fmtR(mean(takes))} ` +
+    `(${takes.length}), passes ${fmtR(mean(passes))} (${passes.length})` + (rest != null ? `, or ${fmtR(rest)} without the single best pass` : "") +
+    `. With this few, one trade can flip the sign: the difference is noise, not skill. Hollow marks have no closed trade to show; a take-all result can be missing because take-all still held that stock, ` +
+    `left the order unfilled, or was still in the trade when the window ended.`;
+
+  const tbody = document.querySelector("#dec-table tbody");
+  tbody.replaceChildren(...rows.map(r => {
+    const tr = el("tr", {},
+      el("td", {}, evening(r.as_of)), el("td", {}, r.symbol), el("td", {}, r.verdict.replace("_", "-")),
+      el("td", { class: "num" }, r.conviction == null ? "–" : r.conviction.toFixed(2)),
+      el("td", { class: "num" }, fmtPct(r.candidate.gap)), el("td", { class: "num" }, fmtR(r.r)), el("td", { class: "num" }, fmtR(r.base_r)));
+    tr.addEventListener("click", () => openDrawer(r));
+    return tr;
+  }));
+}
+function quoteBlock(chunkId, quote) {
+  const chunk = D.chunks[String(chunkId)];
+  const box = el("div", { class: "src" });
+  if (!chunk) { box.append(quote); return box; }
+  const text = chunk.text;
+  let span = chunk.spans.find(([a, b]) => text.slice(a, b) === quote) || chunk.spans.find(([a, b]) => text.slice(a, b).replace(/\s+/g, " ") === quote.replace(/\s+/g, " "));
+  if (!span) { box.append(quote); return box; }
+  const [a, b] = span, from = Math.max(0, a - 260), to = Math.min(text.length, b + 260);
+  const tidy = t => t.replace(/\n\s*\n/g, "\n");  // blank lines only; the quote itself is shown as filed
+  box.append((from > 0 ? "… " : "") + tidy(text.slice(from, a)), el("mark", {}, text.slice(a, b)), tidy(text.slice(b, to)) + (to < text.length ? " …" : ""));
+  return box;
+}
+function openDrawer(r) {
+  history.replaceState(null, "", `#${r.symbol}-${evening(r.as_of)}`);
+  const d = document.getElementById("drawer");
+  const colors = { take: "--llm", pass: "--base", no_call: "--nocall" };
+  const name = D.entities[String(r.entity_id)]?.name || "";
+  const c = r.candidate;
+  const close = el("button", { class: "ghost", type: "button", style: "float:right" }, "Close");
+  close.addEventListener("click", closeDrawer);
+  const y = outcome(r);
+  d.replaceChildren(
+    close,
+    el("div", { class: "eyebrow" }, `Evening of ${evening(r.as_of)} · decided at 20:00 New York`),
+    el("h3", {}, r.symbol),
+    el("div", { style: "color:var(--muted);font-size:13px" }, name ? `${name} (today's name; the prompt gives only the ticker, the filing names the company as filed)` : ""),
+    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin:12px 0" },
+      el("span", { class: "badge" }, el("i", { style: `background:var(${colors[r.verdict]})` }), r.verdict.replace("_", "-")),
+      ...(r.conviction != null ? [el("span", { class: "badge" }, `conviction ${r.conviction.toFixed(2)}`)] : []),
+      el("span", { class: "badge" }, `gap ${fmtPct(c.gap)}`),
+      el("span", { class: "badge" }, `volume ${c.rvol.toFixed(1)}× 20-day`)),
+  );
+  const kv = el("dl", { class: "kv" });
+  const res = (v) => el("span", { class: v == null ? "" : v >= 0 ? "pos" : "neg" }, fmtR(v));
+  kv.append(el("dt", {}, "This decision"), el("dd", {}, res(r.r)));
+  kv.append(el("dt", {}, "Take-all on the same candidate"), el("dd", {}, res(r.base_r)));
+  for (const t of r.trades) {
+    kv.append(el("dt", {}, `Leg ${t.leg}: ${nyParts(t.entry_at).date} → ${nyParts(t.exit_at).date}`),
+      el("dd", {}, `$${t.entry_price.toFixed(2)} → $${t.exit_price.toFixed(2)} · ${t.exit_reason.replace("_", " ")} · `, res(t.r_multiple)));
+  }
+  d.append(kv);
+  if (r.claims.length) {
+    d.append(el("h4", { style: "margin:22px 0 4px" }, `The model's claims (${r.claims.length}), each checked against the filing`));
+    for (const cl of r.claims) {
+      const chunk = D.chunks[String(cl.chunk_id)];
+      d.append(el("div", { class: "claim" },
+        el("div", { class: "head" }, el("span", { class: `stance ${cl.stance}` }, cl.stance === "for" ? "for taking it" : "against"), chunk ? `· ${chunk.section_path} · passage ${cl.chunk_id}` : ""),
+        el("div", { class: "text" }, cl.claim),
+        quoteBlock(cl.chunk_id, cl.quote)));
+    }
+  } else if (r.verdict === "no_call") {
+    d.append(el("p", { class: "note" }, "No-call: the filing had too little readable text, the model refused, or its claims failed the citation check twice. Nothing uncited is acted on."));
+  }
+  d.classList.add("open"); d.setAttribute("aria-hidden", "false");
+  document.getElementById("scrim").classList.add("open");
+  d.scrollTop = 0;
+  // bring each highlighted quote into its passage box
+  d.querySelectorAll(".src").forEach(box => {
+    const m = box.querySelector("mark");
+    if (m) box.scrollTop = Math.max(0, m.offsetTop - box.offsetTop - 40);
+  });
+}
+function closeDrawer() {
+  history.replaceState(null, "", location.pathname + location.search);
+  document.getElementById("drawer").classList.remove("open");
+  document.getElementById("drawer").setAttribute("aria-hidden", "true");
+  document.getElementById("scrim").classList.remove("open");
+}
+document.getElementById("scrim").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+/* ---------- time machine ---------- */
+let playing = 0;
+let renderTime = () => {};
+function setupTime() {
+  const docs = D.timeline.map(d => ({ ...d, ny: nyParts(d.available_at).stamp }));
+  const ids = [...new Set([...docs.map(d => d.entity_id), ...decisionRows().map(r => r.entity_id)])];
+  ids.sort((a, b) => (D.entities[a]?.ticker || "").localeCompare(D.entities[b]?.ticker || ""));
+  const grid = document.getElementById("tm-grid"), cards = {};
+  for (const id of ids) {
+    const sub = el("span", {}, "–");
+    cards[id] = { node: el("div", { class: "co" }, el("b", {}, D.entities[id]?.ticker || id), sub), sub };
+    grid.append(cards[id].node);
+  }
+  const slider = document.getElementById("tm");
+  slider.max = D.sessions.length - 1;
+  const render = () => {
+    const day = D.sessions[+slider.value], cut = `${day} 20:00`;
+    const prev = D.sessions[Math.max(0, +slider.value - 1)];
+    const seen = docs.filter(d => d.ny <= cut);
+    const last = {};
+    for (const d of seen) last[d.entity_id] = d;
+    const tonight = new Set(decisionRows().filter(r => evening(r.as_of) === day).map(r => r.entity_id));
+    for (const id of ids) {
+      const c = cards[id], l = last[id];
+      c.node.classList.toggle("lit", !!l);
+      c.node.classList.toggle("fresh", !!l && l.ny > `${prev} 20:00`);
+      c.node.classList.toggle("cand", tonight.has(id));
+      c.sub.textContent = l ? `${l.doc_type} ${l.ny.slice(5, 10)}` : "–";
+    }
+    const dt = document.getElementById("tm-date");
+    dt.replaceChildren(day, el("small", {}, `${seen.length} of ${docs.length} filings public · ${tonight.size} judged tonight`));
+    const feed = document.getElementById("feed");
+    feed.replaceChildren(el("div", { style: "color:var(--muted)" }, "Latest public filings"),
+      ...seen.slice(-8).reverse().map(d => el("div", {}, el("b", {}, D.entities[d.entity_id]?.ticker || ""), el("span", {}, d.doc_type), el("time", {}, d.ny.slice(5)))));
+  };
+  renderTime = render;
+  slider.addEventListener("input", render);
+  const play = document.getElementById("play");
+  play.addEventListener("click", () => {
+    if (playing) { clearInterval(playing); playing = 0; play.textContent = "Play"; return; }
+    if (+slider.value >= +slider.max) slider.value = 0;
+    play.textContent = "Pause";
+    playing = setInterval(() => {
+      if (+slider.value >= +slider.max) { clearInterval(playing); playing = 0; play.textContent = "Play"; return; }
+      slider.value = +slider.value + 1; render();
+    }, 260);
+  });
+  render();
+}
+
+/* ---------- leakage & limits ---------- */
+const GUARDS = [
+  ["Reading data from after the decision", "Every point-in-time read takes an as_of instant and goes through a visible_* function (filings, chunks, bars, the security master); the replay decides at 20:00 New York, when the day's bar is final.", "store/queries.py · store/market.py · visible_*(…, as_of)"],
+  ["Using a filing before it was public", "Filings are filtered on when EDGAR disseminated them (available_at), never on the period they describe. Revisions are new rows; nothing is overwritten.", "Document.available_at · tests/store"],
+  ["Knowing today what a ticker meant then", "Renames, ticker reuse and delistings are resolved with the security master as it was known at each instant; a truncation test rebuilds it from only the inputs knowable then and compares. Known residual cases, mostly the vendor rewriting its own history, are listed and may only shrink.", "asof market truncation · configs/truncation_impact_baseline.txt"],
+  ["Future statistics in search", "Full-text ranking uses term statistics of the documents visible at as_of only, not of the whole archive. (This strategy's judge reads the whole triggering filing; search serves research queries.)", "evidence/retrieve.py"],
+  ["A model that already knows the outcome", "Results are split at the model's training cutoff; the demo window starts after it. The prompt gives the ticker, not today's company name, which could reveal a later merger or rename; the filing itself names the company as it was then.", `judge.training_cutoff`],
+  ["Claims the filing does not make", "Each claim must quote, word for word, a passage of the right company that was public at that instant. A claim that fails is sent back once; failing again is a no-call.", "evidence/validate.py · Citation Validator"],
+  ["Results visible before they happened", "A closed trade becomes visible at the close of its exit day, and a decision's outcome only after its re-entry window has closed.", "Trade.available_at · Attribution.outcome_available_at"],
+  ["Trying settings until one works", "Every parameter set a research replay runs under is registered; the count is reported next to every result and will set the bar for promoting a change. This page's grid ran on a copy and is not counted.", "StrategyVersion · attempt_count"],
+];
+function renderGuards() {
+  document.getElementById("guards").replaceChildren(...GUARDS.map(([q, a, t]) =>
+    el("div", { class: "guard" }, el("div", { class: "q" }, q), el("div", { class: "a" }, a), el("div", { class: "t" }, t))));
+  const L = [
+    ["One window, one market regime.", ` ${decisionRows().length} decisions between ${D.meta.window.start} and ${D.meta.window.end}. That cannot tell whether the judge helps; the pipeline running end to end is the result.`],
+    ["The grid is a search.", ` ${D.meta.grid_points} settings are offered here; the best-looking one is the luckiest one. A high minimum conviction leaves only a handful of trades.`],
+    ["The universe was chosen with hindsight.", " About 300 instruments picked today, so companies that disappeared are under-represented."],
+    ["Daily bars.", " Within a day the worst order of high and low is assumed; drawdown counts closed trades only."],
+    ["The benchmark is price only.", " SPY's dividends, roughly 1 to 1.5% a year, are not included, which flatters the strategy over the long run; interest on the strategy's idle cash is not included either, which works the other way."],
+    ["Results are closed trades only.", " Return and drawdown move when a trade closes; open positions are not marked to market, and those still open when the data ends are left out."],
+    ["The prompt describes the default rules.", " It tells the model the stop trails by 1.5 ATR; settings with another trail reuse the same answers."],
+  ];
+  document.getElementById("limits-list").replaceChildren(...L.map(([b, t]) => el("li", {}, el("b", {}, b), t)));
+  document.getElementById("foot").append(el("br"), `Data built from commit ${D.meta.code_version.slice(0, 12)} on ${D.meta.generated_at.slice(0, 10)} · model ${D.meta.model}`);
+}
+
+/* ---------- boot ---------- */
+async function main() {
+  try { await load(); } catch (e) {
+    document.querySelector("main").prepend(el("p", { class: "loading" }, "Could not load the demo data (" + e.message + "). Serve this folder over HTTP, e.g. python -m http.server."));
+    return;
+  }
+  for (const id of ["equity", "drawdown", "long", "scatter"]) charts[id] = echarts.init(document.getElementById(id), null, { renderer: "canvas" });
+  heroCounts(); drawSweep(); setupSliders(); renderLab(true); renderLong(); renderScatter(); setupTime(); renderGuards();
+  requestAnimationFrame(() => Object.values(charts).forEach(c => c.resize()));
+  // #UNH-2026-07-16 opens that evening's decision, so one judgement can be linked to.
+  let hash = "";
+  try { hash = decodeURIComponent(location.hash.slice(1)); } catch (e) { /* malformed link */ }
+  const m = hash.match(/^(.+)-(\d{4}-\d{2}-\d{2})$/);
+  const linked = m && decisionRows().find(r => r.symbol === m[1] && evening(r.as_of) === m[2]);
+  if (linked) openDrawer(linked);
+  let t = 0;
+  window.addEventListener("resize", () => { clearTimeout(t); t = setTimeout(() => { Object.values(charts).forEach(c => c.resize()); drawSweep(); }, 120); });
+}
+main();
+</script>
+</body>
+</html>

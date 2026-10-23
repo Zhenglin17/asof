@@ -2,6 +2,8 @@
 
 A point-in-time correct market research agent.
 
+**[Live demo](https://zhenglin17.github.io/asof/)**: replays, every cited judgement, and the leakage guards.
+
 Every day it scans the market, gathers evidence, forms conclusions that cite
 their sources, places simulated orders, keeps a ledger, attributes results,
 and proposes changes to its own strategies. A proposed change must pass a
@@ -499,14 +501,22 @@ uv run asof demo build --jobs 5          # ~7 minutes; llm answers must already 
 The demo page is static: every number it shows was computed beforehand by a real replay. The
 command replays a small grid over the LLM window, take-all and LLM, each over trail
 (`execute.stop.trail_atr` 1.0 / 1.5 / 2.0) and risk per decision (`execute.sizing.risk_pct`
-0.25 / 0.5 / 1.0), the LLM also over `judge.min_conviction` (0 / 0.5 / 0.6): 36 replays, plus
+0.25 / 0.5 / 1.0), the LLM also over `judge.min_conviction` (0 / 0.55 / 0.6): 36 replays, plus
 take-all with the defaults over 2023-2026. Each worker replays on its own copy of the database,
 deleted afterwards, so the grid adds no strategy versions or runs to the research store: it is
 a display, not a search, and does not count as attempts. It writes JSON to `web/data`: runs
 (metrics and realized equity per grid point, with a SPY index), decisions (verdicts, claims,
 legs, and what take-all earned on the same candidate), the cited chunks with each quote's
-position, and the filing timeline by `available_at`. Only derived numbers are written, no
-bars. The grid point with the defaults reproduces the replays above decision for decision.
+position, and the filing timeline by `available_at`. No bar series is written; a decision's
+gap-day prices and its fills are. The grid point with the defaults reproduces the replays above decision for decision.
+
+The page itself is `web/index.html`, one file with no build step, published to
+[zhenglin17.github.io/asof](https://zhenglin17.github.io/asof/) by `.github/workflows/pages.yml` on
+every push that changes `web/`. To preview it locally:
+
+```bash
+python -m http.server -d web 8000      # then open http://localhost:8000
+```
 
 ## Layout
 
@@ -539,7 +549,7 @@ configs/             watchlist.yaml (instruments that get filings and fundamenta
                      truncation_instants.txt (instants the truncation test rebuilds at),
                      truncation_impact_baseline.txt (known leak impact, a ratchet),
                      docs_exceptions.yaml (reviewed filing coverage gaps)
-web/data/            JSON behind the demo page, written by `asof demo build`
+web/                 the static demo page (index.html) and its data (data/, from `asof demo build`)
 docs/                public documentation                                  (planned)
 ```
 

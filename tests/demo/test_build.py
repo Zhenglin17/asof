@@ -7,7 +7,7 @@ API under test (asof.demo.build):
     grid() -> list[list[str]]   override lists for ``asof replay run --set``
         take_all: execute.stop.trail_atr in {1.0, 1.5, 2.0} x execute.sizing.risk_pct in
                   {0.25, 0.5, 1.0}, no judge.min_conviction                       (9)
-        llm:      judge.kind=llm x the same 9 x judge.min_conviction in {0.0, 0.5, 0.6}  (27)
+        llm:      judge.kind=llm x the same 9 x judge.min_conviction in {0.0, 0.55, 0.6}  (27)
 
 No as_of: the grid is a list of strings and holds no time information, so there is nothing to
 leak here. Assumptions only the real store can confirm (check when the sweep is first run):
@@ -32,7 +32,7 @@ from asof.strategy import apply_overrides, load_strategy
 REPO_STRATEGY = Path(__file__).resolve().parents[2] / "strategies" / "earnings_gap"
 TRAILS = (1.0, 1.5, 2.0)
 RISKS = (0.25, 0.5, 1.0)
-CONVICTIONS = (0.0, 0.5, 0.6)
+CONVICTIONS = (0.0, 0.55, 0.6)
 
 
 def keys(overrides: list[str]) -> list[str]:

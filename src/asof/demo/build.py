@@ -7,7 +7,8 @@ its take-all replay and the three llm replays that differ only in ``min_convicti
 copy, so every llm decision can be paired with the take-all decision on the same candidate. One
 more unit replays take-all with the defaults over the long window.
 
-Only derived numbers are written (equity, P&L, R, metrics, a benchmark index), never raw bars.
+No bar series is written: equity, P&L, R, metrics and a SPY index, plus the few prices a decision
+carries (its gap-day bar and its fills). The user accepted publishing those on 2026-10-23.
 """
 
 import json
@@ -41,7 +42,8 @@ from asof.strategy import attempt_count, load_strategy, replay_count
 
 TRAILS = (1.0, 1.5, 2.0)
 RISKS = (0.25, 0.5, 1.0)
-CONVICTIONS = (0.0, 0.5, 0.6)
+# Takes come with convictions from 0.50 to 0.63, so a 0.5 floor would filter nothing.
+CONVICTIONS = (0.0, 0.55, 0.6)
 LONG = "long"
 
 
@@ -246,12 +248,17 @@ def build(
     for run in runs.values():
         run["metrics"].update(searched)
 
+    spy = _benchmark(root, start, end, equity0)
+    long_spy = _benchmark(root, long_start, end, equity0)
+    # The last session with bars, which may be earlier than ``end``.
+    last = spy[-1]["date"] if spy else end.isoformat()
     meta = {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "code_version": _code_version(),
         "strategy": cfg.strategy.name,
-        "window": {"start": start.isoformat(), "end": end.isoformat()},
-        "long_window": {"start": long_start.isoformat(), "end": end.isoformat()},
+        "window": {"start": start.isoformat(), "end": last},
+        "long_window": {"start": long_start.isoformat(), "end": last},
+        "initial_equity": equity0,
         "model": cfg.judge.model,
         "training_cutoff": _iso_date(cfg.judge.training_cutoff),
         "grid": {"trail_atr": TRAILS, "risk_pct": RISKS, "min_conviction": CONVICTIONS},
@@ -269,8 +276,8 @@ def build(
         "meta.json": meta,
         "runs.json": {
             "runs": runs,
-            "benchmark": _benchmark(root, start, end, equity0),
-            "long_benchmark": _benchmark(root, long_start, end, equity0),
+            "benchmark": spy,
+            "long_benchmark": long_spy,
         },
         "decisions.json": decisions,
         "chunks.json": chunks,
