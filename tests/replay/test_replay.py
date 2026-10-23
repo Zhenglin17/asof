@@ -312,7 +312,10 @@ FILLED_AFTER: list[Ohlcv | None] = [
     (50.0, 51.0, 49.6, 50.6, 1_200_000),  # X1: leg 1 in at 50.0 (key 49, zone 48.5 .. 49.5)
     (50.0, 51.0, 46.9, 50.8, 1_500_000),  # X2: hard stop 47 hit; low 46.9, close 50.8 would
     #                                       confirm a re-entry if the setup were still valid
-    *[(51.0, 51.5, 50.6, 51.2, 1_000_000)] * 24,
+    (51.0, 51.5, 50.6, 51.2, 1_000_000),  # X3: a leg 2 would buy this open
+    (49.0, 49.2, 47.5, 47.8, 1_000_000),  # X4: and leave at its hard stop 48, so it is
+    #                                       booked; an open leg would never reach the ledger
+    *[(48.0, 48.5, 47.6, 48.0, 1_000_000)] * 22,
 ]
 
 
@@ -324,9 +327,9 @@ def legs_of(session: Session, run_id: int) -> list[tuple[Any, ...]]:
 
 
 def simulated_legs(
-    world_bars: list[Any], strategy_dir: Path, reaction: Ohlcv
+    world_bars: list[Any], strategy_dir: Path, reaction: Ohlcv, overrides: tuple[str, ...]
 ) -> list[tuple[Any, ...]]:
-    cfg = apply_overrides(load_strategy(strategy_dir), list(ZERO_SLIP)).execute
+    cfg = apply_overrides(load_strategy(strategy_dir), list(overrides)).execute
     bars = sorted(
         (
             DailyBar(session_date=b.t.astimezone(ET).date(), open=b.open, high=b.high,
@@ -351,10 +354,22 @@ def simulated_legs(
     ]
 
 
+# In the filled world leg 1 loses 202 * 3 = 606, more than the shared 500 budget, so a shared
+# budget alone would block the re-entry and hide whether the reaction-day check works. With an
+# independent budget only that check stands between X2's confirmation and a 178-share leg 2.
+INDEPENDENT = (*ZERO_SLIP, "execute.reentry.risk_mode=independent")
+# The same path with a reaction close above the re-entry zone: leg 2 does happen.
+HELD_REACTION: Ohlcv = (55.0, 57.0, 49.0, 51.0, 3_000_000)
+
+
 @pytest.mark.parametrize(
-    ("reaction", "after"),
-    [(GAP, TRADED), (FILLED_REACTION, FILLED_AFTER)],
-    ids=["two_legs", "filled"],
+    ("reaction", "after", "overrides"),
+    [
+        (GAP, TRADED, ZERO_SLIP),
+        (FILLED_REACTION, FILLED_AFTER, INDEPENDENT),
+        (HELD_REACTION, FILLED_AFTER, INDEPENDENT),
+    ],
+    ids=["two_legs", "filled", "held"],
 )
 def test_replay_trades_equal_simulate_decision(
     tmp_path: Path,
@@ -363,10 +378,12 @@ def test_replay_trades_equal_simulate_decision(
     strategy_dir: Path,
     reaction: Ohlcv,
     after: list[Ohlcv | None],
+    overrides: tuple[str, ...],
 ) -> None:
     world = gap_world(tmp_path, session, reaction=reaction, after=after)
-    run_id = run_replay(session, con, world.root, strategy_dir, START, X[len(after)], ZERO_SLIP)
-    assert legs_of(session, run_id) == simulated_legs(world.bars, strategy_dir, reaction)
+    run_id = run_replay(session, con, world.root, strategy_dir, START, X[len(after)], overrides)
+    expected = simulated_legs(world.bars, strategy_dir, reaction, overrides)
+    assert legs_of(session, run_id) == expected
 
 
 def test_a_gap_filled_on_the_reaction_day_never_reenters(
@@ -374,10 +391,24 @@ def test_a_gap_filled_on_the_reaction_day_never_reenters(
 ) -> None:
     world = gap_world(tmp_path, session, reaction=FILLED_REACTION, after=FILLED_AFTER)
     run_id = run_replay(
-        session, con, world.root, strategy_dir, START, X[len(FILLED_AFTER)], ZERO_SLIP
+        session, con, world.root, strategy_dir, START, X[len(FILLED_AFTER)], INDEPENDENT
     )
     [only] = trades(session, run_id)
     assert (only.leg, only.exit_price, only.exit_reason) == (1, 47.0, "hard")
+
+
+def test_the_same_path_reenters_when_the_reaction_day_held(
+    tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, strategy_dir: Path
+) -> None:
+    # Control for the test above: only the reaction close differs (51.0 instead of 49.3).
+    world = gap_world(tmp_path, session, reaction=HELD_REACTION, after=FILLED_AFTER)
+    run_id = run_replay(
+        session, con, world.root, strategy_dir, START, X[len(FILLED_AFTER)], INDEPENDENT
+    )
+    first, second = trades(session, run_id)
+    assert (first.leg, first.exit_reason) == (1, "hard")
+    assert (second.leg, second.shares, second.entry_price) == (2, 178, 51.0)
+    assert (second.exit_price, second.exit_reason) == (48.0, "hard")
 
 
 def test_a_split_on_a_session_without_a_bar_is_still_applied(
