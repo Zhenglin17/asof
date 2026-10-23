@@ -75,6 +75,30 @@ uv run ruff format --check .
 uv run pyright          # type check
 ```
 
+### Commands at a glance
+
+In pipeline order; each step reads what the ones before it wrote. Details follow below and in
+[Filings](#filings), [Evidence](#evidence) and [Replay](#replay).
+
+```bash
+uv run asof db init                  # metadata database ($ASOF_DATA_DIR/meta.db)
+uv run asof entities sync --download # watchlist -> entity table, matched to SEC identifiers
+uv run asof market universe          # every listed symbol, past and present
+uv run asof market backfill          # daily bars since 2020
+uv run asof market import-bars       # registered second-source bars
+uv run asof market actions           # splits, renames, mergers
+uv run asof market identity          # security master: which security each symbol was, per day
+uv run asof market instruments       # instrument class per security-master segment
+uv run asof market audit             # data checks, with reviewed exceptions
+uv run asof market truncation        # rebuild identity as of past instants; gate on leak impact
+uv run asof docs sync                # SEC filings of the watchlist companies, as citable chunks
+uv run asof docs audit               # filing integrity and coverage gaps
+uv run asof evidence index           # full-text index over the chunks
+uv run asof evidence search "..." --as-of 2025-01-31 --ticker NVDA   # what was public then
+uv run asof replay run --strategy earnings_gap --start 2023-01-03 --end 2026-10-21
+uv run asof replay report --run 1    # markdown report of a replay
+```
+
 Create the metadata database:
 
 ```bash
