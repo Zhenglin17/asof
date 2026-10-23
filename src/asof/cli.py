@@ -16,6 +16,7 @@ import typer
 from sqlmodel import Session, select
 
 from asof import __version__
+from asof.demo.build import build
 from asof.evidence.retrieve import search
 from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
@@ -1735,3 +1736,49 @@ def judge_run(
             "answers are free); rerun to continue from the cache"
         )
         raise typer.Exit(1)
+
+
+demo_app = typer.Typer(help="Data for the static demo page.", no_args_is_help=True)
+app.add_typer(demo_app, name="demo")
+
+
+@demo_app.command("build")
+def demo_build(
+    out: Annotated[Path, typer.Option("--out", help="Directory for the JSON files.")] = Path(
+        "web/data"
+    ),
+    strategy: Annotated[str, typer.Option("--strategy")] = "earnings_gap",
+    start: Annotated[
+        datetime, typer.Option("--start", formats=["%Y-%m-%d"], help="Grid window start.")
+    ] = datetime(2026, 7, 1),
+    end: Annotated[datetime, typer.Option("--end", formats=["%Y-%m-%d"])] = datetime(2026, 10, 21),
+    long_start: Annotated[
+        datetime,
+        typer.Option("--long-start", formats=["%Y-%m-%d"], help="Start of the take-all curve."),
+    ] = datetime(2023, 1, 3),
+    jobs: Annotated[int, typer.Option("--jobs", help="Worker processes.")] = 1,
+    strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """Replay the demo grid (take-all and llm over trail, risk and min conviction) on private
+    copies of the database and write the page's JSON. The research database is only read: the
+    grid adds no strategy versions or runs to it. Llm answers must already be cached."""
+    if jobs < 1:
+        _fail("--jobs must be at least 1")
+    counts = build(
+        db or default_db_path(),
+        _market_root(data_dir),
+        strategies_dir / strategy,
+        out,
+        start=start.date(),
+        end=end.date(),
+        long_start=long_start.date(),
+        jobs=jobs,
+    )
+    for name, n in counts.items():
+        typer.echo(f"{name} {n}")

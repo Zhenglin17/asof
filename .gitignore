@@ -19,6 +19,7 @@ htmlcov/
 
 # Data (market bars, filings, caches) — never commit raw data
 data/
+!web/data/
 *.parquet
 *.duckdb
 *.sqlite

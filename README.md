@@ -105,6 +105,7 @@ uv run asof judge run --strategy earnings_gap --start 2026-07-01 --end 2026-10-2
 uv run asof replay run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 \
     --set judge.kind=llm                # the LLM judge, read from the answer cache
 uv run asof replay compare --base 2 --run 3   # LLM replay against take-all, same window
+uv run asof demo build --jobs 5      # demo page data: a parameter grid of real replays -> web/data
 ```
 
 Create the metadata database:
@@ -489,6 +490,24 @@ take-all, a gap that comes from four trades take-all had no capital left for, no
 judgement; the passes' advantage rests on one trade. 51 candidates in one market regime
 cannot tell whether the judge helps. Convictions clustered at 0.5 to 0.6.
 
+#### Demo data
+
+```bash
+uv run asof demo build --jobs 5          # ~7 minutes; llm answers must already be cached
+```
+
+The demo page is static: every number it shows was computed beforehand by a real replay. The
+command replays a small grid over the LLM window, take-all and LLM, each over trail
+(`execute.stop.trail_atr` 1.0 / 1.5 / 2.0) and risk per decision (`execute.sizing.risk_pct`
+0.25 / 0.5 / 1.0), the LLM also over `judge.min_conviction` (0 / 0.5 / 0.6): 36 replays, plus
+take-all with the defaults over 2023-2026. Each worker replays on its own copy of the database,
+deleted afterwards, so the grid adds no strategy versions or runs to the research store: it is
+a display, not a search, and does not count as attempts. It writes JSON to `web/data`: runs
+(metrics and realized equity per grid point, with a SPY index), decisions (verdicts, claims,
+legs, and what take-all earned on the same candidate), the cited chunks with each quote's
+position, and the filing timeline by `available_at`. Only derived numbers are written, no
+bars. The grid point with the defaults reproduces the replays above decision for decision.
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.
@@ -505,6 +524,7 @@ src/asof/
   execute/    pure-code simulated execution: zone stops, trailing key, re-entry, sizing
   attribute/  per-decision outcome, hidden until it can no longer change
   replay/     session-by-session replay, bar cache, report, comparison of two replays
+  demo/       the static demo page's data: a parameter grid of real replays, exported
   evolve/     strategy proposals, permutation gate, approval
   api/        FastAPI surface
 strategies/<name>/   one strategy per directory (scan, rules, judge, execute,
@@ -519,6 +539,7 @@ configs/             watchlist.yaml (instruments that get filings and fundamenta
                      truncation_instants.txt (instants the truncation test rebuilds at),
                      truncation_impact_baseline.txt (known leak impact, a ratchet),
                      docs_exceptions.yaml (reviewed filing coverage gaps)
+web/data/            JSON behind the demo page, written by `asof demo build`
 docs/                public documentation                                  (planned)
 ```
 
