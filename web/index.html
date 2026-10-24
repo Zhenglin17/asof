@@ -1,19 +1,23 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>asof · point-in-time market agent</title>
+<script>
+/* restore the saved theme before first paint, so a returning visitor sees no flash */
+try { const t = localStorage.getItem("asof-theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) { /* storage blocked */ }
+</script>
 <meta name="description" content="A market research agent that may only read what was public at each moment, and must quote the filing behind every judgement. Replays, cited decisions and the leakage guards, explorable.">
 <style>
 :root {
   color-scheme: light;
-  --page: #f9f9f7;
-  --surface: #fcfcfb;
-  --surface-2: #f3f2ee;
+  --page: #efede7;
+  --surface: #f8f7f3;
+  --surface-2: #e8e6df;
   --ink: #0b0b0b;
   --ink-2: #52514e;
-  --muted: #898781;
+  --muted: #67655f;
   --grid: #e1e0d9;
   --axis: #c3c2b7;
   --ring: rgba(11, 11, 11, 0.10);
@@ -110,8 +114,8 @@ button.ghost:hover { color: var(--ink); background: var(--surface-2); }
 }
 .eyebrow { color: var(--muted); font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
 h1 {
-  font-size: clamp(30px, 5vw, 52px); line-height: 1.08; letter-spacing: -0.025em;
-  margin: 12px 0 16px; max-width: 900px; font-weight: 680;
+  font-size: clamp(28px, 4.2vw, 44px); line-height: 1.1; letter-spacing: -0.025em;
+  margin: 12px 0 16px; max-width: 900px; font-weight: 680; text-wrap: balance;
 }
 .lede { color: var(--ink-2); max-width: 720px; font-size: 17px; margin: 0; }
 .counters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 36px 0 22px; }
@@ -281,7 +285,7 @@ footer a { color: var(--ink-2); }
 <header class="hero" id="top">
   <div class="wrap">
     <div class="eyebrow">Evidence-grounded · replayable · no look-ahead</div>
-    <h1>A market agent that may only read what was public at the time, and must quote it.</h1>
+    <h1>A point-in-time market agent, with receipts.</h1>
     <p class="lede">Replayed evening by evening, it scans for post-earnings gaps, a language model reads the filing behind each one and answers take or pass, and code checks that every claim quotes, word for word, a passage that was public at that instant. Below: real replays, every cited judgement, and the guards against seeing the future.</p>
     <div class="counters">
       <div class="counter"><b data-count="judgements">–</b><span id="judged-label">candidates judged in the demo window</span></div>
@@ -452,7 +456,6 @@ document.getElementById("theme").addEventListener("click", () => {
   applyThemeLabel();
   if (D) { renderLab(true); renderLong(); renderScatter(); drawSweep(); }
 });
-try { const t = localStorage.getItem("asof-theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) { /* storage blocked */ }
 applyThemeLabel();
 
 /* ---------- hero ---------- */
