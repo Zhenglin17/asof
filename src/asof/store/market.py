@@ -33,7 +33,7 @@ import pyarrow.parquet as pq
 from asof.ingest.alpaca import Timeframe
 from asof.ingest.bar_imports import EXT_BAR_SCHEMA, EXT_DIR
 from asof.ingest.bars import _DIRS, BAR_SCHEMA
-from asof.ingest.corporate_actions import SPLIT_SCHEMA
+from asof.ingest.corporate_actions import DIVIDEND_SCHEMA, SPLIT_SCHEMA
 from asof.ingest.master_truncation import mask_master
 from asof.ingest.security_master import MASTER_FILE, MASTER_SCHEMA
 
@@ -442,6 +442,32 @@ def visible_splits(
     if path is None:
         return SPLIT_SCHEMA.empty_table()
     return splits_as_of(con, _source([path]), as_of_utc, symbols)
+
+
+def visible_dividends(
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    as_of: datetime,
+    symbols: Sequence[str] | None = None,
+) -> pa.Table:
+    """Cash dividend records known at ``as_of`` (``available_at`` is 00:00 New York of the
+    ex-date). Rows identical in every column are returned once: the feed stores some payouts
+    twice (QQQ 2022-09-19). Ordered by symbol then ex_date."""
+    path = _actions_file(root, "dividends")
+    if path is None:
+        return DIVIDEND_SCHEMA.empty_table()
+    clauses = ["available_at <= $as_of"]
+    params: dict[str, Any] = {"as_of": _aware_utc(as_of, "as_of")}
+    if symbols is not None:
+        clauses.append("symbol IN (SELECT UNNEST($symbols))")
+        params["symbols"] = list(symbols)
+    con.execute("SET TimeZone = 'UTC'")
+    columns = ", ".join(DIVIDEND_SCHEMA.names)
+    query = (
+        f"SELECT DISTINCT {columns} FROM {_source([path])} WHERE {' AND '.join(clauses)} "
+        "ORDER BY symbol, ex_date"
+    )
+    return con.execute(query, params).to_arrow_table()
 
 
 def splits_as_of(

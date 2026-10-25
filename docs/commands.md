@@ -56,6 +56,8 @@ The [README](../README.md) is the short tour.
 - [x] Evaluation protocol: development, holdout and clean dates and the gate's settings are
       pre-registered in `configs/evaluation.yaml`; replays and judge runs that reach the
       sealed holdout are refused unless the strategy opens it, once
+- [x] Benchmarks: SPY and QQQ with dividends reinvested and a monthly top-10 dollar-volume
+      basket, members picked point in time (`asof benchmark`)
 - [ ] Strategy evolution: permutation gate, approval
 
 ## Development
@@ -522,6 +524,26 @@ every push that changes `web/`. To preview it locally:
 ```bash
 python -m http.server -d web 8000      # then open http://localhost:8000
 ```
+
+### Benchmarks
+
+```bash
+uv run asof benchmark --start 2020-01-01 --end 2025-06-30            # the protocol's benchmarks
+uv run asof benchmark --start 2020-01-01 --end 2025-06-30 --holdings # plus the basket's members
+```
+
+The benchmarks a strategy has to beat over the same dates, set in `configs/evaluation.yaml`:
+SPY and QQQ bought at the first session's open and held, and a mechanical basket. On the
+first session of each month the basket buys, equal weight at the open, the 10 common stocks
+(no funds) with the largest dollar volume over the previous 60 sessions, as visible at 00:00
+New York that day, and sells them at the next month's first open. A split multiplies the
+shares before the ex-date open. A dividend is owed on the shares held before the ex-date open
+and reinvested at that close; a payout on shares sold at that open waits as cash. Rows the
+feed stores twice count once. No trading costs. Members are picked point in time; the curve is
+marked with bars and actions as known at the window's end. Over development dates (2020-01-01
+to 2025-06-30): SPY +107.3%, QQQ +166.4%, the basket +265.5% with a 50.5% drawdown. The
+basket holds cash in January 2020 (the store starts 2020-01-02, so there is no history to
+rank), and GOOG and GOOGL can both enter.
 
 ## Layout
 

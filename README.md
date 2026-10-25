@@ -78,7 +78,9 @@ flowchart TB
   number of attempts is on record for the significance gate a change will have to pass. The
   evaluation protocol is pre-registered in [`configs/evaluation.yaml`](configs/evaluation.yaml):
   development dates, a sealed one-year holdout that code refuses to replay unless a strategy
-  opens it (once), and the gate's settings.
+  opens it (once), and the gate's settings. Results are compared with SPY and QQQ (dividends
+  reinvested) and with a mechanical basket: each month, the 10 largest stocks by recent
+  dollar volume, equal weight. [Details](docs/commands.md#benchmarks)
 
 ## Results so far
 

@@ -19,7 +19,9 @@ from asof import __version__
 from asof.demo.build import build
 from asof.evidence.retrieve import search
 from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
+from asof.evolve.benchmark import benchmarks
 from asof.evolve.holdout import HoldoutError
+from asof.evolve.protocol import load_protocol
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
 from asof.ingest.bar_imports import import_bars, load_bar_imports
 from asof.ingest.bars import ET, Partition, backfill, windows_for_requests
@@ -1758,6 +1760,37 @@ def judge_run(
             "answers are free); rerun to continue from the cache"
         )
         raise typer.Exit(1)
+
+
+@app.command("benchmark")
+def benchmark_cmd(
+    start: Annotated[datetime, typer.Option("--start", formats=["%Y-%m-%d"])],
+    end: Annotated[datetime, typer.Option("--end", formats=["%Y-%m-%d"])],
+    holdings: Annotated[
+        bool, typer.Option("--holdings", help="List the basket's members at each rebalance.")
+    ] = False,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """The protocol's benchmarks over [start, end]: index buy-and-hold with dividends
+    reinvested and the monthly top dollar-volume basket (configs/evaluation.yaml)."""
+    root = _market_root(data_dir)
+    con = duckdb.connect()
+    try:
+        curves = benchmarks(con, root, load_protocol(), start.date(), end.date())
+    except ValueError as error:
+        _fail(str(error))
+    finally:
+        con.close()
+    for c in curves:
+        typer.echo(
+            f"{c.label}: total {c.total_return:+.2%}, annualized {c.annualized_return:+.2%}, "
+            f"max drawdown {c.max_drawdown:.2%}, {len(c.sessions)} sessions"
+        )
+        if holdings:
+            for r in c.rebalances:
+                typer.echo(f"  {r.session} " + " ".join(symbol for _, symbol in r.members))
 
 
 demo_app = typer.Typer(help="Data for the static demo page.", no_args_is_help=True)
