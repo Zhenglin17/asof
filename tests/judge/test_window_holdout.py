@@ -23,12 +23,12 @@ from typing import Any
 import duckdb
 import httpx
 import pytest
-from asof.evolve.holdout import HoldoutError
 from sqlmodel import Session, select
 from typer.testing import CliRunner
 
 import asof.judge.window as window_module
 from asof.cli import app
+from asof.evolve.holdout import HoldoutError
 from asof.judge import client
 from asof.judge.window import judge_window
 from asof.store.models import HoldoutOpening, StrategyVersion

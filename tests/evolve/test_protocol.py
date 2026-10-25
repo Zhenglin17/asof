@@ -34,15 +34,15 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic import ValidationError
+
+from asof.evolve import protocol as protocol_module
 from asof.evolve.protocol import (
     DEFAULT_PROTOCOL_PATH,
     EvaluationProtocol,
     Window,
     load_protocol,
 )
-from pydantic import ValidationError
-
-from asof.evolve import protocol as protocol_module
 from tests.evolve.protocols import REAL, protocol, raw
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
