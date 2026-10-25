@@ -14,7 +14,17 @@ from zoneinfo import ZoneInfo
 
 from sqlmodel import Session, col, select
 
-from asof.store.models import Attribution, Decision, Direction, Document, Entity, Run, Trade
+from asof.evolve.protocol import EvaluationProtocol, load_protocol
+from asof.store.models import (
+    Attribution,
+    Decision,
+    Direction,
+    Document,
+    Entity,
+    HoldoutOpening,
+    Run,
+    Trade,
+)
 from asof.strategy import attempt_count, replay_count
 
 ET = ZoneInfo("America/New_York")
@@ -177,14 +187,31 @@ def _top_decisions(session: Session, run_id: int, trades: list[Trade]) -> list[s
     return lines
 
 
+def _holdout_lines(session: Session, run: Run, protocol: EvaluationProtocol) -> list[str]:
+    sealed = f"{protocol.holdout.start} .. {protocol.holdout.end}"
+    if run.strategy_id in protocol.seen_before_protocol:
+        return [
+            f"Holdout: this strategy was replayed over the sealed holdout {sealed} before the "
+            f"evaluation protocol existed, so no date before {protocol.clean_after} is unseen "
+            "data for it.",
+            "",
+        ]
+    opened = session.exec(select(HoldoutOpening).where(HoldoutOpening.run_id == run.id)).first()
+    if opened is not None:
+        return [f"Holdout: this run is the strategy's one opening of {sealed}.", ""]
+    return []
+
+
 def build_report(
     session: Session,
     run_id: int,
     *,
     benchmark: tuple[str, float] | None = None,
+    protocol: EvaluationProtocol | None = None,
 ) -> str:
     """``benchmark``: (label, return over the same sessions), e.g. SPY buy-and-hold."""
     run = _run(session, run_id)
+    protocol = protocol or load_protocol()
     m = replay_metrics(session, run_id)
     trades = _trades(session, run_id)
     holding = m.holding_sessions
@@ -199,6 +226,7 @@ def build_report(
         f"strategy version {run.strategy_version_id}, "
         f"code {run.git_sha[:12]}.",
         "",
+        *_holdout_lines(session, run, protocol),
         "## Summary",
         "",
         "| metric | value |",

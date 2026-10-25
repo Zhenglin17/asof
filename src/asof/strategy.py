@@ -203,7 +203,11 @@ def load_strategy(path: Path) -> StrategyConfig:
         if not file.is_file():
             raise FileNotFoundError(f"{file}: missing strategy file")
         raw[name] = yaml.safe_load(file.read_text()) or {}
-    return _validate(raw)
+    cfg = _validate(raw)
+    # The name keys attempt counts and the holdout opening; it must not drift from the directory.
+    if cfg.strategy.name != path.name:
+        raise ValueError(f"{path}: strategy.name {cfg.strategy.name!r} is not the directory name")
+    return cfg
 
 
 def _parse_override(override: str) -> tuple[list[str], Any]:
@@ -220,6 +224,9 @@ def apply_overrides(cfg: StrategyConfig, overrides: Sequence[str]) -> StrategyCo
     raw = cfg.model_dump(mode="json")
     for override in overrides:
         keys, value = _parse_override(override)
+        if keys[0] == "strategy":
+            # strategy.name keys attempts and the holdout; a new identity is a new directory.
+            raise ValueError(f"{override!r}: the strategy section cannot be overridden")
         node = raw
         for key in keys[:-1]:
             if not isinstance(node.get(key), dict):

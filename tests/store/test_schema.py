@@ -39,6 +39,7 @@ EXPECTED_TABLES = {
     "strategy_version",
     "feedback",
     "trade",
+    "holdout_opening",
 }
 # The full-text index over chunk.text: one FTS5 virtual table plus the shadow tables it owns.
 FTS_TABLES = {
@@ -50,7 +51,7 @@ FTS_TABLES = {
 }
 
 
-def test_init_db_creates_exactly_the_twelve_tables_and_the_chunk_index(engine: Engine) -> None:
+def test_init_db_creates_exactly_the_thirteen_tables_and_the_chunk_index(engine: Engine) -> None:
     assert set(inspect(engine).get_table_names()) == EXPECTED_TABLES | FTS_TABLES
 
 

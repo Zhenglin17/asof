@@ -62,6 +62,14 @@ def _upgrade_trade_table(conn: Connection) -> None:
         conn.exec_driver_sql("ALTER TABLE trade ADD COLUMN symbol VARCHAR")
 
 
+def _upgrade_holdout_opening_table(conn: Connection) -> None:
+    # A holdout_opening table from before `run_id` existed gains the nullable column.
+    if "run_id" not in {c["name"] for c in inspect(conn).get_columns("holdout_opening")}:
+        conn.exec_driver_sql(
+            "ALTER TABLE holdout_opening ADD COLUMN run_id INTEGER REFERENCES run(id)"
+        )
+
+
 def init_db(engine: Engine) -> None:
     """Create or upgrade the schema and the chunk index. Safe to run repeatedly."""
     with engine.connect() as conn:
@@ -76,4 +84,5 @@ def init_db(engine: Engine) -> None:
         conn.exec_driver_sql("BEGIN")
         _upgrade_citation_table(conn)
         _upgrade_trade_table(conn)
+        _upgrade_holdout_opening_table(conn)
         fts.create_chunk_index(conn)

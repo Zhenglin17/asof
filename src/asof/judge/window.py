@@ -20,6 +20,8 @@ from typing import Any
 import duckdb
 from sqlmodel import Session
 
+from asof.evolve.holdout import check_window
+from asof.evolve.protocol import EvaluationProtocol, load_protocol
 from asof.judge.cache import LLMCache
 from asof.judge.client import JudgeCallError
 from asof.judge.llm import JudgeOutcome, judge_candidate, one_per_security
@@ -54,9 +56,20 @@ def judge_window(
     *,
     max_cost: float,
     limit: int | None = None,
+    protocol: EvaluationProtocol | None = None,
+    open_holdout: bool = False,
 ) -> WindowResult:
     if cfg.judge.kind != "llm":
         raise ValueError(f"judge_window needs judge.kind llm, got {cfg.judge.kind!r}")
+    # Same refusal as a replay; the opening itself is recorded by the replay that uses these.
+    check_window(
+        session,
+        protocol or load_protocol(),
+        cfg.strategy.name,
+        start,
+        end,
+        open_holdout=open_holdout,
+    )
     cache = LLMCache(root / "llm_cache", offline=False)
     result = WindowResult()
 

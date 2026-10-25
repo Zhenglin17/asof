@@ -53,6 +53,9 @@ The [README](../README.md) is the short tour.
       candidate with the take-all baseline, split at the model's training cutoff
 - [x] Demo page: a static page over a grid of real replays, with every cited judgement, a
       filing time machine and the leakage guards, published to GitHub Pages
+- [x] Evaluation protocol: development, holdout and clean dates and the gate's settings are
+      pre-registered in `configs/evaluation.yaml`; replays and judge runs that reach the
+      sealed holdout are refused unless the strategy opens it, once
 - [ ] Strategy evolution: permutation gate, approval
 
 ## Development
@@ -440,6 +443,18 @@ run so far. The judge here takes every candidate. It is the baseline a reading j
 beat, and its decisions carry no claims. Limits: the universe is today's watchlist (chosen
 with hindsight); bars are daily, so within a bar the worst order is assumed; drawdown counts
 closed trades only; no significance test yet.
+
+The dates come from `configs/evaluation.yaml`: development 2020-01-01 to 2025-06-30, a sealed
+holdout 2025-07-01 to 2026-06-30, and from 2026-07-01 the period after the judge model's
+training cutoff. A `replay run` or `judge run` whose range shares a day with the holdout is
+refused before anything is registered or read. `--open-holdout` lets it through once per
+strategy: the replay records the opening in the `holdout_opening` table, and any later
+holdout run of that strategy, under any parameter set, is refused. Lookback bars before the
+range start are not counted as a touch. The opening is written together with the run, so a
+replay that fails part way opens nothing. A strategy's identity is its directory name: it must
+match `strategy.name`, and `--set` cannot change the `strategy` section. Openings live in the
+database `--db` points at. `earnings_gap` is exempt: it was replayed over these dates before
+the protocol existed, and its reports say that no date before 2026-07-01 is unseen data for it.
 
 #### LLM judge
 

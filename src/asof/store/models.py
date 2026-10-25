@@ -8,7 +8,7 @@ Two rules hold for every table:
 """
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -390,6 +390,19 @@ class StrategyVersion(_Table, table=True):
     registered_at: datetime = Field(sa_type=UTCDateTime, index=True)
     change_kind: str
     summary: str | None = None
+
+
+class HoldoutOpening(_Table, table=True):
+    """The one time a strategy replayed the sealed holdout (configs/evaluation.yaml). Unique per
+    strategy: whatever version opened it, no other version may look again."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    strategy_id: str = Field(index=True, unique=True)
+    strategy_version_id: int = Field(foreign_key="strategy_version.id")
+    run_id: int | None = Field(default=None, foreign_key="run.id")
+    window_start: date
+    window_end: date
+    opened_at: datetime = Field(sa_type=UTCDateTime)
 
 
 class Feedback(_Table, table=True):

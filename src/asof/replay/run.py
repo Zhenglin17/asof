@@ -25,6 +25,8 @@ import duckdb
 from sqlmodel import Session, col, select
 
 from asof.attribute import attribute_decision
+from asof.evolve.holdout import check_window, record_opening
+from asof.evolve.protocol import EvaluationProtocol, load_protocol
 from asof.execute import (
     DailyBar,
     DecisionPlan,
@@ -385,12 +387,24 @@ def run_replay(
     start: date,
     end: date,
     overrides: Sequence[str] = (),
+    *,
+    protocol: EvaluationProtocol | None = None,
+    open_holdout: bool = False,
 ) -> int:
     """Replay ``strategy_dir`` (with ``overrides``) over the sessions in [start, end]; returns
-    the Run id. Every parameter set is registered as a StrategyVersion: one more attempt."""
+    the Run id. Every parameter set is registered as a StrategyVersion: one more attempt.
+    A window reaching the sealed holdout is refused before anything is registered or read."""
     if end < start:
         raise ValueError(f"end {end} is before start {start}")
     cfg = apply_overrides(load_strategy(strategy_dir), overrides)
+    opens = check_window(
+        session,
+        protocol or load_protocol(),
+        cfg.strategy.name,
+        start,
+        end,
+        open_holdout=open_holdout,
+    )
     version = register_version(session, strategy_dir, overrides)
     end_as_of = close_of(end)
     calendar = visible_sessions(con, root, "1Day", end_as_of)
@@ -412,6 +426,9 @@ def run_replay(
         run.model_training_cutoff = datetime.combine(cfg.judge.training_cutoff, time(0), tzinfo=UTC)
     session.add(run)
     session.flush()
+    if opens:
+        # Committed with the run below: a replay that fails shows nothing and opens nothing.
+        record_opening(session, cfg.strategy.name, version.id, start, end, run_id=run.id)  # pyright: ignore[reportArgumentType]
 
     cache = BarCache(
         con,

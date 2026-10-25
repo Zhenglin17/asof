@@ -1,0 +1,25 @@
+# Pre-registered evaluation protocol. Committed before any strategy is developed against it;
+# later edits only append (a new exempt strategy, a note), never move a window or loosen a number.
+#
+# dev          replays, parameter search and the gate's statistics use only these dates.
+# holdout      sealed: a replay or judge run touching one of these days is refused unless
+#              --open-holdout is given, and each strategy may open it once (table holdout_opening).
+# clean_after  first day after the judge model's training cutoff (2026-06-30): results from here
+#              on carry no hindsight from the model; paper trading extends this period.
+# seen_before_protocol  strategies replayed over holdout dates before this file existed. They are
+#              not guarded (nothing left to protect) and their reports say so.
+# Numbers below are the gate's settings; changing one later counts as a new attempt.
+dev: {start: 2020-01-01, end: 2025-06-30}
+holdout: {start: 2025-07-01, end: 2026-06-30}
+clean_after: 2026-07-01
+seen_before_protocol: [earnings_gap]
+attempt_budget: 20
+alpha: 0.05
+permutations: 1000
+# Thin-edge check: the edge must survive dropping the best trades and an extra cost per side.
+thin_edge: {drop_top: 3, extra_cost_bps: 10}
+benchmarks:
+  symbols: [SPY, QQQ]
+  # Each month's first session: the 10 stocks (no funds) with the largest dollar volume over the
+  # previous 60 sessions, equal weight, held to the next rebalance.
+  basket: {size: 10, lookback_sessions: 60, rebalance: monthly}

@@ -19,6 +19,7 @@ from asof import __version__
 from asof.demo.build import build
 from asof.evidence.retrieve import search
 from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
+from asof.evolve.holdout import HoldoutError
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
 from asof.ingest.bar_imports import import_bars, load_bar_imports
 from asof.ingest.bars import ET, Partition, backfill, windows_for_requests
@@ -1520,6 +1521,13 @@ def replay_run(
         list[str] | None,
         typer.Option("--set", help="Override one setting, e.g. execute.stop.trail_atr=1.0."),
     ] = None,
+    open_holdout: Annotated[
+        bool,
+        typer.Option(
+            "--open-holdout",
+            help="Allow dates in the sealed holdout (configs/evaluation.yaml); once per strategy.",
+        ),
+    ] = False,
     strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
     data_dir: Annotated[
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
@@ -1545,7 +1553,12 @@ def replay_run(
         init_db(engine)
         with Session(engine) as session:
             try:
-                run_id = run_replay(session, con, root, path, first, last, overrides or [])
+                run_id = run_replay(
+                    session, con, root, path, first, last, overrides or [],
+                    open_holdout=open_holdout,
+                )  # fmt: skip
+            except HoldoutError as error:
+                _fail(f"Refused, nothing was registered or run: {error}")
             except (FileNotFoundError, ValueError) as error:
                 _fail(
                     f"Replay failed, no run was written (the parameter set is registered): {error}"
@@ -1683,6 +1696,13 @@ def judge_run(
         list[str] | None,
         typer.Option("--set", help="Override one setting, e.g. judge.effort=medium."),
     ] = None,
+    open_holdout: Annotated[
+        bool,
+        typer.Option(
+            "--open-holdout",
+            help="Allow dates in the sealed holdout (configs/evaluation.yaml); once per strategy.",
+        ),
+    ] = False,
     strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
     data_dir: Annotated[
         Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
@@ -1715,8 +1735,10 @@ def judge_run(
             try:
                 result = judge_window(
                     session, con, root, cfg, first, last, model.complete,
-                    max_cost=max_cost, limit=limit,
+                    max_cost=max_cost, limit=limit, open_holdout=open_holdout,
                 )  # fmt: skip
+            except HoldoutError as error:
+                _fail(f"Refused, nothing was sent: {error}")
             except ValueError as error:
                 _fail(f"Judging stopped: {error}. Answers paid for so far are cached.")
     finally:

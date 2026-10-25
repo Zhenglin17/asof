@@ -74,8 +74,11 @@ flowchart TB
   that was public at that instant. [Details](docs/commands.md#evidence)
 - **Executor.** Next-open entry, ATR zone stops with a trailing key and one re-entry, sizing
   from a fixed risk budget with position and exposure caps. Each closed leg is a ledger row.
-- **Evolution** (planned). Every parameter set a replay runs under is registered, so the
-  number of attempts is on record for the significance gate a change will have to pass.
+- **Evolution** (in progress). Every parameter set a replay runs under is registered, so the
+  number of attempts is on record for the significance gate a change will have to pass. The
+  evaluation protocol is pre-registered in [`configs/evaluation.yaml`](configs/evaluation.yaml):
+  development dates, a sealed one-year holdout that code refuses to replay unless a strategy
+  opens it (once), and the gate's settings.
 
 ## Results so far
 
@@ -128,6 +131,7 @@ count. It is still a search to anyone who picks its best cell, and is shown as s
 | Outcomes visible before they happened | A trade is visible from its exit-day close, an outcome after its re-entry window | `tests/attribute/test_trades.py`, `tests/replay/test_replay.py` |
 | A result that depends on later days | Replaying to day N gives the same decisions as replaying further | `tests/replay/test_replay.py` |
 | Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
+| Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
 
 On the real store, `asof market audit` runs 33 data checks with reviewed exceptions, and
 hand-checked reference histories (renames, ticker reuse, splits) are asserted as tests.
