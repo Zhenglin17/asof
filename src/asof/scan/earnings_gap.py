@@ -8,7 +8,7 @@ release at 07:00 the same day. Everything is read through the visible_* function
 
 import re
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -16,18 +16,19 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
+import pyarrow as pa
 from sqlmodel import Session
 
 from asof.features.daily import daily_features
 from asof.store.market import visible_bars, visible_master, visible_sessions, visible_splits
 from asof.store.models import Document, Entity
 from asof.store.queries import visible_documents
+from asof.store.universe import filing_cik
 from asof.strategy import StrategyConfig
 
 ET = ZoneInfo("America/New_York")
 OPEN = time(9, 30)
 _ITEMS = re.compile(r"^\d+\.\d+(,\d+\.\d+)*$")
-_ARCHIVE_CIK = re.compile(r"/Archives/edgar/data/(\d+)/")
 
 
 @dataclass(frozen=True)
@@ -94,14 +95,6 @@ def _earnings_events(
         ):
             events[doc.entity_id].append(doc)
     return events
-
-
-def filing_cik(url: str | None) -> int | None:
-    """The CIK an EDGAR filing was made under, from its archive URL
-    (".../Archives/edgar/data/<cik>/<accession>/<file>"). A company's CIK can change (XOM's did
-    on 2026-07-16), so the filing's own CIK, not today's, links it to a security."""
-    match = _ARCHIVE_CIK.search(url or "")
-    return int(match.group(1)) if match else None
 
 
 def _security_of(
@@ -223,3 +216,92 @@ def scan(
             )
         )
     return found
+
+
+BarsAt = Callable[..., pa.Table]
+
+
+def pool(
+    session: Session,
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    as_of: datetime,
+    cfg: StrategyConfig,
+    *,
+    sessions: Sequence[date] | None = None,
+    bars_at: BarsAt | None = None,
+) -> frozenset[str]:
+    """What ``scan`` could have returned at ``as_of`` if every company had just released
+    earnings: the random-entry null draws from this. Same rules minus the signal: any visible
+    8-K makes a company a filer, one security per company as ``_security_of`` picks it, no split
+    in the scan window, a bar on the previous session, today's close and the average dollar
+    volume before today over the thresholds. No gap, rvol or earnings-item test.
+
+    ``sessions`` and ``bars_at(as_of, start=...)`` (``visible_bars`` semantics, e.g.
+    ``BarCache.bars_at``) only spare the caller re-reading the store each evening."""
+    if as_of.tzinfo is None:
+        raise ValueError("as_of must be timezone-aware")
+    if sessions is None:
+        sessions = visible_sessions(con, root, "1Day", as_of)
+    sessions = [d for d in sessions if datetime.combine(d, time(20), tzinfo=ET) <= as_of]
+    if not sessions:
+        return frozenset()
+    today = sessions[-1]
+    docs: dict[int, list[Document]] = defaultdict(list)
+    for doc in visible_documents(session, as_of, doc_type="8-K"):
+        if doc.entity_id is not None:
+            docs[doc.entity_id].append(doc)
+    if not docs:
+        return frozenset()
+
+    master = visible_master(con, root, as_of).to_pylist()
+    chosen: dict[str, list[str]] = {}
+    for entity_id, filed in sorted(docs.items()):
+        entity = session.get(Entity, entity_id)
+        if entity is None:
+            continue
+        ciks = {cik for d in filed if (cik := filing_cik(d.url)) is not None}
+        if entity.cik is not None:
+            ciks.add(entity.cik)
+        resolved = _security_of(master, ciks, entity.ticker, today)
+        if resolved is not None:
+            chosen[resolved[0]] = resolved[1]
+    if not chosen:
+        return frozenset()
+
+    first = sessions[max(0, len(sessions) - 1 - lookback_sessions(cfg))]
+    symbols = sorted({s for symbols in chosen.values() for s in symbols})
+    split = {
+        r["symbol"]
+        for r in visible_splits(con, root, as_of, symbols).to_pylist()
+        if first <= r["ex_date"] <= today
+    }
+    candidates = {sid for sid, symbols in chosen.items() if not split & set(symbols)}
+    start = datetime.combine(first, time(0), tzinfo=ET)
+    if bars_at is not None:
+        bars = bars_at(as_of, start=start)
+    else:
+        bars = visible_bars(con, root, "1Day", as_of, symbols=symbols, start=start)
+    frame = bars.to_pandas()
+    frame = frame[frame["security_id"].isin(candidates)]
+    if frame.empty:
+        return frozenset()
+    scan_cfg = cfg.scan
+    features = daily_features(
+        frame,
+        atr_days=scan_cfg.atr_days,
+        rvol_days=scan_cfg.rvol_days,
+        dollar_volume_days=scan_cfg.dollar_volume_days,
+    )
+    # As scan(): without a bar on the previous session, prev_close would be an older close.
+    if len(sessions) < 2:
+        return frozenset()
+    traded = set(features.loc[features["session_date"] == sessions[-2], "security_id"])
+    row = features[
+        (features["session_date"] == today) & features["security_id"].isin(sorted(traded))
+    ]
+    keep = row[
+        (row["close"] >= scan_cfg.min_price)
+        & (row["avg_dollar_volume"] >= scan_cfg.min_avg_dollar_volume - 1e-6)
+    ]
+    return frozenset(str(sid) for sid in keep["security_id"])

@@ -25,6 +25,7 @@ Symbols of one security are summed (VTIQ and NKLA across the rename window) and 
 the symbol of the latest visible segment.
 """
 
+import re
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -34,9 +35,12 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+from sqlmodel import Session, col, select
 
 from asof.ingest.instrument_class import CLASS_FILE
 from asof.store.market import visible_bars, visible_master, visible_sessions
+from asof.store.models import Entity
+from asof.store.queries import visible_documents
 
 ET = ZoneInfo("America/New_York")
 
@@ -207,3 +211,42 @@ def tier_union(
     if not blocks:
         return _empty()
     return pa.concat_tables(blocks)
+
+
+_ARCHIVE_CIK = re.compile(r"/Archives/edgar/data/(\d+)/")
+
+
+def filing_cik(url: str | None) -> int | None:
+    """The CIK an EDGAR filing was made under, from its archive URL
+    (".../Archives/edgar/data/<cik>/<accession>/<file>"). A company's CIK can change (XOM's did
+    on 2026-07-16), so the filing's own CIK, not today's, links it to a security."""
+    match = _ARCHIVE_CIK.search(url or "")
+    return int(match.group(1)) if match else None
+
+
+def filer_securities(
+    session: Session,
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    as_of: datetime,
+    doc_type: str = "8-K",
+) -> frozenset[str]:
+    """Securities whose company had filed a ``doc_type`` by ``as_of``: the candidate pool of a
+    strategy whose universe is ``watchlist_with_documents``. Both sides are point in time: the
+    filing must be visible and the security's CIK link known (``visible_master`` hides a CIK
+    before its ``cik_available_at``). A company is matched by the CIK each filing was made
+    under as well as its CIK today: XOM's segments before 2026-07-16 carry 34088, the entity
+    2115436."""
+    as_of_utc = _aware_utc(as_of, "as_of")
+    docs = [
+        d
+        for d in visible_documents(session, as_of_utc, doc_type=doc_type)
+        if d.entity_id is not None
+    ]
+    if not docs:
+        return frozenset()
+    ciks = {cik for d in docs if (cik := filing_cik(d.url)) is not None}
+    stmt = select(Entity.cik).where(col(Entity.id).in_(sorted({d.entity_id for d in docs})))
+    ciks |= {c for c in session.exec(stmt).all() if c is not None}
+    master = visible_master(con, root, as_of_utc).to_pylist()
+    return frozenset(r["security_id"] for r in master if r["cik"] in ciks)

@@ -22,7 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
-from sqlmodel import Session, col, select
+from sqlmodel import Session
 
 from asof.attribute import attribute_decision
 from asof.evolve.holdout import check_window, record_opening
@@ -46,13 +46,12 @@ from asof.store.models import (
     DecisionCitation,
     DecisionKind,
     Direction,
-    Entity,
     EvidenceKind,
     Run,
     RunMode,
     Trade,
 )
-from asof.store.queries import visible_documents
+from asof.store.universe import filer_securities
 from asof.strategy import StrategyConfig, apply_overrides, load_strategy, register_version
 
 ET = ZoneInfo("America/New_York")
@@ -371,11 +370,8 @@ def _universe_symbols(
 ) -> list[str]:
     """Every symbol of every security whose company filed an 8-K by ``as_of``: what the
     simulator may need. Only decides what the cache loads, never what a step may see."""
-    entity_ids = {d.entity_id for d in visible_documents(session, as_of, doc_type="8-K")}
-    stmt = select(Entity.cik).where(col(Entity.id).in_([i for i in entity_ids if i is not None]))
-    ciks = {c for c in session.exec(stmt).all() if c is not None}
+    securities = filer_securities(session, con, root, as_of)
     master = visible_master(con, root, as_of).to_pylist()
-    securities = {r["security_id"] for r in master if r["cik"] in ciks}
     return sorted({r["symbol"] for r in master if r["security_id"] in securities})
 
 

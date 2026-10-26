@@ -80,7 +80,10 @@ flowchart TB
   development dates, a sealed one-year holdout that code refuses to replay unless a strategy
   opens it (once), and the gate's settings. Results are compared with SPY and QQQ (dividends
   reinvested) and with a mechanical basket: each month, the 10 largest stocks by recent
-  dollar volume, equal weight. [Details](docs/commands.md#benchmarks)
+  dollar volume, equal weight. [Details](docs/commands.md#benchmarks) Each trade is also
+  tested against random entries: the same dates and exits with a security drawn from what the
+  scanner could have bought that evening without its signal, corrected for every variant
+  tried. [Details](docs/commands.md#random-entry-null)
 
 ## Results so far
 
@@ -115,7 +118,10 @@ Take-all over 2023-01-03 to 2026-10-16: 643 candidates, 547 traded, **+62.4% aga
 +98.6%**, max drawdown 10.4% on closed trades, and the ten best trades made 77% of the profit.
 The strategy trailed buy-and-hold, and even that figure is an upper bound: the watchlist was
 picked with hindsight and SPY doubled over the period. SPY is fully invested while the
-strategy holds cash most of the time, so the returns are not risk-matched.
+strategy holds cash most of the time, so the returns are not risk-matched. Against random
+entries from the same candidate pool on the same days, its 632 closed legs averaged +1.73%
+where random picks averaged +1.54%: an edge of +0.19% a leg, p = 0.33. Most of the per-trade
+return came from the market and the watchlist, not from the gap.
 
 The grid ran on throwaway copies of the database, so it adds nothing to the recorded attempt
 count. It is still a search to anyone who picks its best cell, and is shown as such.

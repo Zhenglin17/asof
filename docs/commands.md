@@ -58,6 +58,8 @@ The [README](../README.md) is the short tour.
       sealed holdout are refused unless the strategy opens it, once
 - [x] Benchmarks: SPY and QQQ with dividends reinvested and a monthly top-10 dollar-volume
       basket, members picked point in time (`asof benchmark`)
+- [x] Random-entry null: each replay leg against random picks from the scanner's pool on
+      the same dates, max-statistic correction across runs (`asof gate null`)
 - [ ] Strategy evolution: permutation gate, approval
 
 ## Development
@@ -544,6 +546,37 @@ marked with bars and actions as known at the window's end. Over development date
 to 2025-06-30): SPY +107.3%, QQQ +166.4%, the basket +265.5% with a 50.5% drawdown. The
 basket holds cash in January 2020 (the store starts 2020-01-02, so there is no history to
 rank), and GOOG and GOOGL can both enter.
+
+### Random-entry null
+
+```bash
+uv run asof gate null --run 1                 # one replay against random entries
+uv run asof gate null --run 2 --run 3         # several runs form one family
+uv run asof gate null --run 1 --current-strategy  # the run's version is gone: use today's files
+```
+
+Would picking securities at random have done as well? Every closed leg of a run keeps its
+entry and exit sessions and whether it left at an open or a close; its security is replaced by
+one drawn uniformly from what the scanner could have returned the evening before entry without
+its signal: for the earnings gap, one security per company with an 8-K on file, a bar on the
+previous session, no split in the scan window, a close of at least `scan.min_price` and an
+average dollar volume of at least `scan.min_avg_dollar_volume` (the gap and volume tests are
+left out). The drawn leg buys the entry open and sells the exit open or close, with the same
+slippage and the splits in between. 1,000 draws (the protocol's `permutations`) give what luck
+earns per leg in the same market and pool. The pool is read as of each entry's previous
+evening; prices are outcomes and are read as of the last exit.
+
+Draws are keyed by the leg (security, entry session, leg number), so two runs holding the same
+leg draw the same securities. With several runs, `p adj` is the share of draws in which the
+best run's standardized random mean reached this run's: trying more variants raises the bar,
+and near-duplicates raise it little. The run's strategy files must hash to the version it
+replayed; `--current-strategy` overrides that check.
+
+Over 2023-01-03 to 2026-10-16 (run 1, take-all): 632 legs, +1.73% a leg, random picks +1.54%,
+excess +0.19%, p = 0.33. Known gaps: a hard stop fills at its stop price but a random leg exits
+at the close (repricing the real legs the null's way moves them +0.10% a leg, against the
+strategy); random legs have no guard against an unrecorded split (48 of 109,743 pool legs on
+run 1 cross one).
 
 ## Layout
 
