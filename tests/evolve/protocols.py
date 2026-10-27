@@ -26,6 +26,8 @@ REAL: dict[str, Any] = {
         "basket": {"size": 10, "lookback_sessions": 60, "rebalance": "monthly"},
     },
     "comparison": {"risk_free_rate": 0.0, "high_exposure": 0.70},
+    "walk_forward": {"train_months": 24, "test_months": 6, "min_positive": 4},
+    "mde_power": 0.80,
 }
 
 

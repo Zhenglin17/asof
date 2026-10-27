@@ -9,8 +9,10 @@ API under test (asof.evolve.protocol):
     Basket(size: int, lookback_sessions: int, rebalance: Literal["monthly"]);
     Benchmarks(symbols: list[str], basket: Basket);
     Comparison(risk_free_rate: float >= 0, high_exposure: float in (0, 1]);
+    WalkForward(train_months: int >= 1, test_months: int >= 1, min_positive: int >= 1);
     EvaluationProtocol(dev, holdout, clean_after, seen_before_protocol, attempt_budget, alpha,
-                       permutations, thin_edge, benchmarks, comparison)
+                       permutations, thin_edge, benchmarks, comparison, walk_forward,
+                       mde_power: float in (0, 1))
                        -- every key required, extra keys forbidden everywhere
     load_protocol(path: Path) -> EvaluationProtocol
     DEFAULT_PROTOCOL_PATH: <repo root>/configs/evaluation.yaml, resolved from the package file
@@ -78,6 +80,9 @@ def test_load_protocol_reads_every_field(tmp_path: Path) -> None:
     assert (basket.size, basket.lookback_sessions, basket.rebalance) == (10, 60, "monthly")
     assert loaded.comparison.risk_free_rate == 0.0
     assert loaded.comparison.high_exposure == pytest.approx(0.70)
+    wf = loaded.walk_forward
+    assert (wf.train_months, wf.test_months, wf.min_positive) == (24, 6, 4)
+    assert loaded.mde_power == pytest.approx(0.80)
 
 
 def test_dates_written_as_quoted_strings_still_load_as_dates(tmp_path: Path) -> None:
@@ -98,6 +103,10 @@ def test_the_committed_default_file_parses_with_the_registered_holdout() -> None
     # The comparison block was appended after registration; its values are part of the protocol.
     assert loaded.comparison.risk_free_rate == 0.0
     assert loaded.comparison.high_exposure == pytest.approx(0.70)
+    # So were the walk-forward windows and the power the MDE is reported at.
+    wf = loaded.walk_forward
+    assert (wf.train_months, wf.test_months, wf.min_positive) == (24, 6, 4)
+    assert loaded.mde_power == pytest.approx(0.80)
 
 
 def test_default_path_is_the_repo_config_not_the_working_directory(
@@ -303,3 +312,67 @@ def test_benchmarks_need_at_least_one_symbol() -> None:
 def test_a_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_protocol(tmp_path / "nope.yaml")
+
+
+# =============================================================================================
+# boundaries: walk-forward and MDE power
+# =============================================================================================
+
+
+@pytest.mark.parametrize(
+    "walk_forward",
+    [
+        {"train_months": 0, "test_months": 6, "min_positive": 4},
+        {"train_months": 24, "test_months": 0, "min_positive": 4},
+        {"train_months": 24, "test_months": 6, "min_positive": 0},
+        {"train_months": 2.5, "test_months": 6, "min_positive": 4},
+    ],
+    ids=["train_0", "test_0", "min_positive_0", "train_fractional"],
+)
+def test_out_of_range_walk_forward_numbers_are_refused(walk_forward: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        protocol(walk_forward=walk_forward)
+
+
+@pytest.mark.parametrize("power", [0.0, 1.0, -0.2, 1.2], ids=["0", "1", "negative", "above_1"])
+def test_an_mde_power_outside_zero_one_is_refused(power: float) -> None:
+    with pytest.raises(ValidationError):
+        protocol(mde_power=power)
+
+
+def test_smallest_walk_forward_and_an_mde_power_inside_zero_one_load() -> None:
+    p = protocol(walk_forward={"train_months": 1, "test_months": 1, "min_positive": 1},
+                 mde_power=0.5)  # fmt: skip
+    assert p.walk_forward.model_dump() == {"train_months": 1, "test_months": 1, "min_positive": 1}
+    assert p.mde_power == 0.5
+
+
+@pytest.mark.parametrize("key", ["walk_forward", "mde_power"])
+def test_a_missing_walk_forward_or_mde_power_is_refused(tmp_path: Path, key: str) -> None:
+    content = raw()
+    del content[key]
+    with pytest.raises(ValidationError):
+        load_protocol(write(tmp_path, content))
+
+
+@pytest.mark.parametrize(
+    "walk_forward",
+    [
+        {"train_months": 24, "test_months": 6},
+        {"train_months": 24, "min_positive": 4},
+        {"test_months": 6, "min_positive": 4},
+        {"train_month": 24, "test_months": 6, "min_positive": 4},
+        {"train_months": 24, "test_months": 6, "min_positive": 4, "step_months": 6},
+    ],
+    ids=["no_min_positive", "no_test_months", "no_train_months", "misspelled", "unknown_key"],
+)
+def test_a_missing_or_misspelled_walk_forward_key_is_refused(walk_forward: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        protocol(walk_forward=walk_forward)
+
+
+def test_a_misspelled_mde_power_is_refused(tmp_path: Path) -> None:
+    content = raw()
+    content["mde_powr"] = content.pop("mde_power")
+    with pytest.raises(ValidationError):
+        load_protocol(write(tmp_path, content))

@@ -27,6 +27,7 @@ from asof.store.models import (
     Document,
     EquityDaily,
     Event,
+    Run,
     StrategyVersion,
     Trade,
 )
@@ -344,6 +345,13 @@ def visible_equity(session: Session, as_of: datetime, *, run_id: int) -> list[Eq
         .where(col(EquityDaily.run_id) == run_id, col(EquityDaily.available_at) <= as_of)
         .order_by(col(EquityDaily.session_date))
     )
+    return list(session.exec(stmt).all())
+
+
+def runs_of_strategy(session: Session, strategy_id: str | None) -> list[Run]:
+    """A strategy's runs: the research record of what was tried, like Source and Entity an
+    identity lookup rather than information that becomes public, so it takes no as_of."""
+    stmt = select(Run).where(col(Run.strategy_id) == strategy_id).order_by(col(Run.id))
     return list(session.exec(stmt).all())
 
 

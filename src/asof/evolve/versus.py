@@ -5,6 +5,7 @@ they are only reported. SPY is the buy-and-hold of the protocol's first symbol, 
 last curve.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -15,7 +16,7 @@ from sqlmodel import Session
 from asof.evolve.benchmark import benchmarks
 from asof.evolve.metrics import CurveMetrics, curve_metrics
 from asof.evolve.protocol import EvaluationProtocol
-from asof.store.models import Run
+from asof.store.models import EquityDaily, Run
 from asof.store.queries import visible_equity
 
 
@@ -33,27 +34,41 @@ class Versus:
     beats_spy_and_basket_total: bool
 
 
+def equity_slice(
+    rows: Sequence[EquityDaily], start: date, end: date
+) -> tuple[list[EquityDaily], float]:
+    """The rows within [start, end] and the equity just before the first of them: the previous
+    row's when the run had one, else the run's initial equity."""
+    i = next((k for k, r in enumerate(rows) if r.session_date >= start), len(rows))
+    kept = [r for r in rows[i:] if r.session_date <= end]
+    if i > 0:
+        return kept, rows[i - 1].equity
+    first = rows[0] if rows else None
+    return kept, (first.equity - first.realized - first.unrealized) if first else 0.0
+
+
 def compare_run(
     session: Session,
     con: duckdb.DuckDBPyConnection,
     root: Path,
     run_id: int,
     protocol: EvaluationProtocol,
+    *,
+    window: tuple[date, date] | None = None,
 ) -> Versus:
+    """``window`` keeps the run's rows within [first, last]; None is the whole run."""
     run = session.get(Run, run_id)
     if run is None:
         raise LookupError(f"no run {run_id}")
-    rows = visible_equity(session, run.as_of, run_id=run_id)
-    if not rows:
+    every = visible_equity(session, run.as_of, run_id=run_id)
+    if not every:
         raise LookupError(f"run {run_id} has no daily equity; replay it again to record one")
+    rows, base = equity_slice(every, *(window or (date.min, date.max)))
+    if not rows:
+        raise LookupError(f"run {run_id} has no daily equity in the window {window}")
     start, end = rows[0].session_date, rows[-1].session_date
     rf = protocol.comparison.risk_free_rate
-    first = rows[0]
-    strategy = curve_metrics(
-        [r.equity for r in rows],
-        base=first.equity - first.realized - first.unrealized,
-        risk_free_rate=rf,
-    )
+    strategy = curve_metrics([r.equity for r in rows], base=base, risk_free_rate=rf)
     curves = benchmarks(con, root, protocol, start, end)
     days = tuple(r.session_date for r in rows)
     for c in curves:

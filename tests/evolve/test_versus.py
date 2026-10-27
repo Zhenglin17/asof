@@ -19,6 +19,11 @@ API under test (asof.evolve.versus, new module):
         drawdown_not_worse_than_basket = strategy max_drawdown <= basket's
         sharpe_at_least_best = strategy sharpe >= max(SPY's, basket's); False if any is None
         beats_spy_and_basket_total = strategy total_return > SPY's and > basket's
+    compare_run(..., window=(first, last)) keeps only rows with first <= session_date <= last;
+        start, end are then the first and last kept rows. The base is the equity of the row just
+        before the first kept one when there is one (the slice starts after the run's first
+        row), else rows[0].equity - realized - unrealized as above. No row in the window ->
+        LookupError, like a run without rows. window=None (the default) is the whole run.
     Versus(run_id, start, end, strategy, benchmarks, mean_exposure, high_exposure_share,
            drawdown_not_worse_than_basket, sharpe_at_least_best, beats_spy_and_basket_total)
     "SPY" = the buy-and-hold of protocol.benchmarks.symbols[0]; the basket = the last curve,
@@ -388,3 +393,99 @@ def test_market_data_after_the_runs_last_session_changes_nothing(
 
     assert seen.end == end
     same_versus(seen, clean)
+
+
+# =============================================================================================
+# window
+# =============================================================================================
+
+
+def test_a_window_inside_the_run_starts_from_the_previous_rows_equity(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
+) -> None:
+    root = world(tmp_path, override=DIP)
+    p = settings()
+    run_id = new_run(session)
+    path = strong_path()
+    add_rows(session, run_id, WINDOW, path)
+    first, last = WINDOW[10], WINDOW[29]
+
+    v = compare_run(session, con, root, run_id, p, window=(first, last))
+
+    assert (v.start, v.end) == (first, last)
+    # Base = the 2025-02-14 row's equity: the +1% earned on 02-18 (WINDOW[10]) counts; the
+    # account's starting 100,000 would add the ten sessions before the window.
+    same(v.strategy, curve_metrics(path[10:30], base=path[9]))
+    curves = benchmarks(con, root, p, first, last)
+    assert [label for label, _ in v.benchmarks] == [c.label for c in curves]
+    for (_, got), curve in zip(v.benchmarks, curves, strict=True):
+        same(got, curve_metrics(curve.equity, base=1.0))
+
+
+def test_a_window_wider_than_the_run_is_the_whole_run(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
+) -> None:
+    root = world(tmp_path, override=DIP)
+    run_id = new_run(session)
+    days = WINDOW[5:15]
+    add_rows(
+        session, run_id, days, [100_500.0, *[101_000.0] * 8, 110_000.0], first_unrealized=300.0
+    )
+
+    wide = compare_run(
+        session, con, root, run_id, settings(), window=(date(2025, 1, 1), date(2025, 12, 31))
+    )
+    whole = compare_run(session, con, root, run_id, settings())
+
+    same_versus(wide, whole)
+    assert wide.strategy.total_return == pytest.approx(0.10)  # base 100,000, not 100,500
+
+
+def test_a_window_starting_before_the_run_uses_the_initial_equity_and_ends_on_its_last_day(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
+) -> None:
+    root = world(tmp_path, override=DIP)
+    run_id = new_run(session)
+    path = strong_path()
+    add_rows(session, run_id, WINDOW, path)
+
+    v = compare_run(session, con, root, run_id, settings(), window=(date(2025, 1, 1), WINDOW[19]))
+
+    assert (v.start, v.end) == (WINDOW[0], WINDOW[19])
+    same(v.strategy, curve_metrics(path[:20], base=INITIAL))
+
+
+def test_a_window_without_rows_raises_lookup_error(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
+) -> None:
+    root = world(tmp_path, override=DIP)
+    run_id = new_run(session)
+    add_rows(session, run_id, WINDOW[:10], strong_path()[:10])
+
+    with pytest.raises(LookupError):
+        compare_run(session, con, root, run_id, settings(), window=(WINDOW[20], WINDOW[30]))
+
+
+def test_rows_and_market_data_after_the_window_change_nothing(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
+) -> None:
+    # Two runs share their rows up to 02-28; after it one doubles every day and SPY halves in
+    # the full store. Over a window ending 02-28 both must read like the cut store's.
+    end = date(2025, 2, 28)
+    n = len([d for d in WINDOW if d <= end])
+    later: dict[tuple[str, date], Ohlcv | None] = {
+        ("SPY", d): (50.0, 50.0, 10 * M) for d in SESSIONS if d > end
+    }
+    full = world(tmp_path / "full", override={**DIP, **later})
+    cut = world(tmp_path / "cut", override=DIP, through=end)
+    path = strong_path()
+    calm = new_run(session)
+    add_rows(session, calm, WINDOW, path)
+    wild = new_run(session)
+    add_rows(session, wild, WINDOW, path[:n] + [path[n - 1] * 2 ** (i + 1) for i in range(40 - n)])
+
+    clean = compare_run(session, con, cut, calm, settings(), window=(WINDOW[0], end))
+    for run_id in (calm, wild):
+        seen = compare_run(session, con, full, run_id, settings(), window=(WINDOW[0], end))
+        assert seen.end == end
+        same_versus(seen, Versus(**{**clean.__dict__, "run_id": run_id}))

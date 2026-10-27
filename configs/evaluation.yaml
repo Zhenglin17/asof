@@ -27,3 +27,9 @@ benchmarks:
 # run's own sessions: Sharpe on daily returns above this yearly rate (0: replays earn nothing on
 # idle cash), and the share of sessions with open positions >= high_exposure of equity.
 comparison: {risk_free_rate: 0.0, high_exposure: 0.70}
+# Appended 2026-10-26, before any gate verdict was reported. Walk-forward over dev: pick the
+# variant with the best Sharpe over train_months, score it over the next test_months (its legs'
+# mean against the same legs' random-entry mean), roll by test_months; min_positive of the
+# windows must be positive. mde_power: the power of the minimum detectable edge (report only).
+walk_forward: {train_months: 24, test_months: 6, min_positive: 4}
+mde_power: 0.80

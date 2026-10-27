@@ -85,7 +85,11 @@ flowchart TB
   scanner could have bought that evening without its signal, corrected for every variant
   tried. [Details](docs/commands.md#random-entry-null) Every replay records its account marked
   to market at each close, set against the same benchmarks on return, drawdown and Sharpe.
-  [Details](docs/commands.md#strategy-versus-benchmarks)
+  [Details](docs/commands.md#strategy-versus-benchmarks) The gate's verdict combines these
+  over development dates only: the random-entry test, walk-forward (a pick made on two years
+  must beat random entries on the next six months, in four of seven windows), a thin-edge check
+  (the edge must survive dropping the best three legs and an extra cost) and the benchmarks.
+  [Details](docs/commands.md#gate-verdict)
 
 ## Results so far
 
@@ -128,13 +132,17 @@ made 77% of the profit. Marked to market at every close:
 Benchmarks reinvest dividends. The strategy had 40% of its equity invested on average, so its
 smaller drawdown is the cash, not an edge; a Sharpe ratio does not change with leverage, and on
 it the strategy trails too, though with under four years of daily returns its standard error
-is about 0.65 and the gap is within it. By period the Sharpe ratio was 1.50 on development
+is about 0.5 and the gap to SPY is within it. By period the Sharpe ratio was 1.50 on development
 dates (SPY 1.35), 0.37 on the holdout's dates (SPY 1.68) and -0.07 after the model's cutoff
 (SPY 0.80). This strategy was replayed over the holdout before the protocol existed, so none of
 this is out of sample, and the watchlist was picked with hindsight. Against random
 entries from the same candidate pool on the same days, its 632 closed legs averaged +1.73%
 where random picks averaged +1.54%: an edge of +0.19% a leg, p = 0.33. Most of the per-trade
-return came from the market and the watchlist, not from the gap.
+return came from the market and the watchlist, not from the gap. The gate fails it on
+development dates (where filings start in 2023): +0.69% a leg over random entries, p = 0.11,
+below the +1.9% its 383 legs could detect, and all of it from three trades (QBTS, SMCI, DUOL);
+dropping them leaves 0.00%. This strategy was replayed over these dates before the protocol
+existed, so the protocol would not count a pass here anyway.
 
 The grid ran on throwaway copies of the database, so it adds nothing to the recorded attempt
 count. It is still a search to anyone who picks its best cell, and is shown as such.
@@ -176,7 +184,7 @@ hand-checked reference histories (renames, ticker reuse, splits) are asserted as
   differently. A training cutoff hides outcomes, not what the model knew about each company
   before it.
 - **Long only, gap-ups only.** Never tested in a falling or very volatile market.
-- **Not built yet:** minute bars, macro data, the evolution loop and its significance gate.
+- **Not built yet:** minute bars, macro data, the evolution loop (proposals and approval).
 
 ## Quickstart
 
@@ -213,7 +221,8 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] Fast loop: scanner, take-all and LLM judges, executor, ledger, attribution, replay report
 - [x] Demo page on GitHub Pages
 - [ ] Minute bars, XBRL facts, FRED
-- [ ] Strategy evolution: permutation gate, approval
+- [x] Significance gate: random entries, walk-forward, thin edge, benchmarks
+- [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).
 

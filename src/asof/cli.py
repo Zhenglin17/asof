@@ -20,6 +20,8 @@ from asof.demo.build import build
 from asof.evidence.retrieve import search
 from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
 from asof.evolve.benchmark import benchmarks
+from asof.evolve.gate import check as gate_verdict
+from asof.evolve.gate import render_report
 from asof.evolve.holdout import HoldoutError
 from asof.evolve.null import null_test
 from asof.evolve.protocol import load_protocol
@@ -130,7 +132,7 @@ from asof.store.universe import (
     month_starts,
     tier_union,
 )
-from asof.strategy import apply_overrides, content_hash, load_strategy
+from asof.strategy import StrategyConfig, apply_overrides, content_hash, load_strategy
 
 SEC_USER_AGENT_ENV = "ASOF_SEC_USER_AGENT"
 ALPACA_KEY_ENV = "ALPACA_API_KEY"
@@ -1799,6 +1801,43 @@ gate_app = typer.Typer(help="The evaluation gate (configs/evaluation.yaml).", no
 app.add_typer(gate_app, name="gate")
 
 
+def _family_config(
+    session: Session, runs: list[int], strategies_dir: Path, current_strategy: bool
+) -> StrategyConfig:
+    """The random-entry pool and slippage of a family of runs: their strategy files must still
+    be the versions they replayed (or ``current_strategy``), and agree on pool and slippage."""
+    cfgs = {}
+    for run_id in runs:
+        run = session.get(Run, run_id)
+        if run is None or run.strategy_id is None:
+            _fail(f"no replay run {run_id}")
+        version = (
+            session.get(StrategyVersion, run.strategy_version_id)
+            if run.strategy_version_id is not None
+            else None
+        )
+        overrides = version.summary.split(", ") if version and version.summary else []
+        path = strategies_dir / run.strategy_id
+        cfgs[run_id] = apply_overrides(load_strategy(path), overrides)
+        if version is None or content_hash(path, overrides) != version.content_hash:
+            if not current_strategy:
+                _fail(
+                    f"run {run_id}: {path} is no longer the version it replayed; "
+                    "--current-strategy uses today's files"
+                )
+            typer.echo(f"run {run_id}: using today's {path}", err=True)
+    settings = {
+        json.dumps(
+            [c.strategy.universe, c.scan.model_dump(), c.execute.fills.model_dump()],
+            sort_keys=True,
+        )
+        for c in cfgs.values()
+    }
+    if len(settings) != 1:
+        _fail("the runs differ in universe, scan thresholds or slippage")
+    return cfgs[runs[0]]
+
+
 @gate_app.command("null")
 def gate_null(
     runs: Annotated[
@@ -1832,36 +1871,7 @@ def gate_null(
     con = duckdb.connect()
     try:
         with Session(engine) as session:
-            cfgs = {}
-            for run_id in runs:
-                run = session.get(Run, run_id)
-                if run is None or run.strategy_id is None:
-                    _fail(f"no replay run {run_id}")
-                version = (
-                    session.get(StrategyVersion, run.strategy_version_id)
-                    if run.strategy_version_id is not None
-                    else None
-                )
-                overrides = version.summary.split(", ") if version and version.summary else []
-                path = strategies_dir / run.strategy_id
-                cfgs[run_id] = apply_overrides(load_strategy(path), overrides)
-                if version is None or content_hash(path, overrides) != version.content_hash:
-                    if not current_strategy:
-                        _fail(
-                            f"run {run_id}: {path} is no longer the version it replayed; "
-                            "--current-strategy uses today's files"
-                        )
-                    typer.echo(f"run {run_id}: using today's {path}", err=True)
-            settings = {
-                json.dumps(
-                    [c.strategy.universe, c.scan.model_dump(), c.execute.fills.model_dump()],
-                    sort_keys=True,
-                )
-                for c in cfgs.values()
-            }
-            if len(settings) != 1:
-                _fail("the runs differ in universe, scan thresholds or slippage")
-            cfg = cfgs[runs[0]]
+            cfg = _family_config(session, runs, strategies_dir, current_strategy)
             try:
                 results = null_test(
                     session, con, root, runs, cfg=cfg,
@@ -1879,6 +1889,70 @@ def gate_null(
             f"{run_id:>5} {r.trades:>5} {r.mean:>+8.2%} {r.null_mean:>+8.2%} {r.excess:>+8.2%} "
             f"{r.z:>6.2f} {r.p_raw:>7.4f} {r.p_adjusted:>7.4f}"
         )
+
+
+@gate_app.command("check")
+def gate_check(
+    runs: Annotated[
+        list[int], typer.Option("--run", help="A replay run; several runs form one family.")
+    ],
+    permutations: Annotated[
+        int | None, typer.Option("--permutations", help="Defaults to the protocol's.")
+    ] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 0,
+    current_strategy: Annotated[
+        bool,
+        typer.Option(
+            "--current-strategy",
+            help="Use today's strategy files for runs replayed under another version.",
+        ),
+    ] = False,
+    strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+    report: Annotated[
+        Path | None,
+        typer.Option("--report", help="Defaults to <data-dir>/reports/gate-<runs>.md."),
+    ] = None,
+) -> None:
+    """The gate's verdict on a family of runs over the protocol's development dates: random
+    entries with the max-statistic correction, walk-forward, thin edge and the benchmarks; the
+    minimum detectable edge is reported. Exit 0 pass, 2 fail."""
+    base = data_dir or default_data_dir()
+    root = _market_root(data_dir)
+    engine = make_engine(db or default_db_path())
+    init_db(engine)
+    try:
+        protocol = load_protocol()
+    except ValueError as error:  # a pydantic ValidationError is a ValueError
+        _fail(f"configs/evaluation.yaml: {error}")
+    con = duckdb.connect()
+    try:
+        with Session(engine) as session:
+            cfg = _family_config(session, runs, strategies_dir, current_strategy)
+            try:
+                result = gate_verdict(
+                    session, con, root, runs, cfg=cfg, protocol=protocol,
+                    permutations=permutations or protocol.permutations, seed=seed,
+                )  # fmt: skip
+            except (LookupError, ValueError) as error:
+                _fail(str(error))
+            text = render_report(session, result, protocol)
+    finally:
+        con.close()
+        engine.dispose()
+    path = report or base / "reports" / f"gate-{'-'.join(str(r) for r in runs)}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    verdict = "pass" if result.passed else "fail: " + ", ".join(result.reasons)
+    typer.echo(f"gate {verdict} (candidate run {result.candidate})")
+    typer.echo(f"report {path}")
+    if not result.passed:
+        raise typer.Exit(2)
 
 
 @gate_app.command("compare")

@@ -49,6 +49,12 @@ class Comparison(_Strict):
     high_exposure: float = Field(gt=0, le=1)  # report the share of sessions at least this invested
 
 
+class WalkForward(_Strict):
+    train_months: int = Field(ge=1)  # pick the best variant over this many months
+    test_months: int = Field(ge=1)  # then score the pick over the next this many
+    min_positive: int = Field(ge=1)  # test windows whose pick beat random entries
+
+
 class EvaluationProtocol(_Strict):
     dev: Window
     holdout: Window
@@ -60,6 +66,8 @@ class EvaluationProtocol(_Strict):
     thin_edge: ThinEdge
     benchmarks: Benchmarks
     comparison: Comparison
+    walk_forward: WalkForward
+    mde_power: float = Field(gt=0, lt=1)
 
     @model_validator(mode="after")
     def _in_order(self) -> Self:
