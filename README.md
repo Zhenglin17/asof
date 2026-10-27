@@ -83,7 +83,9 @@ flowchart TB
   dollar volume, equal weight. [Details](docs/commands.md#benchmarks) Each trade is also
   tested against random entries: the same dates and exits with a security drawn from what the
   scanner could have bought that evening without its signal, corrected for every variant
-  tried. [Details](docs/commands.md#random-entry-null)
+  tried. [Details](docs/commands.md#random-entry-null) Every replay records its account marked
+  to market at each close, set against the same benchmarks on return, drawdown and Sharpe.
+  [Details](docs/commands.md#strategy-versus-benchmarks)
 
 ## Results so far
 
@@ -114,11 +116,22 @@ distinguishable from noise.
 **51 candidates in one market regime cannot tell whether the judge helps**; what this shows is
 the pipeline running end to end with every decision traceable to the passage it rests on.
 
-Take-all over 2023-01-03 to 2026-10-16: 643 candidates, 547 traded, **+62.4% against SPY's
-+98.6%**, max drawdown 10.4% on closed trades, and the ten best trades made 77% of the profit.
-The strategy trailed buy-and-hold, and even that figure is an upper bound: the watchlist was
-picked with hindsight and SPY doubled over the period. SPY is fully invested while the
-strategy holds cash most of the time, so the returns are not risk-matched. Against random
+Take-all over 2023-01-03 to 2026-10-16: 643 candidates, 547 traded, and the ten best trades
+made 77% of the profit. Marked to market at every close:
+
+|                       | Take-all | SPY     | QQQ     | Top-10 basket |
+|-----------------------|---------:|--------:|--------:|--------------:|
+| Total return          | +63.2%   | +107.7% | +169.6% | +417.7%       |
+| Max drawdown          | 11.0%    | 18.8%   | 22.8%   | 29.5%         |
+| Sharpe (daily, rf 0)  | 1.08     | 1.38    | 1.41    | 1.59          |
+
+Benchmarks reinvest dividends. The strategy had 40% of its equity invested on average, so its
+smaller drawdown is the cash, not an edge; a Sharpe ratio does not change with leverage, and on
+it the strategy trails too, though with under four years of daily returns its standard error
+is about 0.65 and the gap is within it. By period the Sharpe ratio was 1.50 on development
+dates (SPY 1.35), 0.37 on the holdout's dates (SPY 1.68) and -0.07 after the model's cutoff
+(SPY 0.80). This strategy was replayed over the holdout before the protocol existed, so none of
+this is out of sample, and the watchlist was picked with hindsight. Against random
 entries from the same candidate pool on the same days, its 632 closed legs averaged +1.73%
 where random picks averaged +1.54%: an edge of +0.19% a leg, p = 0.33. Most of the per-trade
 return came from the market and the watchlist, not from the gap.
@@ -152,10 +165,11 @@ hand-checked reference histories (renames, ticker reuse, splits) are asserted as
   under-represented.
 - **Daily bars, simple fills.** Within a day the worst order of high and low is assumed;
   fills pay a flat 5 bps of slippage and no commission.
-- **Closed trades only.** Return and drawdown move when a trade closes; open positions are not
-  marked to market, which understates drawdown.
-- **Price-only benchmark.** SPY without dividends (about 1-1.5% a year), and no interest on the
-  strategy's idle cash.
+- **Closed trades in the replay report.** Its return and drawdown move when a trade closes and
+  its SPY is price only; the comparison above marks open positions daily against
+  total-return benchmarks.
+- **No income for the strategy.** Idle cash earns no interest and dividends on held stocks are
+  not credited; both count against it.
 - **Vendor history.** A few identity facts the data vendor rewrote after the fact cannot be
   dated; they are listed in a baseline that may only shrink.
 - **One model, one prompt.** Answers are cached; another model or prompt may decide

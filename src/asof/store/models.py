@@ -372,6 +372,23 @@ class Trade(_Table, table=True):
     available_at: datetime = Field(sa_type=UTCDateTime, index=True)
 
 
+class EquityDaily(_Table, table=True):
+    """A replay's account marked to market at one session's close: open positions at that close,
+    pending orders not counted. ``available_at`` is the 20:00 New York close, as for Trade."""
+
+    __table_args__ = (UniqueConstraint("run_id", "session_date"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="run.id", index=True)
+    session_date: date
+    equity: float  # initial equity + realized + unrealized
+    realized: float  # cumulative pnl of closed legs
+    unrealized: float
+    gross_exposure: float  # shares x close of open positions; unlike the sizer's, no orders
+    open_positions: int
+    available_at: datetime = Field(sa_type=UTCDateTime, index=True)
+
+
 class StrategyVersion(_Table, table=True):
     __table_args__ = (
         UniqueConstraint("strategy_id", "content_hash"),

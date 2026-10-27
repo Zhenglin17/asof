@@ -23,6 +23,7 @@ from asof.evolve.benchmark import benchmarks
 from asof.evolve.holdout import HoldoutError
 from asof.evolve.null import null_test
 from asof.evolve.protocol import load_protocol
+from asof.evolve.versus import compare_run
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
 from asof.ingest.bar_imports import import_bars, load_bar_imports
 from asof.ingest.bars import ET, Partition, backfill, windows_for_requests
@@ -1878,6 +1879,57 @@ def gate_null(
             f"{run_id:>5} {r.trades:>5} {r.mean:>+8.2%} {r.null_mean:>+8.2%} {r.excess:>+8.2%} "
             f"{r.z:>6.2f} {r.p_raw:>7.4f} {r.p_adjusted:>7.4f}"
         )
+
+
+@gate_app.command("compare")
+def gate_compare(
+    run_id: Annotated[int, typer.Option("--run", help="A replay run with daily equity.")],
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """A run's daily marked-to-market equity against the protocol's benchmarks over the same
+    sessions: return, drawdown and Sharpe, how invested it was, and the walk-forward criteria
+    (reported only, not a verdict)."""
+    root = _market_root(data_dir)
+    engine = make_engine(db or default_db_path())
+    init_db(engine)
+    con = duckdb.connect()
+    protocol = load_protocol()
+    try:
+        with Session(engine) as session:
+            v = compare_run(session, con, root, run_id, protocol)
+    except (LookupError, ValueError) as error:
+        _fail(str(error))
+    finally:
+        con.close()
+        engine.dispose()
+
+    def sharpe(value: float | None) -> str:
+        return f"{value:>7.2f}" if value is not None else f"{'-':>7}"
+
+    typer.echo(f"run {v.run_id}: {v.start} .. {v.end}, {v.strategy.sessions} sessions")
+    rows = [("strategy", v.strategy), *v.benchmarks]
+    width = max(len(label) for label, _ in rows)
+    typer.echo(f"{'':<{width}} {'total':>9} {'annualized':>11} {'max dd':>8} {'sharpe':>7}")
+    for label, m in rows:
+        typer.echo(
+            f"{label:<{width}} {m.total_return:>+9.2%} {m.annualized_return:>+11.2%} "
+            f"{m.max_drawdown:>8.2%} {sharpe(m.sharpe)}"
+        )
+    high = protocol.comparison.high_exposure
+    typer.echo(f"mean exposure {v.mean_exposure:.1%}; high-exposure share (>= {high:.0%}) "
+               f"{v.high_exposure_share:.1%}")  # fmt: skip
+    spy = protocol.benchmarks.symbols[0]
+    for text, ok in [
+        ("max drawdown not worse than the basket's", v.drawdown_not_worse_than_basket),
+        (f"Sharpe at least the better of {spy} and the basket", v.sharpe_at_least_best),
+        (f"total return above both {spy} and the basket", v.beats_spy_and_basket_total),
+    ]:
+        typer.echo(f"  {'yes' if ok else 'no':<3} {text}")
 
 
 demo_app = typer.Typer(help="Data for the static demo page.", no_args_is_help=True)

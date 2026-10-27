@@ -25,6 +25,7 @@ from asof.store.models import (
     Chunk,
     Decision,
     Document,
+    EquityDaily,
     Event,
     StrategyVersion,
     Trade,
@@ -332,6 +333,17 @@ def visible_trades(
     if strategy_id is not None:
         stmt = stmt.where(col(Trade.strategy_id) == strategy_id)
     stmt = stmt.order_by(col(Trade.available_at), col(Trade.id))
+    return list(session.exec(stmt).all())
+
+
+def visible_equity(session: Session, as_of: datetime, *, run_id: int) -> list[EquityDaily]:
+    """A run's daily marks whose session had closed by as_of."""
+    _require_aware(as_of)
+    stmt = (
+        select(EquityDaily)
+        .where(col(EquityDaily.run_id) == run_id, col(EquityDaily.available_at) <= as_of)
+        .order_by(col(EquityDaily.session_date))
+    )
     return list(session.exec(stmt).all())
 
 

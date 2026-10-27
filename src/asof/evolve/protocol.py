@@ -40,8 +40,13 @@ class Basket(_Strict):
 
 
 class Benchmarks(_Strict):
-    symbols: list[str]
+    symbols: list[str] = Field(min_length=1)  # the first is the SPY of the comparison
     basket: Basket
+
+
+class Comparison(_Strict):
+    risk_free_rate: float = Field(ge=0)  # a year; replays earn nothing on idle cash
+    high_exposure: float = Field(gt=0, le=1)  # report the share of sessions at least this invested
 
 
 class EvaluationProtocol(_Strict):
@@ -54,6 +59,7 @@ class EvaluationProtocol(_Strict):
     permutations: int = Field(ge=100)
     thin_edge: ThinEdge
     benchmarks: Benchmarks
+    comparison: Comparison
 
     @model_validator(mode="after")
     def _in_order(self) -> Self:

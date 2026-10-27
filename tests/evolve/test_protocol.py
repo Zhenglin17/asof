@@ -8,8 +8,10 @@ API under test (asof.evolve.protocol):
     Window(start: date, end: date); ThinEdge(drop_top: int, extra_cost_bps: float);
     Basket(size: int, lookback_sessions: int, rebalance: Literal["monthly"]);
     Benchmarks(symbols: list[str], basket: Basket);
+    Comparison(risk_free_rate: float >= 0, high_exposure: float in (0, 1]);
     EvaluationProtocol(dev, holdout, clean_after, seen_before_protocol, attempt_budget, alpha,
-                       permutations, thin_edge, benchmarks)   -- extra keys forbidden everywhere
+                       permutations, thin_edge, benchmarks, comparison)
+                       -- every key required, extra keys forbidden everywhere
     load_protocol(path: Path) -> EvaluationProtocol
     DEFAULT_PROTOCOL_PATH: <repo root>/configs/evaluation.yaml, resolved from the package file
 
@@ -74,6 +76,8 @@ def test_load_protocol_reads_every_field(tmp_path: Path) -> None:
     assert loaded.benchmarks.symbols == ["SPY", "QQQ"]
     basket = loaded.benchmarks.basket
     assert (basket.size, basket.lookback_sessions, basket.rebalance) == (10, 60, "monthly")
+    assert loaded.comparison.risk_free_rate == 0.0
+    assert loaded.comparison.high_exposure == pytest.approx(0.70)
 
 
 def test_dates_written_as_quoted_strings_still_load_as_dates(tmp_path: Path) -> None:
@@ -91,6 +95,9 @@ def test_the_committed_default_file_parses_with_the_registered_holdout() -> None
     assert loaded.dev.end < loaded.holdout.start
     assert loaded.clean_after == date(2026, 7, 1)
     assert "earnings_gap" in loaded.seen_before_protocol
+    # The comparison block was appended after registration; its values are part of the protocol.
+    assert loaded.comparison.risk_free_rate == 0.0
+    assert loaded.comparison.high_exposure == pytest.approx(0.70)
 
 
 def test_default_path_is_the_repo_config_not_the_working_directory(
@@ -237,6 +244,60 @@ def test_a_missing_key_is_refused() -> None:
     del content["holdout"]
     with pytest.raises(ValidationError):
         EvaluationProtocol.model_validate(content)
+
+
+@pytest.mark.parametrize(
+    "comparison",
+    [
+        {"risk_free_rate": -0.01, "high_exposure": 0.70},
+        {"risk_free_rate": 0.0, "high_exposure": 0.0},
+        {"risk_free_rate": 0.0, "high_exposure": 1.01},
+    ],
+    ids=["risk_free_negative", "high_exposure_0", "high_exposure_above_1"],
+)
+def test_out_of_range_comparison_numbers_are_refused(comparison: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        protocol(comparison=comparison)
+
+
+def test_comparison_edges_that_are_allowed_load() -> None:
+    p = protocol(comparison={"risk_free_rate": 0.0, "high_exposure": 1.0})
+    assert (p.comparison.risk_free_rate, p.comparison.high_exposure) == (0.0, 1.0)
+    other = protocol(comparison={"risk_free_rate": 0.04, "high_exposure": 0.5})
+    assert other.comparison.model_dump() == {"risk_free_rate": 0.04, "high_exposure": 0.5}
+
+
+def test_a_missing_comparison_block_is_refused(tmp_path: Path) -> None:
+    content = raw()
+    del content["comparison"]
+    with pytest.raises(ValidationError):
+        load_protocol(write(tmp_path, content))
+
+
+@pytest.mark.parametrize(
+    "comparison",
+    [
+        {"risk_free_rate": 0.0},
+        {"high_exposure": 0.70},
+        {"risk_free_rate": 0.0, "high_exposur": 0.70},
+        {"risk_free_rate": 0.0, "high_exposure": 0.70, "benchmark": "SPY"},
+    ],
+    ids=["no_high_exposure", "no_risk_free_rate", "misspelled", "unknown_key"],
+)
+def test_a_missing_or_misspelled_comparison_key_is_refused(comparison: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        protocol(comparison=comparison)
+
+
+def test_benchmarks_need_at_least_one_symbol() -> None:
+    # The first symbol is the SPY of the comparison; without one the basket would stand in.
+    with pytest.raises(ValidationError):
+        protocol(
+            benchmarks={
+                "symbols": [],
+                "basket": {"size": 10, "lookback_sessions": 60, "rebalance": "monthly"},
+            }
+        )
 
 
 def test_a_missing_file_raises(tmp_path: Path) -> None:

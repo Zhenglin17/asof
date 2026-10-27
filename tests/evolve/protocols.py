@@ -25,6 +25,7 @@ REAL: dict[str, Any] = {
         "symbols": ["SPY", "QQQ"],
         "basket": {"size": 10, "lookback_sessions": 60, "rebalance": "monthly"},
     },
+    "comparison": {"risk_free_rate": 0.0, "high_exposure": 0.70},
 }
 
 

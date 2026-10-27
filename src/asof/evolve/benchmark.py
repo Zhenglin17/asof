@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
+from asof.evolve.metrics import TRADING_DAYS
 from asof.evolve.protocol import EvaluationProtocol
 from asof.store.market import (
     visible_bars,
@@ -30,7 +31,6 @@ from asof.store.market import (
 from asof.store.universe import liquid_securities
 
 ET = ZoneInfo("America/New_York")
-TRADING_DAYS = 252
 
 
 @dataclass(frozen=True)

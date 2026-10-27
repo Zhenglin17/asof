@@ -60,6 +60,9 @@ The [README](../README.md) is the short tour.
       basket, members picked point in time (`asof benchmark`)
 - [x] Random-entry null: each replay leg against random picks from the scanner's pool on
       the same dates, max-statistic correction across runs (`asof gate null`)
+- [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
+      is compared with the benchmarks on return, drawdown, Sharpe and exposure
+      (`asof gate compare`)
 - [ ] Strategy evolution: permutation gate, approval
 
 ## Development
@@ -577,6 +580,26 @@ excess +0.19%, p = 0.33. Known gaps: a hard stop fills at its stop price but a r
 at the close (repricing the real legs the null's way moves them +0.10% a leg, against the
 strategy); random legs have no guard against an unrecorded split (48 of 109,743 pool legs on
 run 1 cross one).
+
+### Strategy versus benchmarks
+
+```bash
+uv run asof gate compare --run 4              # a replay's daily equity against the benchmarks
+```
+
+Every replay writes one row per session to `equity_daily`: the initial equity plus realized pnl
+plus open positions at that session's close (a position without a bar keeps its last close),
+the value of open positions (orders not yet filled are not counted) and their number, visible
+from 20:00 New York that day. The command takes a run's own sessions and computes the
+protocol's benchmarks over them; the two calendars must match day for day. For each curve it
+prints total and annualized return, maximum drawdown and the Sharpe ratio of daily returns
+above `comparison.risk_free_rate` (0: idle cash earns nothing in a replay), annualized over
+252 sessions. The strategy starts from its initial equity, the benchmarks from the money
+invested at the first open. It also prints the mean share of equity invested and the share of
+sessions at least `comparison.high_exposure` invested, and three criteria the walk-forward
+gate will apply, reported here without a verdict: a maximum drawdown no worse than the
+basket's, a Sharpe ratio at least the better of SPY's and the basket's, and a total return
+above both.
 
 ## Layout
 

@@ -46,6 +46,7 @@ from asof.store.models import (
     DecisionCitation,
     DecisionKind,
     Direction,
+    EquityDaily,
     EvidenceKind,
     Run,
     RunMode,
@@ -159,6 +160,24 @@ class _Replay:
             max_position_pct=sizing.max_position_pct,
             max_gross_pct=sizing.max_gross_pct,
             gross_exposure=self._open_value(),
+        )
+
+    def mark(self, day: date) -> None:
+        """The account at ``day``'s close; a position without a bar today keeps its last close."""
+        held = [
+            a.sim.open.state.shares * a.last_close for a in self.active if a.sim.open is not None
+        ]
+        self.session.add(
+            EquityDaily(
+                run_id=self.run.id,  # pyright: ignore[reportArgumentType]
+                session_date=day,
+                equity=self.equity(),
+                realized=self.realized,
+                unrealized=self._unrealized(),
+                gross_exposure=sum(held),
+                open_positions=len(held),
+                available_at=close_of(day),
+            )
         )
 
     # ---- one evening -----------------------------------------------------------------------
@@ -437,6 +456,7 @@ def run_replay(
     for day in steps:
         as_of = close_of(day)
         replay.step_positions(day, as_of, cache)
+        replay.mark(day)
         replay.attribute_finished(day)
         replay.decide(day, as_of)
     run.finished_at = datetime.now(UTC)

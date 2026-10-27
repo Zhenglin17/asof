@@ -23,3 +23,7 @@ benchmarks:
   # Each month's first session: the 10 stocks (no funds) with the largest dollar volume over the
   # previous 60 sessions, equal weight, held to the next rebalance.
   basket: {size: 10, lookback_sessions: 60, rebalance: monthly}
+# Appended 2026-10-26, before any comparison was reported. Strategy versus benchmarks over a
+# run's own sessions: Sharpe on daily returns above this yearly rate (0: replays earn nothing on
+# idle cash), and the share of sessions with open positions >= high_exposure of equity.
+comparison: {risk_free_rate: 0.0, high_exposure: 0.70}
