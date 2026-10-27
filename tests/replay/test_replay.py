@@ -32,6 +32,7 @@ from asof.strategy import apply_overrides, content_hash, load_strategy
 from tests.replay.scenario import END, START, TRADED, X
 from tests.scan.world import ET, GAP, Ohlcv, close_of, et, filing, gap_world
 from tests.store.test_market import write_splits
+from tests.store.test_split_events import mdrr_rows, nlsp_rows, write_split_rows
 from tests.strategy.files import write_strategy
 
 ZERO_SLIP = ("execute.fills.slippage_bps=0",)
@@ -175,6 +176,54 @@ def test_a_split_while_holding_rescales_the_position(
     assert (ny_date(only.exit_at), only.exit_price, only.exit_reason) == (X[4], 26.6, "break")
     assert only.pnl == pytest.approx(-412.5)  # = 125 * (53.2 - 56.5) before the split
     assert only.r_multiple == pytest.approx(-1.65 / 2.25)
+
+
+def test_one_reverse_split_stored_as_two_records_is_applied_once(
+    tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, strategy_dir: Path
+) -> None:
+    # The NLSP 2025-10-31 shape (tests/store/test_split_events.py): one 1-for-10 stored as
+    # reverse_split 10 -> 1 and unit_split 1 -> 0.1, same CUSIPs. Prices are the 2:1 test's
+    # post-split bars times 20, i.e. the pre-split level times 10. Applied once: 125 -> 12
+    # shares (floored), entry 565, key 540 (zone 535 .. 545, hard 520); X3 closes 530 -> break
+    # at X4's open. Applied twice (0.01) the position would be 1 share with a 5,400 key.
+    after: list[Ohlcv | None] = [
+        (56.5, 57.0, 56.0, 56.8, 1_200_000),
+        (562.0, 566.0, 558.0, 564.0, 120_000),
+        (560.0, 562.0, 528.0, 530.0, 120_000),
+        (532.0, 534.0, 526.0, 528.0, 100_000),
+        *[(530.0, 534.0, 526.0, 530.0, 100_000)] * 22,
+    ]
+    world = gap_world(tmp_path, session, after=after)
+    write_split_rows(world.root, nlsp_rows("GAPX", X[2]))
+    run_id = run_replay(session, con, world.root, strategy_dir, START, X[len(after)], ZERO_SLIP)
+    [only] = trades(session, run_id)
+    assert only.shares == 12
+    assert only.entry_price == pytest.approx(565.0)
+    assert (ny_date(only.exit_at), only.exit_price, only.exit_reason) == (X[4], 532.0, "break")
+    assert only.pnl == pytest.approx(12 * (532.0 - 565.0))
+
+
+def test_two_split_events_on_one_day_are_both_applied(
+    tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, strategy_dir: Path
+) -> None:
+    # The MDRR 2024-07-03 shape: 1-for-10 then 5-for-1 the same day, net 0.5 (real price 5.99
+    # -> 11.79). Prices: the 2:1 test's post-split bars times 4. Net 0.5: 125 -> 62 shares,
+    # entry 113, key 108 (zone 107 .. 109, hard 104); X3 closes 106 -> break at X4's open.
+    after: list[Ohlcv | None] = [
+        (56.5, 57.0, 56.0, 56.8, 1_200_000),
+        (112.4, 113.2, 111.6, 112.8, 600_000),
+        (112.0, 112.4, 105.6, 106.0, 600_000),
+        (106.4, 106.8, 105.2, 105.6, 500_000),
+        *[(106.0, 106.8, 105.2, 106.0, 500_000)] * 22,
+    ]
+    world = gap_world(tmp_path, session, after=after)
+    write_split_rows(world.root, mdrr_rows("GAPX", X[2]))
+    run_id = run_replay(session, con, world.root, strategy_dir, START, X[len(after)], ZERO_SLIP)
+    [only] = trades(session, run_id)
+    assert only.shares == 62
+    assert only.entry_price == pytest.approx(113.0)
+    assert (ny_date(only.exit_at), only.exit_price, only.exit_reason) == (X[4], 106.4, "break")
+    assert only.pnl == pytest.approx(62 * (106.4 - 113.0))
 
 
 def test_five_missing_sessions_exit_at_the_last_close(

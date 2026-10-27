@@ -476,7 +476,15 @@ def splits_as_of(
     as_of: datetime,
     symbols: Sequence[str] | None = None,
 ) -> pa.Table:
-    """``visible_splits`` over a given relation holding the split columns (a cached table)."""
+    """``visible_splits`` over a given relation holding the split columns (a cached table).
+
+    Rows with equal (symbol, ex_date, factor to 9 decimals, old_cusip, new_cusip) are one event
+    and come back once: the feed stores some splits twice, identical (SNEX 2023-11-27) or as two
+    kinds with different rates (NLSP 2025-10-31: reverse_split 10 -> 1 and unit_split 1 -> 0.1),
+    and every reader multiplies the rows of a day. The copy kept is the earliest knowable at
+    ``as_of``, a non-``unit_split`` one first (the audit's split checks skip unit splits).
+    Distinct events on one day (MDRR 2024-07-03: 1-for-10 then 5-for-1) all stay; audit S5
+    lists such days."""
     clauses = ["available_at <= $as_of"]
     params: dict[str, Any] = {"as_of": _aware_utc(as_of, "as_of")}
     if symbols is not None:
@@ -484,7 +492,12 @@ def splits_as_of(
         params["symbols"] = list(symbols)
     con.execute("SET TimeZone = 'UTC'")
     columns = ", ".join(SPLIT_SCHEMA.names)
-    query = (
-        f"SELECT {columns} FROM {relation} WHERE {' AND '.join(clauses)} ORDER BY symbol, ex_date"
-    )
+    query = f"""
+        SELECT {columns} FROM {relation} WHERE {" AND ".join(clauses)}
+        QUALIFY row_number() OVER (
+            PARTITION BY symbol, ex_date, round(factor, 9), old_cusip, new_cusip
+            ORDER BY available_at, kind = 'unit_split', kind, old_rate, new_rate
+        ) = 1
+        ORDER BY symbol, ex_date, factor, old_cusip, new_cusip
+    """
     return con.execute(query, params).to_arrow_table()

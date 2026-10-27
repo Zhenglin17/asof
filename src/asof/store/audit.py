@@ -178,6 +178,9 @@ CHECKS: dict[str, CheckSpec] = dict(
         _spec("S2", "split record without the price move", "liquid", f"{_SYM}:{_DATE}"),
         _spec("S3", "one-day thin-volume spike, no split", "liquid", f"{_SYM}:{_DATE}"),
         _spec("S4", "close jump of 3x without a split", None, f"{_SYM}:{_DATE}"),
+        # gated everywhere, not only in the liquid tier: every reader multiplies the events of a
+        # day, so a wrong one silently rescales any position held across it
+        _spec("S5", "several split events on one day", "all", f"{_SYM}:{_DATE}"),
         _spec(
             "N1", "rename recorded long after the old name stopped", None, f"{_SYM}/{_SYM}:{_DATE}"
         ),  # fmt: skip
@@ -1312,6 +1315,21 @@ class _Audit:
         )
         buckets = table.column("bucket").to_pylist()
         return table, {b: buckets.count(b) for b in ("lt1", "1to10", "gt10")}
+
+    def s5(self) -> tuple[pa.Table, dict]:
+        # repeated records are already one event here (splits_as_of); what is left are days the
+        # readers multiply, right only when the events are genuinely chained (MDRR 2024-07-03)
+        table = self._q(
+            f"""
+            SELECT symbol || ':' || {_day("ex_date")} AS key, {_liq_sym("symbol")} AS _liq,
+                   symbol, ex_date, count(*) AS events, product(factor) AS net_factor,
+                   string_agg(kind || ' ' || factor, ', ' ORDER BY factor) AS records
+            FROM {_SPLITS}
+            GROUP BY symbol, ex_date
+            HAVING count(*) > 1
+            """
+        )
+        return table, {}
 
     # -- N: name changes against the bars --------------------------------------------------------
 

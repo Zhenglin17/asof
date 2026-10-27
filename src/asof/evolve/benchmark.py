@@ -109,16 +109,12 @@ def _bars(
 def _actions(
     con: duckdb.DuckDBPyConnection, root: Path, symbols: Sequence[str], end: date
 ) -> tuple[dict[str, list[tuple[date, float]]], dict[str, list[tuple[date, float]]]]:
-    """Split ratios and cash dividends per symbol known at ``end``'s close. A row repeated in
-    every column is one event (real: QQQ 2022-09-19 is stored twice)."""
+    """Split ratios and cash dividends per symbol known at ``end``'s close. Repeated records
+    come back once from both readers (real: QQQ's 2022-09-19 dividend is stored twice)."""
     as_of = _close_of(end)
     splits: dict[str, list[tuple[date, float]]] = defaultdict(list)
-    seen: set[tuple[str, date, float, float]] = set()
     for s in visible_splits(con, root, as_of, sorted(set(symbols))).to_pylist():
-        key = (s["symbol"], s["ex_date"], s["old_rate"], s["new_rate"])
-        if key not in seen:
-            seen.add(key)
-            splits[s["symbol"]].append((s["ex_date"], s["new_rate"] / s["old_rate"]))
+        splits[s["symbol"]].append((s["ex_date"], s["new_rate"] / s["old_rate"]))
     dividends: dict[str, list[tuple[date, float]]] = defaultdict(list)
     for d in visible_dividends(con, root, as_of, sorted(set(symbols))).to_pylist():
         dividends[d["symbol"]].append((d["ex_date"], float(d["rate"])))

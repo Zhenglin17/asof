@@ -60,6 +60,7 @@ from asof.store.universe import liquid_securities
 from tests.evolve.protocols import protocol
 from tests.ingest.fakes import daily
 from tests.store.test_market import write_splits
+from tests.store.test_split_events import nlsp_rows, write_split_rows
 from tests.store.test_universe import Seg, known, store_daily, write_symbols
 
 HOLIDAYS = {date(2025, 1, 9), date(2025, 1, 20), date(2025, 2, 17)}
@@ -329,6 +330,25 @@ def test_two_for_one_split_mid_hold_does_not_move_the_value(
     # 0.01 shares, 0.02 from the ex-date's open: 1.0, 1.02, 0.02 * 50, 0.02 * 55.
     assert curve.equity == pytest.approx((1.0, 1.02, 1.0, 1.1))
     assert curve.max_drawdown == pytest.approx(1 - 1.0 / 1.02)
+
+
+def test_one_reverse_split_stored_as_two_records_scales_shares_once(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    # The NLSP 2025-10-31 shape (tests/store/test_split_events.py): reverse_split 10 -> 1 and
+    # unit_split 1 -> 0.1, same factor 0.1 and CUSIPs, i.e. one 1-for-10. The rows differ in
+    # old / new rate, so a (symbol, ex_date, old_rate, new_rate) seen-set keeps both.
+    d = FEB[:4]
+    root = path_store(
+        tmp_path, "X", [(d[0], 100, 100), (d[1], 101, 102), (d[2], 1010, 1000), (d[3], 1000, 1100)]
+    )
+    write_split_rows(root, nlsp_rows("X", d[2]))
+
+    curve = buy_and_hold(con, root, "X", d[0], d[3])
+
+    # 0.01 shares, 0.001 from the ex-date's open: 1.0, 1.02, 0.001 * 1000, 0.001 * 1100.
+    # Applied twice (0.0001 shares) the curve would read 0.1 and 0.11.
+    assert curve.equity == pytest.approx((1.0, 1.02, 1.0, 1.1))
 
 
 def test_dividend_is_paid_on_the_ex_date_and_reinvested_at_its_close(

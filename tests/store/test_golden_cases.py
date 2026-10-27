@@ -339,6 +339,24 @@ def test_split_days_are_flagged_and_the_raw_prices_are_unadjusted(
     assert [r["close"] for r in nvda] == [1208.88, 121.79]
 
 
+def test_repeated_split_records_are_one_event_and_chained_ones_stay(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # Store reads 2026-10-27: SNEX 2023-11-27 is stored twice (identical), NLSP 2025-10-31 as
+    # reverse_split 10 -> 1 plus unit_split 1 -> 0.1; MDRR 2024-07-03 is 1-for-10 then 5-for-1
+    # (close 5.99 -> open 11.79)
+    splits = visible_splits(con, ROOT, NOW, ["SNEX", "NLSP", "MDRR"]).to_pylist()
+    day = {
+        "SNEX": date(2023, 11, 27),
+        "NLSP": date(2025, 10, 31),
+        "MDRR": date(2024, 7, 3),
+    }
+    on = {s: [r for r in splits if r["symbol"] == s and r["ex_date"] == d] for s, d in day.items()}
+    assert [r["factor"] for r in on["SNEX"]] == [1.5]
+    assert [(r["kind"], r["factor"]) for r in on["NLSP"]] == [("reverse_split", 0.1)]
+    assert sorted(r["factor"] for r in on["MDRR"]) == [0.1, 5.0]
+
+
 def test_hcti_reverse_splits_compound_to_the_tradingview_price(
     con: duckdb.DuckDBPyConnection,
 ) -> None:

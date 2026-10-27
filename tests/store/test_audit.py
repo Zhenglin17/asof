@@ -149,6 +149,7 @@ GATES: dict[str, str | None] = {
     "S2": "liquid",
     "S3": "liquid",
     "S4": None,
+    "S5": "all",  # several split events on one day: each must be reviewed
     "N1": None,
     "N2": None,
     "N3": None,
@@ -239,6 +240,7 @@ SAMPLE_KEYS = {
     "S2": "AAA:2020-01-16",
     "S3": "AAA:2020-01-16",
     "S4": "AAA:2020-01-16",
+    "S5": "MDRR:2024-07-03",
     "N1": "CCC/CCC3:2020-03-08",
     "N2": "ROLD/RNEW:2020-01-16",
     "N3": "AAA/BBB",

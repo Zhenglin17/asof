@@ -256,6 +256,11 @@ def _s4(w: MetaWorld) -> None:
     jump_world(w, before=5.0, after=20.0)
 
 
+def _s5(w: MetaWorld) -> None:
+    # the MDRR 2024-07-03 shape (tests/store/test_split_events.py): two factors on one day
+    w.splits = [split("AAA", DAYS[10], 10.0, 1.0), split("AAA", DAYS[10], 1.0, 5.0)]
+
+
 def _n1(w: MetaWorld) -> None:
     w.name_changes = [rename("CCC", "CCC3", DAYS[-1] + timedelta(days=31))]
 
@@ -309,6 +314,7 @@ BROKEN: dict[str, Callable[[MetaWorld], None]] = {
     "S2": _s2,
     "S3": _s3,
     "S4": _s4,
+    "S5": _s5,
     "N1": _n1,
     "N2": _n2,
     "N3": _n3,

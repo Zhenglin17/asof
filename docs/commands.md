@@ -26,7 +26,7 @@ The [README](../README.md) is the short tour.
 - [x] Resolved read path: every bar read carries the permanent id of the security that owned
       its symbol that day, as the security master was known at the time; relabelled copies
       and the vendor's volume-0 filler bars are gone by default
-- [x] Data audit: 33 checks over the real store with reviewed exceptions, clean in the
+- [x] Data audit: 34 checks over the real store with reviewed exceptions, clean in the
       liquid tier, and hand-checked reference histories asserted as tests against it
 - [x] Truncation test: the security master rebuilt from only the inputs knowable at an
       instant and compared with what the full master shows then; every identity fact (a
@@ -225,7 +225,12 @@ the day the vendor filed it keeps attributing the old symbol's bars to the old s
 bar also carries `traded`; the vendor keeps writing a volume-0 bar a day under an old symbol
 for years after a rename (1.18M such bars, 6.5% of the store), and these are dropped unless
 asked for. `split_day` marks the ex-date bar of a split known at the time, so a return across
-it is not mistaken for a move. `resolve=False` returns the raw store for audits.
+it is not mistaken for a move. The vendor stores some splits more than once: SNEX's 3-for-2 of
+2023-11-27 twice, NLSP's 1-for-10 of 2025-10-31 as a reverse split 10 -> 1 and a unit split
+1 -> 0.1. Every reader multiplies the records of a day, so a held NLSP position would have
+shrunk to a hundredth. Records with the same symbol, ex-date, factor and CUSIPs are therefore
+read as one event; days that still hold several events (MDRR on 2024-07-03: 1-for-10, then
+5-for-1, net 0.5 as its prices show) are listed by the audit and need a reviewed exception. `resolve=False` returns the raw store for audits.
 
 The vendor files a symbol's whole history under its current holder, so when a ticker is reused
 the old holder's history can disappear: after Banzai took PARA in 2026, Paramount Global's
@@ -251,11 +256,11 @@ a line.
 
 Tests on fake data only show that the code does what its author imagined; they stay green when
 the imagined vendor differs from the real one. `asof market audit` therefore reads the real
-store as of an instant and counts each kind of accident met so far, 33 checks in all:
+store as of an instant and counts each kind of accident met so far, 34 checks in all:
 duplicate or impossible bars, segments of one security that overlap, two securities sharing
 an identical bar (a relabelled history the master did not catch), an earlier holder's segment
 partly made of the current holder's bars, a split record with no price
-move, a one-day thin-volume print far from the previous close with no split to explain it, a
+move, a day holding several split events, a one-day thin-volume print far from the previous close with no split to explain it, a
 price jump across a rename, traded bars that no segment owns, a listed symbol whose bars
 stopped although the vendor still serves it, and a company the SEC lists on an exchange that
 owns no bar at all (the vendor dropped Inhibrx's history when its ticker was reused; read from

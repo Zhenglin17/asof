@@ -45,8 +45,17 @@ Interpretations a reviewer should confirm (the spec does not say):
 
 Real-data check: ``asof market audit`` (manual): S1 / S2 clean in the liquid tier after 6-c;
 S1's UTX:2020-04-03 and S2's ULTY:2025-11-28 and ARNC:2020-04-01 gone from the report.
+
+S5 (several split events on one day): one row per (symbol, ex_date)
+that still has more than one event after ``splits_as_of`` merged repeated records (rule and
+the real SNEX / NLSP / MDRR / GWACU shapes: tests/store/test_split_events.py). Key
+``SYMBOL:YYYY-MM-DD``; gate "all": every such day needs a reviewed exception, because a
+wrong extra record multiplies a held position by its factor. Real-data check: ``asof market
+audit`` S5 lists MDRR:2024-07-03, GWACU:2020-12-07 and SAQNU:2020-10-15 on the store of
+2026-10-27, nothing for SNEX / NLSP.
 """
 
+import re
 from collections.abc import Iterator, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -72,6 +81,7 @@ from tests.store.audit_world import (
     World,
     base_segs,
     drop,
+    exc,
     iso,
     keys,
     rows,
@@ -79,6 +89,13 @@ from tests.store.audit_world import (
     split,
 )
 from tests.store.test_market import avail, known
+from tests.store.test_split_events import (
+    gwacu_rows,
+    mdrr_rows,
+    nlsp_rows,
+    snex_rows,
+    split_row,
+)
 from tests.store.test_universe import trading_days
 
 EX = DAYS[10]  # 2020-01-16
@@ -510,3 +527,77 @@ def test_s1_silence_after_a_security_that_ended_is_not_gated(
     row = by_key(result)[key]
     assert row["reason"] == "not_traded_around"
     assert row["in_liquid"] is False
+
+
+# =============================================================================================
+# S5: several split events on one day
+# =============================================================================================
+
+
+S5_AS_OF = datetime(2026, 10, 27, tzinfo=UTC)  # the real shapes' ex-dates are all knowable
+
+
+def s5(
+    con: duckdb.DuckDBPyConnection, world: World, as_of: datetime = S5_AS_OF, **kwargs: Any
+) -> CheckResult:
+    return world.audit(con, as_of=as_of, checks=["S5"], **kwargs)["S5"]
+
+
+def test_s5_is_in_the_check_list_after_s4_and_gates_everywhere() -> None:
+    ids = list(audit_mod.CHECKS)
+    assert "S5" in ids and ids.index("S5") == ids.index("S4") + 1
+    spec = audit_mod.CHECKS["S5"]
+    assert spec.gate == "all"
+    assert spec.title.strip()
+
+
+def test_s5_flags_mdrr_and_gwacu_shapes_one_row_per_day(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    world.splits = mdrr_rows() + gwacu_rows()
+
+    result = s5(con, world)
+
+    assert keys(result) == ["GWACU:2020-12-07", "MDRR:2024-07-03"]
+    assert result.fails("liquid") is True and result.fails("all") is True
+
+
+def test_s5_does_not_flag_repeated_records_of_one_event(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    world.splits = snex_rows() + nlsp_rows() + [split_row("AAPL", date(2020, 8, 31), 1.0, 4.0)]
+
+    assert rows(s5(con, world)) == []
+
+
+def test_s5_a_day_with_three_records_two_of_them_copies_is_one_row(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    first, second = mdrr_rows()
+    world.splits = [first, second, {**second, "kind": "unit_split"}]
+
+    assert keys(s5(con, world)) == ["MDRR:2024-07-03"]
+
+
+def test_s5_exception_silences_the_row(con: duckdb.DuckDBPyConnection, world: World) -> None:
+    world.splits = mdrr_rows() + gwacu_rows()
+
+    result = s5(con, world, exceptions=[exc("S5", "MDRR:2024-07-03")])
+
+    excepted = {r["key"]: r["excepted"] for r in rows(result)}
+    assert excepted == {"GWACU:2020-12-07": False, "MDRR:2024-07-03": True}
+    assert audit_mod.CHECKS["S5"].key_pattern
+    assert re.fullmatch(audit_mod.CHECKS["S5"].key_pattern, "MDRR:2024-07-03")
+
+
+def test_s5_second_event_not_yet_knowable_is_not_flagged(
+    con: duckdb.DuckDBPyConnection, world: World
+) -> None:
+    # leakage: the second MDRR event is on disk but its available_at lies after the audit's
+    # as_of; at that as_of the day has one event. One microsecond later it has two.
+    first, second = mdrr_rows()
+    as_of = known(first["ex_date"]) + timedelta(hours=1)
+    world.splits = [first, {**second, "available_at": as_of + timedelta(microseconds=1)}]
+
+    assert rows(s5(con, world, as_of=as_of)) == []
+    assert keys(s5(con, world, as_of=as_of + timedelta(microseconds=1))) == ["MDRR:2024-07-03"]

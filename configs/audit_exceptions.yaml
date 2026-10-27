@@ -91,6 +91,24 @@
   added: 2026-10-19
   by: greyson
 
+# S5 (2026-10-27): days that still hold several split events after repeated records were
+# merged. Every reader multiplies them, so each is checked against the bars before it stays.
+- check: S5
+  key: "MDRR:2024-07-03"
+  reason: "1-for-10 (58403P303 -> 58403P402) then 5-for-1 the same day, net 0.5; close 5.99 on 07-02, open 11.79 on 07-03 bears it out"
+  added: 2026-10-27
+  by: greyson
+- check: S5
+  key: "GWACU:2020-12-07"
+  reason: "unit separation (1:1 unit_split, 38216X206 -> 38216X107) plus a 0.5 record; no GWACU bar on or after the ex-date, so no price ever takes the product"
+  added: 2026-10-27
+  by: greyson
+- check: S5
+  key: "SAQNU:2020-10-15"
+  reason: "unit separation (1:1 unit_split, 83406B200 -> 23130Q107) plus a 0.5 record; no SAQNU bar on or after the ex-date, so no price ever takes the product"
+  added: 2026-10-27
+  by: greyson
+
 # M6 relabelled (rule R, 2026-10-19): the build merged an earlier holder's segment into the
 # filer that took the label, because the taker traded nothing of its own while it ran. Each
 # merge was checked against the bars by hand before it was excepted.
