@@ -58,6 +58,10 @@ The [README](../README.md) is the short tour.
       sealed holdout are refused unless the strategy opens it, once
 - [x] Benchmarks: SPY and QQQ with dividends reinvested and a monthly top-10 dollar-volume
       basket, members picked point in time (`asof benchmark`)
+- [x] First shared feature: the B-Xtrender short-term histogram on split-adjusted daily,
+      weekly and monthly bars, with Pine's EMA / RMA / RSI so the values match the chart; a
+      weekly or monthly value is used only from the close that completes its period
+      (`asof.features.bx`)
 - [x] Random-entry null: each replay leg against random picks from the scanner's pool on
       the same dates, max-statistic correction across runs (`asof gate null`)
 - [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
@@ -230,7 +234,11 @@ it is not mistaken for a move. The vendor stores some splits more than once: SNE
 1 -> 0.1. Every reader multiplies the records of a day, so a held NLSP position would have
 shrunk to a hundredth. Records with the same symbol, ex-date, factor and CUSIPs are therefore
 read as one event; days that still hold several events (MDRR on 2024-07-03: 1-for-10, then
-5-for-1, net 0.5 as its prices show) are listed by the audit and need a reviewed exception. `resolve=False` returns the raw store for audits.
+5-for-1, net 0.5 as its prices show) are listed by the audit and need a reviewed exception. A
+record the prices disprove (HON's 2:1 reverse split of 2026-06-29: the next opens are 1.04,
+1.00 and 0.98 of the previous close) is listed in `configs/split_rejections.yaml` with a reason
+and a date and is left out by every reader at every instant, since it never happened; a
+genuine split whose prices moved by a different multiple stays an audit exception instead. `resolve=False` returns the raw store for audits.
 
 The vendor files a symbol's whole history under its current holder, so when a ticker is reused
 the old holder's history can disappear: after Banzai took PARA in 2026, Paramount Global's

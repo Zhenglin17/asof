@@ -374,6 +374,33 @@ def test_hcti_reverse_splits_compound_to_the_tradingview_price(
     assert 640 <= adjusted <= 660
 
 
+def test_rejected_split_records_are_gone_and_nvda_adjusts_to_its_post_split_price(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    # Hand-checked 2026-10-19 (audit S2): HON's 2026-06-29 2:1 reverse record (opens 1.04, 1.00,
+    # 0.98 of the previous close) and AIIO's 2026-06-03 10:1 reverse record (0.95, 0.98, 1.08)
+    # are disproved by the prices; configs/split_rejections.yaml lists both.
+    from asof.features.bx import adjust_for_splits
+
+    splits = visible_splits(con, ROOT, NOW, ["HON", "AIIO", "NVDA"]).to_pylist()
+    days = {(r["symbol"], r["ex_date"]) for r in splits}
+    assert ("HON", date(2026, 6, 29)) not in days
+    assert ("AIIO", date(2026, 6, 3)) not in days
+    # the records are in the store: it is the rejection file that removes them
+    unrejected = visible_splits(con, ROOT, NOW, ["HON", "AIIO"], rejected=()).to_pylist()
+    stored = {(r["symbol"], r["ex_date"]) for r in unrejected}
+    assert {("HON", date(2026, 6, 29)), ("AIIO", date(2026, 6, 3))} <= stored
+
+    # NVDA 10-for-1 ex 2024-06-10: 1208.88 on 06-07 reads as 120.888 split-adjusted (store
+    # values pinned above; 1208.88 / 10)
+    raw = bars(con, NOW, ["NVDA"], start=ny(2024, 5, 1), end=ny(2024, 7, 1)).to_pandas()
+    nvda_splits = visible_splits(con, ROOT, NOW, ["NVDA"]).to_pandas()
+    adjusted = adjust_for_splits(raw, nvda_splits)
+    close = dict(zip(adjusted["session_date"], adjusted["close"], strict=True))
+    assert close[date(2024, 6, 7)] == pytest.approx(120.888)
+    assert close[date(2024, 6, 10)] == 121.79
+
+
 # -- instrument classes and the liquid tier ------------------------------------------------------
 
 

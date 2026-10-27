@@ -223,6 +223,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] Demo page on GitHub Pages
 - [ ] Minute bars, XBRL facts, FRED
 - [x] Gate report: random entries, walk-forward, thin edge, benchmarks, side by side
+- [x] First feature: B-Xtrender on split-adjusted daily, weekly and monthly bars, matched against the chart
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

@@ -1,0 +1,20 @@
+# Vendor split records the prices disprove. Every reader of splits (replay, random-entry null,
+# scanner, benchmarks, features, audit) leaves out every record of a listed (symbol, ex_date),
+# so no position or price history is rescaled by a split that did not happen. Each entry needs
+# every field:
+#
+#   - key: "HON:2026-06-29"      # SYMBOL:YYYY-MM-DD, the record's symbol and ex-date
+#     reason: "..."              # the prices that disprove it
+#     added: 2026-10-27
+#     by: greyson
+#
+# A genuine split with a larger or smaller move than its ratio (TTOO 2023-10-13, TAOP
+# 2020-07-30, RGC 2025-06-16) is not listed here: it stays an audit S2 exception.
+- key: "HON:2026-06-29"
+  reason: "2:1 reverse record; opens 1.04, 1.00, 0.98 of the previous close over three sessions, no move"
+  added: 2026-10-27
+  by: greyson
+- key: "AIIO:2026-06-03"
+  reason: "10:1 reverse record; opens 0.95, 0.98, 1.08 of the previous close over three sessions, no move"
+  added: 2026-10-27
+  by: greyson

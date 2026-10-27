@@ -21,7 +21,7 @@ Two more things happen on the way out, both decided by the user on 2026-10-08:
 
 import functools
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,7 @@ from typing import Any
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
 
 from asof.ingest.alpaca import Timeframe
 from asof.ingest.bar_imports import EXT_BAR_SCHEMA, EXT_DIR
@@ -429,19 +430,84 @@ def _actions_file(root: Path, name: str) -> Path | None:
     return path if path.exists() else None
 
 
+SPLIT_REJECTIONS_FILE = Path(__file__).resolve().parents[3] / "configs" / "split_rejections.yaml"
+_REJECTION_FIELDS = ("key", "reason", "added", "by")
+_REJECTION_KEY = re.compile(r"([A-Z0-9.]+):(\d{4}-\d{2}-\d{2})")
+
+
+def load_split_rejections(path: Path) -> frozenset[tuple[str, date]]:
+    """``configs/split_rejections.yaml``: vendor split records the prices disprove, a list of
+    ``key / reason / added / by`` with key ``SYMBOL:YYYY-MM-DD``. Validated like the audit
+    exceptions; a key listed twice is an error. A missing file is the empty set."""
+    if not path.exists():
+        return frozenset()
+    raw = yaml.safe_load(path.read_text())
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, list):
+        raise ValueError(f"{path}: expected a list of rejections")
+    keys: set[tuple[str, date]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}: entry {item!r} is not a mapping")
+        if set(item) != set(_REJECTION_FIELDS):
+            raise ValueError(f"{path}: entry {item!r} must have exactly {_REJECTION_FIELDS}")
+        if any(item[name] is None or str(item[name]).strip() == "" for name in _REJECTION_FIELDS):
+            raise ValueError(f"{path}: entry {item!r} has an empty field")
+        key = str(item["key"])
+        match = _REJECTION_KEY.fullmatch(key)
+        try:
+            ex_date = date.fromisoformat(match.group(2)) if match else None
+        except ValueError:
+            ex_date = None
+        if match is None or ex_date is None:
+            raise ValueError(f"{path}: entry {item!r}: key {key!r} is not SYMBOL:YYYY-MM-DD")
+        added = item["added"]
+        if isinstance(added, datetime) or not isinstance(added, date):
+            try:
+                date.fromisoformat(str(added))
+            except ValueError:
+                raise ValueError(
+                    f"{path}: entry {item!r}: added {item['added']!r} is not YYYY-MM-DD"
+                ) from None
+        pair = (match.group(1), ex_date)
+        if pair in keys:
+            raise ValueError(f"{path}: key {key!r} is listed twice")
+        keys.add(pair)
+    return frozenset(keys)
+
+
+@functools.lru_cache(maxsize=4)
+def _shipped_rejections(path: Path, mtime_ns: int, size: int) -> frozenset[tuple[str, date]]:
+    return load_split_rejections(path)
+
+
+def _rejections(rejected: Collection[tuple[str, date]] | None) -> Collection[tuple[str, date]]:
+    """The shipped file is required: without it HON's false 2:1 would halve every position."""
+    if rejected is not None:
+        return rejected
+    path = SPLIT_REJECTIONS_FILE
+    if not path.exists():
+        raise FileNotFoundError(f"{path} is missing; pass rejected=() to read every record")
+    stat = path.stat()
+    return _shipped_rejections(path, stat.st_mtime_ns, stat.st_size)
+
+
 def visible_splits(
     con: duckdb.DuckDBPyConnection,
     root: Path,
     as_of: datetime,
     symbols: Sequence[str] | None = None,
+    *,
+    rejected: Collection[tuple[str, date]] | None = None,
 ) -> pa.Table:
     """Split records known at ``as_of``: ``available_at`` (00:00 New York of the ex-date) must
-    not lie after it. Ordered by symbol then ex_date."""
+    not lie after it. Ordered by symbol then ex_date. ``rejected`` as in ``splits_as_of``."""
     as_of_utc = _aware_utc(as_of, "as_of")
     path = _actions_file(root, "splits")
     if path is None:
         return SPLIT_SCHEMA.empty_table()
-    return splits_as_of(con, _source([path]), as_of_utc, symbols)
+    return splits_as_of(con, _source([path]), as_of_utc, symbols, rejected=rejected)
 
 
 def visible_dividends(
@@ -475,6 +541,8 @@ def splits_as_of(
     relation: str,
     as_of: datetime,
     symbols: Sequence[str] | None = None,
+    *,
+    rejected: Collection[tuple[str, date]] | None = None,
 ) -> pa.Table:
     """``visible_splits`` over a given relation holding the split columns (a cached table).
 
@@ -484,12 +552,23 @@ def splits_as_of(
     and every reader multiplies the rows of a day. The copy kept is the earliest knowable at
     ``as_of``, a non-``unit_split`` one first (the audit's split checks skip unit splits).
     Distinct events on one day (MDRR 2024-07-03: 1-for-10 then 5-for-1) all stay; audit S5
-    lists such days."""
+    lists such days.
+
+    Every row of a rejected (symbol, ex_date) is left out: records the prices disprove (HON
+    2026-06-29, a 2:1 reverse with no move). ``rejected=None`` reads ``SPLIT_REJECTIONS_FILE``;
+    an explicit collection replaces it. The rejection is a data correction, not dated: a replay
+    of the ex-date does not see the false record either."""
     clauses = ["available_at <= $as_of"]
     params: dict[str, Any] = {"as_of": _aware_utc(as_of, "as_of")}
     if symbols is not None:
         clauses.append("symbol IN (SELECT UNNEST($symbols))")
         params["symbols"] = list(symbols)
+    skip = sorted(f"{symbol}:{day.isoformat()}" for symbol, day in _rejections(rejected))
+    if skip:
+        clauses.append(
+            "symbol || ':' || strftime(ex_date, '%Y-%m-%d') NOT IN (SELECT UNNEST($skip))"
+        )
+        params["skip"] = skip
     con.execute("SET TimeZone = 'UTC'")
     columns = ", ".join(SPLIT_SCHEMA.names)
     query = f"""

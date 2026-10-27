@@ -54,20 +54,11 @@
 
 # S1 / S2 left after date scoping (2026-10-19): a split record the vendor's prices do not bear
 # out. S1 looks the bar up under every name of the security; S2 accepts the move up to two
-# sessions late. Ratios are open / previous close against 1 / factor.
+# sessions late. Ratios are open / previous close against 1 / factor. Records with no move at all
+# are not excepted here but rejected (configs/split_rejections.yaml).
 - check: S1
   key: "AMRH:2020-12-31"
   reason: "Ameri -> Enveric (ENVB) merger close with a 1:4 record; no bar under either name that day (AMRH last 12-30 at 1.48, ENVB first 2021-01-04 at 3.90)"
-  added: 2026-10-19
-  by: greyson
-- check: S2
-  key: "AIIO:2026-06-03"
-  reason: "10:1 reverse record; opens 0.95, 0.98, 1.08 of the previous close over three sessions, no move"
-  added: 2026-10-19
-  by: greyson
-- check: S2
-  key: "HON:2026-06-29"
-  reason: "2:1 reverse record; opens 1.04, 1.00, 0.98 of the previous close over three sessions, no move"
   added: 2026-10-19
   by: greyson
 - check: S2
