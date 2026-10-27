@@ -1,8 +1,7 @@
 """A replay's daily equity against the protocol's benchmarks over the run's own sessions.
 
-The three criteria are the ones the walk-forward gate will apply (DECISIONS 2026-10-26); here
-they are only reported. SPY is the buy-and-hold of the protocol's first symbol, the basket is the
-last curve.
+Side by side, no verdict: while strategies are still being explored the comparison is shown,
+not scored (DECISIONS 2026-10-26); a pass mark is set only when a strategy is about to be run.
 """
 
 from collections.abc import Sequence
@@ -29,9 +28,30 @@ class Versus:
     benchmarks: list[tuple[str, CurveMetrics]]
     mean_exposure: float  # open positions / equity, averaged over sessions
     high_exposure_share: float  # sessions with exposure >= protocol.comparison.high_exposure
-    drawdown_not_worse_than_basket: bool
-    sharpe_at_least_best: bool  # against the better of SPY and the basket
-    beats_spy_and_basket_total: bool
+
+    @property
+    def differences(self) -> list["Difference"]:
+        """The strategy minus each benchmark."""
+        s = self.strategy
+        return [
+            Difference(
+                label=label,
+                sharpe=s.sharpe - m.sharpe
+                if s.sharpe is not None and m.sharpe is not None
+                else None,
+                max_drawdown=s.max_drawdown - m.max_drawdown,
+                total_return=s.total_return - m.total_return,
+            )
+            for label, m in self.benchmarks
+        ]
+
+
+@dataclass(frozen=True)
+class Difference:
+    label: str
+    sharpe: float | None  # None when either side has no Sharpe ratio
+    max_drawdown: float  # above zero: the strategy fell further
+    total_return: float
 
 
 def equity_slice(
@@ -79,14 +99,7 @@ def compare_run(
                 f"run {run_id}: {c.label} has {len(c.sessions)} sessions, the run {len(days)}"
             )
     marks = [(c.label, curve_metrics(c.equity, base=1.0, risk_free_rate=rf)) for c in curves]
-    spy, basket = marks[0][1], marks[-1][1]
     exposure = [r.gross_exposure / r.equity for r in rows]
-    sharpe_ok = (
-        strategy.sharpe is not None
-        and spy.sharpe is not None
-        and basket.sharpe is not None
-        and strategy.sharpe >= max(spy.sharpe, basket.sharpe)
-    )
     return Versus(
         run_id=run_id,
         start=start,
@@ -96,8 +109,4 @@ def compare_run(
         mean_exposure=sum(exposure) / len(exposure),
         high_exposure_share=sum(e >= protocol.comparison.high_exposure for e in exposure)
         / len(exposure),
-        drawdown_not_worse_than_basket=strategy.max_drawdown <= basket.max_drawdown,
-        sharpe_at_least_best=sharpe_ok,
-        beats_spy_and_basket_total=strategy.total_return
-        > max(spy.total_return, basket.total_return),
     )

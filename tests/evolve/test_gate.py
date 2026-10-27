@@ -1,8 +1,8 @@
-"""Guards against a gate that passes a strategy for the wrong reason: holdout trades, rows or bars
-reaching a development verdict, a leg that exits after the development window counted, a
+"""Guards against gate measurements that flatter for the wrong reason: holdout trades, rows or bars
+reaching a development measurement, a leg that exits after the development window counted, a
 walk-forward pick made with the test window's own results, a candidate chosen on rows outside
 dev, a thin edge that only survives because its best trades or the extra cost were left out,
-and a failing criterion missing from the reasons.
+and a hidden pass mark: while strategies are explored nothing is scored (DECISIONS 2026-10-26).
 
 API under test (asof.evolve.gate, new module):
 
@@ -14,15 +14,14 @@ API under test (asof.evolve.gate, new module):
     Segment(train, test, picked: int | None, legs: int, mean: float | None,
             null_mean: float | None, positive: bool)
     GateResult(dev, candidate, variants: dict[int, VariantResult], segments: list[Segment],
-               walk_forward_positive, versus: Versus, mde, thin_excess, thin_edge_ok,
-               versions_on_dev, passed, reasons: list[str])
+               walk_forward_positive, walk_forward_scorable, versus: Versus, mde,
+               thin_excess, thin_drop_excess, thin_cost_excess, versions_on_dev, left_out,
+               seen_before_protocol)  -- no pass, fail or reasons
     check(session, con, root, run_ids, *, cfg, protocol, permutations, seed) -> GateResult
 
 Interface points this file pins down where the spec left a choice:
-- ``reasons`` names: "null" (candidate p_adjusted >= alpha), "walk_forward" (fewer positive
-  segments than min_positive), "thin_edge", and the three Versus field names
-  "drawdown_not_worse_than_basket", "sharpe_at_least_best", "beats_spy_and_basket_total".
-  Compared as sets: the order is not pinned.
+- ``alpha`` and ``walk_forward.min_positive`` are reference numbers: alpha enters the MDE only,
+  min_positive nothing measured.
 - ``result.dev`` has ``start`` and ``end`` (the protocol's Window).
 - An unknown run raises LookupError (as null_test does); no dev legs or no dev equity rows
   raise ValueError, the latter mentioning "replay".
@@ -37,7 +36,7 @@ are in test_null.py.
 
 Assumptions these fixtures cannot settle; check them on the real store:
 - A replay's equity rows cover every session of its window, so the dev slice lines up with the
-  benchmarks' sessions. Check: for each run passed to `asof gate check`, count equity_daily
+  benchmarks' sessions. Check: for each run passed to `asof gate report`, count equity_daily
   rows inside dev against visible_sessions over the same dates; any difference must be zero.
 - The MDE reference: on the real earnings_gap run (sd of dev leg returns about 14.3%, n 170)
   the report shows an MDE of about 2.7%.
@@ -299,7 +298,7 @@ def test_thin_edge_drops_the_best_legs_and_charges_only_the_real_returns(
     charged = (1 + real[keep]) * (1 - c) / (1 + c) - 1
     assert sorted(real[keep].tolist()) == pytest.approx([0.04, 0.05, 0.06, 0.07])
     assert result.thin_excess == pytest.approx(float(charged.mean() - null[:, keep].mean()))
-    assert result.thin_edge_ok is True
+    assert result.thin_excess is not None and result.thin_excess > 0
 
 
 def test_the_mde_is_the_normal_approximation_over_the_candidates_dev_returns(
@@ -325,18 +324,20 @@ def test_versus_is_the_candidates_comparison_over_dev(
     assert (result.versus.start, result.versus.end) == (DEV_DAYS[0], DEV_DAYS[-1])
     # Measured: A total 50.4% and Sharpe 15.97, drawdown 0; SPY 3.8% / 2.96, basket 21.9% / 7.76
     # with a 0.25% drawdown.
-    assert result.versus.drawdown_not_worse_than_basket is True
-    assert result.versus.sharpe_at_least_best is True
-    assert result.versus.beats_spy_and_basket_total is True
+    spy, basket = result.versus.differences
+    assert spy.total_return == pytest.approx(result.versus.strategy.total_return - 0.038, abs=1e-3)
+    assert all(d.total_return > 0 and d.max_drawdown <= 0 for d in (spy, basket))
+    assert spy.sharpe is not None and spy.sharpe > 0
 
 
-def test_a_run_meeting_every_criterion_passes_with_no_reasons(
+def test_nothing_is_scored(
     session: Session, con: duckdb.DuckDBPyConnection, root: Path, runs: Runs, cfg: StrategyConfig
 ) -> None:
     result = gate(session, con, root, [runs.a, runs.b], cfg)
 
-    assert result.passed is True
-    assert result.reasons == []
+    for name in ("passed", "reasons", "thin_edge_ok"):
+        assert not hasattr(result, name), name
+        assert not hasattr(result.versus, name), name
 
 
 def test_versions_on_dev_counts_each_version_that_traded_or_marked_in_dev_once(
@@ -478,9 +479,8 @@ def test_dropping_every_leg_fails_the_thin_edge(
     result = gate(session, con, root, [runs.a, runs.b], cfg,
                   with_(thin_edge=GATE.thin_edge.model_copy(update={"drop_top": 7})))  # fmt: skip
 
-    assert result.thin_edge_ok is False
-    assert set(result.reasons) == {"thin_edge"}
-    assert result.passed is False
+    assert result.thin_excess is None
+    assert result.thin_drop_excess is None
 
 
 def test_the_extra_cost_is_charged_to_real_returns_only(
@@ -495,38 +495,33 @@ def test_the_extra_cost_is_charged_to_real_returns_only(
     _, reals, nulls = reference(session, con, root, [runs.a, runs.b], cfg)
     charged = (1 + reals[runs.a]) * 0.8 / 1.2 - 1
     assert result.thin_excess == pytest.approx(float(charged.mean() - nulls[runs.a].mean()))
-    assert result.thin_edge_ok is False
+    assert result.thin_excess is not None and result.thin_excess < 0
 
 
-@pytest.mark.parametrize(
-    ("changes", "reason"),
-    [
-        ({"alpha": 0.02}, "null"),  # p adjusted 0.025
-        (
-            {"walk_forward": {"train_months": 1, "test_months": 1, "min_positive": 3}},
-            "walk_forward",
-        ),
-    ],
-    ids=["null", "walk_forward"],
-)
-def test_a_failing_protocol_criterion_is_the_only_reason(
-    session: Session,
-    con: duckdb.DuckDBPyConnection,
-    root: Path,
-    runs: Runs,
-    cfg: StrategyConfig,
-    changes: dict[str, object],
-    reason: str,
+def test_reference_numbers_change_no_measurement_but_the_mde(
+    session: Session, con: duckdb.DuckDBPyConnection, root: Path, runs: Runs, cfg: StrategyConfig
 ) -> None:
-    p = EvaluationProtocol.model_validate({**GATE.model_dump(), **changes})
+    # min_positive and alpha are only reference lines now: a stricter min_positive changes
+    # nothing, a stricter alpha changes the MDE (its z) and nothing else.
+    base = gate(session, con, root, [runs.a, runs.b], cfg)
+    wf = {"train_months": 1, "test_months": 1, "min_positive": 3}
+    strict_wf = gate(
+        session,
+        con,
+        root,
+        [runs.a, runs.b],
+        cfg,
+        EvaluationProtocol.model_validate({**GATE.model_dump(), "walk_forward": wf}),
+    )
+    strict_alpha = gate(session, con, root, [runs.a, runs.b], cfg, with_(alpha=0.02))
 
-    result = gate(session, con, root, [runs.a, runs.b], cfg, p)
+    assert strict_wf == base
+    assert strict_alpha.mde is not None and base.mde is not None
+    assert strict_alpha.mde > base.mde
+    assert dataclasses.replace(strict_alpha, mde=base.mde) == base
 
-    assert result.passed is False
-    assert set(result.reasons) == {reason}
 
-
-def test_a_soaring_spy_fails_the_sharpe_and_total_criteria(
+def test_a_soaring_spy_shows_as_negative_sharpe_and_total_differences(
     session: Session,
     con: duckdb.DuckDBPyConnection,
     tmp_path: Path,
@@ -538,11 +533,13 @@ def test_a_soaring_spy_fails_the_sharpe_and_total_criteria(
 
     result = gate(session, con, hot, [runs.a, runs.b], cfg)
 
-    assert result.passed is False
-    assert set(result.reasons) == {"sharpe_at_least_best", "beats_spy_and_basket_total"}
+    spy, basket = result.versus.differences
+    assert spy.sharpe is not None and spy.sharpe < 0
+    assert spy.total_return < 0
+    assert basket.total_return > 0
 
 
-def test_a_candidate_deeper_in_drawdown_than_the_basket_fails_that_criterion(
+def test_a_candidate_deeper_in_drawdown_than_the_basket_shows_it(
     session: Session, con: duckdb.DuckDBPyConnection, root: Path, runs: Runs, cfg: StrategyConfig
 ) -> None:
     # A's path with one -3% session in March: drawdown 3% against the basket's 0.25%; its
@@ -554,7 +551,9 @@ def test_a_candidate_deeper_in_drawdown_than_the_basket_fails_that_criterion(
     result = gate(session, con, root, [a2, runs.b], cfg)
 
     assert result.candidate == a2
-    assert set(result.reasons) == {"drawdown_not_worse_than_basket"}
+    spy, basket = result.versus.differences
+    assert basket.max_drawdown == pytest.approx(0.03 - 0.0025, abs=1e-3)
+    assert spy.total_return > 0 and basket.total_return > 0
 
 
 def test_a_run_without_dev_legs_raises(
@@ -653,28 +652,25 @@ def test_a_walk_forward_pick_ignores_the_test_windows_rows(
 # =============================================================================================
 
 
-def test_a_strategy_seen_before_the_protocol_never_passes_on_dev(
+def test_a_strategy_seen_before_the_protocol_is_flagged(
     session: Session, con: duckdb.DuckDBPyConnection, root: Path, runs: Runs, cfg: StrategyConfig
 ) -> None:
-    # The passing family again, under a protocol that lists earnings_gap as replayed over these
-    # dates before the protocol existed: every number stays, the verdict cannot be a pass.
+    # The same family under a protocol that lists earnings_gap as replayed over these dates
+    # before the protocol existed: every number stays, the report must say they are not clean.
     plain = gate(session, con, root, [runs.a, runs.b], cfg)
     seen = gate(
         session, con, root, [runs.a, runs.b], cfg, with_(seen_before_protocol=["earnings_gap"])
     )
 
-    assert plain.passed is True and plain.seen_before_protocol is False
+    assert plain.seen_before_protocol is False
     assert seen.seen_before_protocol is True
-    assert seen.passed is False
-    assert seen.reasons == ["seen_before_protocol"]
-    assert seen.variants == plain.variants and seen.segments == plain.segments
+    assert seen == dataclasses.replace(plain, seen_before_protocol=True)
 
 
-def test_too_few_scorable_windows_is_named_as_not_evaluable(
+def test_windows_without_a_pick_are_counted_apart(
     session: Session, con: duckdb.DuckDBPyConnection, root: Path, runs: Runs, cfg: StrategyConfig
 ) -> None:
-    # Dev from December: four windows, the first with no rows to pick on. Needing 4 positive
-    # out of 3 scorable cannot happen; the reason says so instead of "no edge".
+    # Dev from December: four windows, the first with no rows to pick on.
     p = EvaluationProtocol.model_validate(
         {**GATE.model_dump(), "dev": {"start": date(2024, 12, 1), "end": DEV_END},
          "walk_forward": {"train_months": 1, "test_months": 1, "min_positive": 4}}
@@ -684,8 +680,7 @@ def test_too_few_scorable_windows_is_named_as_not_evaluable(
 
     assert len(result.segments) == 4
     assert sum(s.picked is not None for s in result.segments) == 3
-    assert "walk_forward_not_evaluable" in result.reasons
-    assert "walk_forward" not in result.reasons
+    assert result.walk_forward_scorable == 3
 
 
 def test_a_run_without_a_version_counts_as_one_attempt(

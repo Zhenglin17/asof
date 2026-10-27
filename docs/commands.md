@@ -63,9 +63,9 @@ The [README](../README.md) is the short tour.
 - [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
       is compared with the benchmarks on return, drawdown, Sharpe and exposure
       (`asof gate compare`)
-- [x] Gate verdict over development dates: random entries with the family correction,
-      walk-forward, thin edge and the benchmarks; minimum detectable edge and attempts
-      reported (`asof gate check`)
+- [x] Gate report over development dates: random entries with the family correction,
+      walk-forward, thin edge, the benchmarks, minimum detectable edge and attempts, shown
+      side by side without a pass mark (`asof gate report`)
 - [ ] Strategy evolution: proposals, approval
 
 ## Development
@@ -599,47 +599,47 @@ prints total and annualized return, maximum drawdown and the Sharpe ratio of dai
 above `comparison.risk_free_rate` (0: idle cash earns nothing in a replay), annualized over
 252 sessions. The strategy starts from its initial equity, the benchmarks from the money
 invested at the first open. It also prints the mean share of equity invested and the share of
-sessions at least `comparison.high_exposure` invested, and three criteria the walk-forward
-gate will apply, reported here without a verdict: a maximum drawdown no worse than the
-basket's, a Sharpe ratio at least the better of SPY's and the basket's, and a total return
-above both.
+sessions at least `comparison.high_exposure` invested, and the strategy minus each benchmark:
+total return and maximum drawdown in percentage points (a positive drawdown difference means
+the strategy fell further) and the Sharpe ratio's difference.
 
 
-### Gate verdict
+### Gate report
 
 ```bash
-uv run asof gate check --run 4                # one run's verdict over development dates
-uv run asof gate check --run 5 --run 6 --run 7  # a family: the best variant is judged
+uv run asof gate report --run 4                 # one run over development dates
+uv run asof gate report --run 5 --run 6 --run 7  # a family: the best variant is measured
 ```
 
-The verdict reads development dates only (`dev` in `configs/evaluation.yaml`): a leg counts
+The report reads development dates only (`dev` in `configs/evaluation.yaml`): a leg counts
 when it enters and exits within them, equity is cut at their end, and prices are read as known
 at the last dev exit. The family's candidate is the run with the best Sharpe ratio over dev
-(ties to the lowest run id). It passes when all of these hold:
+(ties to the lowest run id). For it the report shows, side by side and without a pass mark
+(while strategies are explored nothing is scored; a pass mark is set when one is about to be
+run):
 
-- random entries: its adjusted p below `alpha`, with the max-statistic correction across the
-  family;
+- random entries: every run's excess and p, adjusted with the max-statistic correction across
+  the family;
 - walk-forward: windows of `walk_forward.train_months` to pick the best Sharpe and the next
   `test_months` to score the pick, rolling by `test_months`; a window is positive when the
-  pick's legs entering in it beat the same legs' random entries, and `min_positive` must be.
-  A window whose train months hold no equity is not evaluable and counts as not positive;
-  when too few are evaluable the reason says so;
-- thin edge: without the best `thin_edge.drop_top` legs by return and with
-  `extra_cost_bps` more a side charged to the real legs, the excess over random entries stays
-  above zero (the report also gives the two parts alone);
-- the three benchmark criteria of `asof gate compare`, over dev;
-- the strategy is not in `seen_before_protocol`: those were replayed over these dates before
-  the protocol and are judged only from `clean_after` on.
+  pick's legs entering in it beat the same legs' random entries. A window whose train months
+  hold no equity is not evaluable and is counted apart;
+- thin edge: the excess without the best `thin_edge.drop_top` legs by return and with
+  `extra_cost_bps` more a side charged to the real legs, and each of the two alone;
+- the benchmarks over dev and the strategy minus each of them;
+- the minimum detectable edge at `alpha` and `mde_power`, the versions replayed on dev dates,
+  the legs left out for exiting after dev, the candidate's metrics by period with the Sharpe
+  ratio's standard error (Lo 2002, daily returns: sqrt((1 + SR^2 / 504) / years)), and its ten
+  best legs.
 
-The report (`<data-dir>/reports/gate-<runs>.md`, or `--report`) adds the minimum detectable
-edge at `alpha` and `mde_power`, the number of versions replayed on dev dates, the legs left
-out for exiting after dev, the candidate's metrics by period with the Sharpe ratio's standard
-error (Lo 2002, daily returns: sqrt((1 + SR^2 / 504) / years)), and its ten best legs. Exit 0
-pass, 2 fail, 1 cannot run.
+A strategy in `seen_before_protocol` was replayed over these dates before the protocol; the
+report says its numbers are not clean evidence. The report goes to
+`<data-dir>/reports/gate-<runs>.md`, or `--report`. Exit 0 when written, 1 when it cannot run.
 
-On run 4 (take-all, 2023-01-03 to 2025-06-30 within dev): fail. 383 legs, +0.69% a leg over
-random entries, p = 0.11, MDE +1.91%; walk-forward 3 of 7 (the first three windows have no
-equity to pick on); dropping the best three legs alone leaves 0.00%.
+On run 4 (take-all, 2023-01-03 to 2025-06-30 within dev): 383 legs, +0.69% a leg over random
+entries, p = 0.11, MDE +1.91%; walk-forward 3 positive of 4 evaluable windows (the first
+three have no equity to pick on); without the best three legs 0.00%; against SPY Sharpe
++0.15, max drawdown -8.2 pts, total return -8.7 pts.
 
 ## Layout
 

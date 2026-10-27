@@ -1,12 +1,12 @@
-"""The gate's verdict on a family of replays, over the protocol's development dates only.
+"""The gate's measurements of a family of replays, over the protocol's development dates only.
 
-A variant passes when its edge over random entries survives the family's max-statistic
-correction, holds up walk-forward (a pick made on earlier months beats random entries on the
-months after), survives dropping its best legs and an extra cost, and does not trail the
-benchmarks on drawdown, Sharpe ratio or total return. Nothing dated after dev counts: a leg
-must enter and exit within it, equity rows are cut at its end, and prices are read as known at
-the last dev exit. The minimum detectable edge and the number of versions replayed on dev are
-reported, not judged.
+For the family's best variant: its edge over random entries with the family's max-statistic
+correction, walk-forward (does a pick made on earlier months beat random entries on the months
+after), the edge without its best legs and with an extra cost, the benchmarks side by side, the
+minimum detectable edge and the versions replayed on dev. While strategies are explored these
+are shown, not scored: no pass or fail (DECISIONS 2026-10-26); a pass mark is set only when a
+strategy is about to be run. Nothing dated after dev counts: a leg must enter and exit within
+it, equity rows are cut at its end, and prices are read as known at the last dev exit.
 """
 
 import math
@@ -59,18 +59,16 @@ class GateResult:
     variants: dict[int, VariantResult]
     segments: list[Segment]
     walk_forward_positive: int
+    walk_forward_scorable: int  # windows with a pick; the others had no equity to pick on
     versus: Versus
     mde: float | None  # one-sided, at the protocol's alpha and mde_power; None below 2 legs
     thin_excess: float | None  # None when dropping the best legs leaves none
-    thin_edge_ok: bool
     # The two parts of the thin edge alone (report only): best legs dropped, extra cost charged.
     thin_drop_excess: float | None
     thin_cost_excess: float
     versions_on_dev: int
     left_out: int  # the candidate's legs entering in dev but exiting after it
-    seen_before_protocol: bool  # replayed over these dates before the protocol: no verdict
-    passed: bool
-    reasons: list[str]
+    seen_before_protocol: bool  # replayed over these dates before the protocol: not clean
 
 
 def _add_months(day: date, months: int) -> date:
@@ -113,7 +111,7 @@ def _best(sharpes: Mapping[int, float | None]) -> int:
 
 def _versions_on_dev(session: Session, strategy_id: str | None, dev: Window) -> int:
     """Versions of the strategy with a trade entering, or a mark, in dev: what a reader of the
-    verdict should count as tried. A run without a version (older than versions) counts alone."""
+    numbers should count as tried. A run without a version (older than versions) counts alone."""
     as_of = _close_of(dev.end)
     runs = [r for r in runs_of_strategy(session, strategy_id) if r.id is not None]
     traded = {
@@ -212,7 +210,6 @@ def check(
         thin_excess = float(charged(returns[keep]).mean() - draws[:, keep].mean())
         thin_drop = float(returns[keep].mean() - draws[:, keep].mean())
     thin_cost = float(charged(returns).mean() - draws.mean())
-    thin_ok = thin_excess is not None and thin_excess > 0
 
     mde = None
     if len(returns) >= 2:
@@ -223,39 +220,21 @@ def check(
     versus = compare_run(session, con, root, candidate, protocol, window=(dev.start, dev.end))
     run = session.get(Run, candidate)
     seen = run is not None and run.strategy_id in protocol.seen_before_protocol
-    # Windows whose train months hold no row cannot be scored; when too few can, the failure is
-    # named for that, not for a lack of edge. The count needed stays the protocol's.
-    scorable = sum(s.picked is not None for s in segments)
-    walk_forward = "walk_forward" if scorable >= wf.min_positive else "walk_forward_not_evaluable"
-    checks = {
-        # The protocol counts a strategy replayed over these dates before it only after
-        # clean_after: on dev it gets numbers, never a pass.
-        "seen_before_protocol": not seen,
-        "null": variants[candidate].p_adjusted < protocol.alpha,
-        walk_forward: positive >= wf.min_positive,
-        "thin_edge": thin_ok,
-        "drawdown_not_worse_than_basket": versus.drawdown_not_worse_than_basket,
-        "sharpe_at_least_best": versus.sharpe_at_least_best,
-        "beats_spy_and_basket_total": versus.beats_spy_and_basket_total,
-    }
-    reasons = [name for name, ok in checks.items() if not ok]
     return GateResult(
         dev=dev,
         candidate=candidate,
         variants=variants,
         segments=segments,
         walk_forward_positive=positive,
+        walk_forward_scorable=sum(s.picked is not None for s in segments),
         versus=versus,
         mde=mde,
         thin_excess=thin_excess,
-        thin_edge_ok=thin_ok,
         thin_drop_excess=thin_drop,
         thin_cost_excess=thin_cost,
         versions_on_dev=_versions_on_dev(session, run.strategy_id if run else None, dev),
         left_out=late[candidate],
         seen_before_protocol=seen,
-        passed=not reasons,
-        reasons=reasons,
     )
 
 
@@ -268,6 +247,15 @@ def _pct(value: float | None) -> str:
     return f"{value:+.2%}" if value is not None else "-"
 
 
+def _signed(value: float | None) -> str:
+    return f"{value:+.2f}" if value is not None else "-"
+
+
+def _points(value: float) -> str:
+    """A difference of two percentages, in percentage points."""
+    return f"{value * 100:+.1f} pts"
+
+
 def _metrics_row(label: str, m: CurveMetrics) -> str:
     sharpe = f"{m.sharpe:.2f}" if m.sharpe is not None else "-"
     return (
@@ -278,21 +266,29 @@ def _metrics_row(label: str, m: CurveMetrics) -> str:
 
 def render_report(session: Session, result: GateResult, protocol: EvaluationProtocol) -> str:
     dev, cand = result.dev, result.candidate
-    verdict = "PASS" if result.passed else "FAIL: " + ", ".join(result.reasons)
     against = result.versus
+    best = result.variants[cand]
+    spy = against.differences[0]
     out = [
         f"# Gate: runs {', '.join(str(r) for r in result.variants)}",
         "",
         f"Development dates {dev.start} .. {dev.end}; the candidate's equity covers "
-        f"{against.start} .. {against.end} of them. Candidate run {cand} (best Sharpe over dev). "
-        f"Verdict: **{verdict}**.",
+        f"{against.start} .. {against.end} of them. Candidate run {cand} (best Sharpe over dev).",
+        "",
+        "Measured, not scored while strategies are explored: "
+        f"{best.excess:+.2%} a leg over random entries (p adjusted {best.p_adjusted:.3f}); "
+        f"walk-forward {result.walk_forward_positive} positive of "
+        f"{result.walk_forward_scorable} evaluable windows ({len(result.segments)} in all); "
+        f"without the best {protocol.thin_edge.drop_top} legs {_pct(result.thin_drop_excess)}; "
+        f"against {spy.label.split()[0]}: Sharpe {_signed(spy.sharpe)}, max drawdown "
+        f"{_points(spy.max_drawdown)}, total return {_points(spy.total_return)}.",
         "",
     ]
     if result.seen_before_protocol:
         out += [
             "This strategy was replayed over these dates before the protocol was registered "
-            f"(`seen_before_protocol`): its dev numbers are shown for reference, and the protocol "
-            f"judges it only on dates from {protocol.clean_after} on.",
+            f"(`seen_before_protocol`): these numbers are not clean evidence; only dates from "
+            f"{protocol.clean_after} on are.",
             "",
         ]
     out += [
@@ -310,8 +306,8 @@ def render_report(session: Session, result: GateResult, protocol: EvaluationProt
     out += [
         "",
         f"## Walk-forward ({wf.train_months} months to pick, {wf.test_months} to score; "
-        f"{result.walk_forward_positive} of {len(result.segments)} positive, "
-        f"{wf.min_positive} needed)",
+        f"{result.walk_forward_positive} of {result.walk_forward_scorable} evaluable windows "
+        f"positive; reference line {wf.min_positive})",
         "",
         "| train | test | pick | legs | mean | random | positive |",
         "|---|---|--:|--:|--:|--:|---|",
@@ -324,10 +320,7 @@ def render_report(session: Session, result: GateResult, protocol: EvaluationProt
             f"{_pct(s.null_mean)} | {status} |"
         )
     out.append("")
-    out.append(
-        "A window is not evaluable when no run has equity in its train months; it counts as not "
-        "positive, and the number needed does not shrink."
-    )
+    out.append("A window is not evaluable when no run has equity in its train months.")
     if len(result.variants) == 1:
         out.append(
             "With one run in the family every pick is that run: the windows test the stability "
@@ -340,13 +333,14 @@ def render_report(session: Session, result: GateResult, protocol: EvaluationProt
         "",
         f"- Thin edge: without the best {te.drop_top} legs (by return) and with "
         f"{te.extra_cost_bps:g} bps more a side on the real legs, excess "
-        f"{_pct(result.thin_excess)} a leg ({'ok' if result.thin_edge_ok else 'fails'}). Apart: "
+        f"{_pct(result.thin_excess)} a leg. Apart: "
         f"dropping the legs alone {_pct(result.thin_drop_excess)}, the cost alone "
         f"{_pct(result.thin_cost_excess)}.",
         f"- MDE (report only): {_pct(result.mde)} a leg at one-sided alpha {protocol.alpha:g} and "
         f"power {protocol.mde_power:g}, over {result.variants[cand].trades} legs; from the spread "
         "of the real legs, not corrected for the family.",
-        f"- Versions of this strategy replayed on dev dates: {result.versions_on_dev}.",
+        f"- Versions of this strategy replayed on dev dates: {result.versions_on_dev} "
+        f"(reference budget {protocol.attempt_budget}).",
         f"- Legs entering in dev but exiting after it, left out: {result.left_out}.",
         "",
         f"## Benchmarks over {against.start} .. {against.end}",
@@ -356,13 +350,19 @@ def render_report(session: Session, result: GateResult, protocol: EvaluationProt
         _metrics_row(f"run {cand}", result.versus.strategy),
         *(_metrics_row(label, m) for label, m in result.versus.benchmarks),
         "",
-        f"Mean exposure {result.versus.mean_exposure:.1%}; criteria: drawdown not worse than the "
-        f"basket's {'yes' if result.versus.drawdown_not_worse_than_basket else 'no'}, Sharpe at "
-        f"least the better of SPY's and the basket's "
-        f"{'yes' if result.versus.sharpe_at_least_best else 'no'}, total above both "
-        f"{'yes' if result.versus.beats_spy_and_basket_total else 'no'}.",
+        "| the strategy minus | total | max dd | Sharpe |",
+        "|---|--:|--:|--:|",
+        *(
+            f"| {d.label} | {_points(d.total_return)} | {_points(d.max_drawdown)} | "
+            f"{_signed(d.sharpe)} |"
+            for d in against.differences
+        ),
         "",
-        "## Candidate by period (report only; the verdict reads dev alone)",
+        f"Mean exposure {against.mean_exposure:.1%}; sessions at least "
+        f"{protocol.comparison.high_exposure:.0%} invested {against.high_exposure_share:.1%}. "
+        "Max drawdown above zero: the strategy fell further.",
+        "",
+        "## Candidate by period (the measurements above read dev alone)",
         "",
         "| period | sessions | total | max dd | Sharpe | Sharpe s.e. |",
         "|---|--:|--:|--:|--:|--:|",
@@ -400,7 +400,7 @@ def render_report(session: Session, result: GateResult, protocol: EvaluationProt
     legs.sort(key=lambda t: -t.pnl)
     out += [
         "",
-        "## Candidate's top legs by pnl (read them before trusting the verdict)",
+        "## Candidate's top legs by pnl (read them before trusting the numbers)",
         "",
         "| symbol | entry | exit | pnl | return |",
         "|---|---|---|--:|--:|",

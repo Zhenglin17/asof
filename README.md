@@ -85,11 +85,12 @@ flowchart TB
   scanner could have bought that evening without its signal, corrected for every variant
   tried. [Details](docs/commands.md#random-entry-null) Every replay records its account marked
   to market at each close, set against the same benchmarks on return, drawdown and Sharpe.
-  [Details](docs/commands.md#strategy-versus-benchmarks) The gate's verdict combines these
-  over development dates only: the random-entry test, walk-forward (a pick made on two years
-  must beat random entries on the next six months, in four of seven windows), a thin-edge check
-  (the edge must survive dropping the best three legs and an extra cost) and the benchmarks.
-  [Details](docs/commands.md#gate-verdict)
+  [Details](docs/commands.md#strategy-versus-benchmarks) The gate report puts these side by
+  side over development dates only: the random-entry test, walk-forward (does a pick made on
+  two years beat random entries on the next six months), the edge without the best three legs
+  and with an extra cost, and the benchmarks. While strategies are explored it measures and
+  does not score; a pass mark is set when a strategy is about to be run.
+  [Details](docs/commands.md#gate-report)
 
 ## Results so far
 
@@ -138,11 +139,11 @@ dates (SPY 1.35), 0.37 on the holdout's dates (SPY 1.68) and -0.07 after the mod
 this is out of sample, and the watchlist was picked with hindsight. Against random
 entries from the same candidate pool on the same days, its 632 closed legs averaged +1.73%
 where random picks averaged +1.54%: an edge of +0.19% a leg, p = 0.33. Most of the per-trade
-return came from the market and the watchlist, not from the gap. The gate fails it on
-development dates (where filings start in 2023): +0.69% a leg over random entries, p = 0.11,
-below the +1.9% its 383 legs could detect, and all of it from three trades (QBTS, SMCI, DUOL);
-dropping them leaves 0.00%. This strategy was replayed over these dates before the protocol
-existed, so the protocol would not count a pass here anyway.
+return came from the market and the watchlist, not from the gap. On development dates (where
+filings start in 2023) the gate report shows +0.69% a leg over random entries, p = 0.11: no
+evidence of an edge, from 383 legs that could only detect one above +1.9%. All of it comes
+from three trades (QBTS, SMCI, DUOL); without them it is 0.00%. This strategy was replayed over
+these dates before the protocol existed, so none of it is clean evidence.
 
 The grid ran on throwaway copies of the database, so it adds nothing to the recorded attempt
 count. It is still a search to anyone who picks its best cell, and is shown as such.
@@ -221,7 +222,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] Fast loop: scanner, take-all and LLM judges, executor, ledger, attribution, replay report
 - [x] Demo page on GitHub Pages
 - [ ] Minute bars, XBRL facts, FRED
-- [x] Significance gate: random entries, walk-forward, thin edge, benchmarks
+- [x] Gate report: random entries, walk-forward, thin edge, benchmarks, side by side
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

@@ -20,7 +20,7 @@ from asof.demo.build import build
 from asof.evidence.retrieve import search
 from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
 from asof.evolve.benchmark import benchmarks
-from asof.evolve.gate import check as gate_verdict
+from asof.evolve.gate import check as gate_measure
 from asof.evolve.gate import render_report
 from asof.evolve.holdout import HoldoutError
 from asof.evolve.null import null_test
@@ -1891,8 +1891,8 @@ def gate_null(
         )
 
 
-@gate_app.command("check")
-def gate_check(
+@gate_app.command("report")
+def gate_report(
     runs: Annotated[
         list[int], typer.Option("--run", help="A replay run; several runs form one family.")
     ],
@@ -1919,9 +1919,9 @@ def gate_check(
         typer.Option("--report", help="Defaults to <data-dir>/reports/gate-<runs>.md."),
     ] = None,
 ) -> None:
-    """The gate's verdict on a family of runs over the protocol's development dates: random
-    entries with the max-statistic correction, walk-forward, thin edge and the benchmarks; the
-    minimum detectable edge is reported. Exit 0 pass, 2 fail."""
+    """The gate's measurements of a family of runs over the protocol's development dates, side
+    by side and not scored: random entries with the max-statistic correction, walk-forward, thin
+    edge, the benchmarks, the minimum detectable edge. Writes a markdown report."""
     base = data_dir or default_data_dir()
     root = _market_root(data_dir)
     engine = make_engine(db or default_db_path())
@@ -1935,7 +1935,7 @@ def gate_check(
         with Session(engine) as session:
             cfg = _family_config(session, runs, strategies_dir, current_strategy)
             try:
-                result = gate_verdict(
+                result = gate_measure(
                     session, con, root, runs, cfg=cfg, protocol=protocol,
                     permutations=permutations or protocol.permutations, seed=seed,
                 )  # fmt: skip
@@ -1948,11 +1948,13 @@ def gate_check(
     path = report or base / "reports" / f"gate-{'-'.join(str(r) for r in runs)}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
-    verdict = "pass" if result.passed else "fail: " + ", ".join(result.reasons)
-    typer.echo(f"gate {verdict} (candidate run {result.candidate})")
+    best = result.variants[result.candidate]
+    typer.echo(
+        f"candidate run {result.candidate}: {best.excess:+.2%} a leg over random entries "
+        f"(p adj {best.p_adjusted:.3f}), walk-forward {result.walk_forward_positive} of "
+        f"{result.walk_forward_scorable} evaluable windows positive"
+    )
     typer.echo(f"report {path}")
-    if not result.passed:
-        raise typer.Exit(2)
 
 
 @gate_app.command("compare")
@@ -1966,8 +1968,8 @@ def gate_compare(
     ] = None,
 ) -> None:
     """A run's daily marked-to-market equity against the protocol's benchmarks over the same
-    sessions: return, drawdown and Sharpe, how invested it was, and the walk-forward criteria
-    (reported only, not a verdict)."""
+    sessions: return, drawdown and Sharpe, how invested it was, and the strategy minus each
+    benchmark (shown, not scored)."""
     root = _market_root(data_dir)
     engine = make_engine(db or default_db_path())
     init_db(engine)
@@ -1997,13 +1999,11 @@ def gate_compare(
     high = protocol.comparison.high_exposure
     typer.echo(f"mean exposure {v.mean_exposure:.1%}; high-exposure share (>= {high:.0%}) "
                f"{v.high_exposure_share:.1%}")  # fmt: skip
-    spy = protocol.benchmarks.symbols[0]
-    for text, ok in [
-        ("max drawdown not worse than the basket's", v.drawdown_not_worse_than_basket),
-        (f"Sharpe at least the better of {spy} and the basket", v.sharpe_at_least_best),
-        (f"total return above both {spy} and the basket", v.beats_spy_and_basket_total),
-    ]:
-        typer.echo(f"  {'yes' if ok else 'no':<3} {text}")
+    typer.echo("the strategy minus each benchmark (max dd above zero: the strategy fell further)")
+    typer.echo(f"{'':<{width}} {'total':>11} {'max dd':>10} {'sharpe':>7}")
+    for d in v.differences:
+        total, drawdown = f"{d.total_return * 100:+.1f} pts", f"{d.max_drawdown * 100:+.1f} pts"
+        typer.echo(f"{d.label:<{width}} {total:>11} {drawdown:>10} {sharpe(d.sharpe)}")
 
 
 demo_app = typer.Typer(help="Data for the static demo page.", no_args_is_help=True)

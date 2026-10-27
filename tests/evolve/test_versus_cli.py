@@ -1,13 +1,14 @@
 """Guards against `asof gate compare` failing in ways a user cannot read: an unknown run or a run
 without daily equity must end with exit code 1 and one line, never a traceback; a good run prints
-the strategy and every protocol benchmark with their numbers, the exposure figures and the three
-criteria as yes/no.
+the strategy and every protocol benchmark with their numbers, the exposure figures and the
+strategy minus each benchmark (shown, not scored: no yes/no).
 
 CLI under test (asof.cli):
 
     asof gate compare --run N [--data-dir DIR] [--db FILE]
         rows: strategy, then each benchmark; columns total, annualized, max dd, sharpe;
-        then mean exposure, high-exposure share, and the three report-only criteria (yes/no).
+        then mean exposure, high-exposure share, and "the strategy minus" each benchmark:
+        total and max drawdown in percentage points, Sharpe as a difference ("-" if none).
 
 The command reads the committed protocol (configs/evaluation.yaml: SPY, QQQ, a top-10 basket),
 so the store holds SPY and QQQ besides tests/evolve/test_benchmark.py's stocks A-D (provenance
@@ -75,8 +76,15 @@ def new_run(session: Session, equity: Sequence[float] | None) -> int:
     return run.id
 
 
-def answers(text: str) -> list[str]:
-    return re.findall(r"\b(yes|no)\b", text)
+def differences(text: str) -> list[tuple[float, float, str]]:
+    """(total pts, max dd pts, sharpe) per line under "the strategy minus"."""
+    lines = text.split("the strategy minus", 1)[1].splitlines()[1:]
+    out = []
+    for line in lines:
+        m = re.search(r"([+-][\d.]+) pts\s+([+-][\d.]+) pts\s+(\S+)\s*$", line)
+        if m:
+            out.append((float(m[1]), float(m[2]), m[3]))
+    return out
 
 
 def compare(data_dir: Path, run_id: int) -> list[str]:
@@ -96,7 +104,9 @@ def strong_path() -> list[float]:
     return out
 
 
-def test_prints_every_row_the_exposure_and_the_criteria(data_dir: Path, session: Session) -> None:
+def test_prints_every_row_the_exposure_and_the_differences(
+    data_dir: Path, session: Session
+) -> None:
     run_id = new_run(session, strong_path())
 
     result = runner.invoke(app, compare(data_dir, run_id))
@@ -112,11 +122,14 @@ def test_prints_every_row_the_exposure_and_the_criteria(data_dir: Path, session:
     assert "mean exposure" in text
     assert "high-exposure share" in text
     assert "22.02%" in result.output  # the strategy's total return
-    # Every criterion holds for this path.
-    assert answers(text) == ["yes", "yes", "yes"], result.output
+    assert not re.search(r"\b(yes|no)\b", text), result.output  # nothing is scored
+    # Ahead of SPY, QQQ and the basket on total return, never in drawdown, with a Sharpe each.
+    rows = differences(text)
+    assert len(rows) == 3, result.output
+    assert all(total > 0 and drawdown <= 0 and sharpe != "-" for total, drawdown, sharpe in rows)
 
 
-def test_a_run_that_never_traded_prints_no_for_sharpe_and_total(
+def test_a_run_that_never_traded_shows_no_sharpe_difference(
     data_dir: Path, session: Session
 ) -> None:
     run_id = new_run(session, [INITIAL] * len(WINDOW))
@@ -126,8 +139,10 @@ def test_a_run_that_never_traded_prints_no_for_sharpe_and_total(
     assert result.exit_code == 0, result.output
     assert "Traceback" not in result.output
     text = result.output.lower()
-    # Drawdown 0 is not worse than the basket's; no Sharpe and no return pass nothing.
-    assert sorted(answers(text)) == ["no", "no", "yes"], result.output
+    # A flat line: no Sharpe to subtract, and minus each benchmark's return and drawdown.
+    rows = differences(text)
+    assert len(rows) == 3, result.output
+    assert all(sharpe == "-" and total < 0 and drawdown <= 0 for total, drawdown, sharpe in rows)
 
 
 def test_an_unknown_run_exits_one(data_dir: Path, session: Session) -> None:

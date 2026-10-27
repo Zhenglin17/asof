@@ -9,6 +9,9 @@
 # seen_before_protocol  strategies replayed over holdout dates before this file existed. They are
 #              not guarded (nothing left to protect) and their reports say so.
 # Numbers below are the gate's settings; changing one later counts as a new attempt.
+# 2026-10-26: while strategies are explored the gate measures and does not score. alpha and
+# the windows are used to compute; attempt_budget and walk_forward.min_positive are reference
+# lines in the report only, until a pass mark is set for a strategy about to be run.
 dev: {start: 2020-01-01, end: 2025-06-30}
 holdout: {start: 2025-07-01, end: 2026-06-30}
 clean_after: 2026-07-01
@@ -33,3 +36,5 @@ comparison: {risk_free_rate: 0.0, high_exposure: 0.70}
 # windows must be positive. mde_power: the power of the minimum detectable edge (report only).
 walk_forward: {train_months: 24, test_months: 6, min_positive: 4}
 mde_power: 0.80
+# 2026-10-26, gate measures without scoring: "must survive" (thin_edge) and "must be positive"
+# (min_positive) above now read as what the report shows, not conditions; see the note at top.

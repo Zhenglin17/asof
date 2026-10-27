@@ -1,4 +1,4 @@
-"""Benchmarks a strategy has to beat over the same dates: buy-and-hold of index funds and a
+"""Benchmarks a strategy is compared with over the same dates: buy-and-hold of index funds and a
 mechanical basket, the largest stocks by recent dollar volume held equal weight for a month.
 
 The basket picks its members point in time (``liquid_securities`` at 00:00 New York of the

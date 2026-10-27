@@ -1,9 +1,9 @@
 """Guards against a strategy-versus-benchmark comparison that flatters for the wrong reason: a
 window that is not the run's own sessions, a strategy base that already includes the first
 day's profit, benchmarks or settings taken from somewhere other than the protocol, exposure
-measured against the starting money instead of each day's equity, a criterion that compares
-with the wrong benchmark (QQQ or the best of all instead of SPY and the basket), a missing Sharpe
-ratio read as a pass, and benchmark bars after the run's last session changing the verdict.
+measured against the starting money instead of each day's equity, a difference taken against the
+wrong benchmark or with its sign flipped, a missing Sharpe ratio turned into a number, and
+benchmark bars after the run's last session changing the comparison.
 
 API under test (asof.evolve.versus, new module):
 
@@ -16,16 +16,16 @@ API under test (asof.evolve.versus, new module):
                       for curve in evolve.benchmark.benchmarks(con, root, protocol, start, end)]
         mean_exposure = mean(gross_exposure / equity) over the rows
         high_exposure_share = share of rows with gross_exposure / equity >= high_exposure
-        drawdown_not_worse_than_basket = strategy max_drawdown <= basket's
-        sharpe_at_least_best = strategy sharpe >= max(SPY's, basket's); False if any is None
-        beats_spy_and_basket_total = strategy total_return > SPY's and > basket's
+        differences = per benchmark, the strategy minus it: Sharpe (None if either is None),
+        max drawdown (above zero: the strategy fell further) and total return. Shown, not
+        scored: no criterion decides anything while strategies are explored.
     compare_run(..., window=(first, last)) keeps only rows with first <= session_date <= last;
         start, end are then the first and last kept rows. The base is the equity of the row just
         before the first kept one when there is one (the slice starts after the run's first
         row), else rows[0].equity - realized - unrealized as above. No row in the window ->
         LookupError, like a run without rows. window=None (the default) is the whole run.
-    Versus(run_id, start, end, strategy, benchmarks, mean_exposure, high_exposure_share,
-           drawdown_not_worse_than_basket, sharpe_at_least_best, beats_spy_and_basket_total)
+    Versus(run_id, start, end, strategy, benchmarks, mean_exposure, high_exposure_share)
+        .differences -> list[Difference(label, sharpe, max_drawdown, total_return)]
     "SPY" = the buy-and-hold of protocol.benchmarks.symbols[0]; the basket = the last curve,
     the one not named after a protocol symbol.
 
@@ -64,7 +64,7 @@ INITIAL = 100_000.0
 
 
 def settings(*, risk_free_rate: float = 0.0, high_exposure: float = 0.70) -> EvaluationProtocol:
-    """SPY first, then A (a stock that beats everything: no criterion may look at it)."""
+    """SPY first, then A (a stock that beats everything: shown like any other row)."""
     return protocol(
         benchmarks={
             "symbols": ["SPY", "A"],
@@ -155,11 +155,10 @@ def same_versus(a: Versus, b: Versus) -> None:
         same(x, y)
     assert a.mean_exposure == pytest.approx(b.mean_exposure)
     assert a.high_exposure_share == pytest.approx(b.high_exposure_share)
-    assert (
-        a.drawdown_not_worse_than_basket,
-        a.sharpe_at_least_best,
-        a.beats_spy_and_basket_total,
-    ) == (b.drawdown_not_worse_than_basket, b.sharpe_at_least_best, b.beats_spy_and_basket_total)
+    for x, y in zip(a.differences, b.differences, strict=True):
+        assert x.label == y.label
+        assert x.sharpe == (pytest.approx(y.sharpe) if y.sharpe is not None else None)
+        assert (x.max_drawdown, x.total_return) == pytest.approx((y.max_drawdown, y.total_return))
 
 
 # =============================================================================================
@@ -195,7 +194,7 @@ def test_strategy_and_benchmarks_over_the_runs_own_window(
     assert basket.max_drawdown == pytest.approx(1 - 0.90 / 1.05)
 
 
-def test_a_strategy_that_wins_everywhere_passes_all_three_criteria(
+def test_a_strategy_ahead_everywhere_shows_positive_differences(
     con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
 ) -> None:
     root = world(tmp_path, override=DIP)
@@ -204,13 +203,20 @@ def test_a_strategy_that_wins_everywhere_passes_all_three_criteria(
 
     v = compare_run(session, con, root, run_id, settings())
 
-    # Total 22% is below A's 30%: A is neither SPY nor the basket, so it does not count.
-    assert v.drawdown_not_worse_than_basket is True
-    assert v.sharpe_at_least_best is True
-    assert v.beats_spy_and_basket_total is True
+    # The strategy minus each benchmark, in the benchmarks' order: SPY, A, the basket.
+    spy, a, basket = v.differences
+    assert [d.label for d in v.differences] == [label for label, _ in v.benchmarks]
+    for d, (_, m) in zip(v.differences, v.benchmarks, strict=True):
+        assert d.total_return == pytest.approx(v.strategy.total_return - m.total_return)
+        assert d.max_drawdown == pytest.approx(v.strategy.max_drawdown - m.max_drawdown)
+        assert v.strategy.sharpe is not None and m.sharpe is not None
+        assert d.sharpe == pytest.approx(v.strategy.sharpe - m.sharpe)
+    assert spy.total_return > 0 and basket.total_return > 0
+    assert a.total_return < 0  # 22% against A's 30%: shown like any other row
+    assert basket.max_drawdown == pytest.approx(-(1 - 0.90 / 1.05))
 
 
-def test_beating_one_of_spy_and_the_basket_is_not_enough(
+def test_differences_take_their_sign_from_each_benchmark(
     con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
 ) -> None:
     root = world(tmp_path, override=DIP)
@@ -224,9 +230,11 @@ def test_beating_one_of_spy_and_the_basket_is_not_enough(
     assert spy.sharpe is not None and basket.sharpe is not None and v.strategy.sharpe is not None
     assert basket.sharpe < v.strategy.sharpe < spy.sharpe
     assert v.strategy.max_drawdown > basket.max_drawdown
-    assert v.drawdown_not_worse_than_basket is False
-    assert v.sharpe_at_least_best is False
-    assert v.beats_spy_and_basket_total is False
+    d_spy, _, d_basket = v.differences
+    assert d_spy.total_return > 0 > d_basket.total_return
+    assert d_spy.sharpe is not None and d_basket.sharpe is not None
+    assert d_spy.sharpe < 0 < d_basket.sharpe
+    assert d_basket.max_drawdown > 0
 
 
 def test_exposure_is_measured_against_each_days_equity(
@@ -302,7 +310,7 @@ def test_the_risk_free_rate_and_threshold_come_from_the_protocol(
     assert v.high_exposure_share == pytest.approx(0.25)  # only the fully invested day
 
 
-def test_a_run_that_never_traded_has_no_sharpe_and_does_not_pass_on_it(
+def test_a_run_that_never_traded_has_no_sharpe_difference(
     con: duckdb.DuckDBPyConnection, tmp_path: Path, session: Session
 ) -> None:
     root = world(tmp_path, override=DIP)
@@ -314,9 +322,10 @@ def test_a_run_that_never_traded_has_no_sharpe_and_does_not_pass_on_it(
     assert v.strategy.sharpe is None
     assert v.strategy.total_return == 0.0
     assert (v.mean_exposure, v.high_exposure_share) == (0.0, 0.0)
-    assert v.drawdown_not_worse_than_basket is True  # 0 <= 14.29%
-    assert v.sharpe_at_least_best is False
-    assert v.beats_spy_and_basket_total is False
+    # No Sharpe on the strategy's side: no Sharpe difference, the others are minus each side's.
+    for d, (_, m) in zip(v.differences, v.benchmarks, strict=True):
+        assert d.sharpe is None
+        assert (d.total_return, d.max_drawdown) == pytest.approx((-m.total_return, -m.max_drawdown))
 
 
 def test_a_one_session_run_compares_over_that_session(
@@ -333,7 +342,7 @@ def test_a_one_session_run_compares_over_that_session(
     assert v.strategy.sessions == 1
     assert v.strategy.sharpe is None
     assert all(m.sessions == 1 for _, m in v.benchmarks)
-    assert v.sharpe_at_least_best is False
+    assert all(d.sharpe is None for d in v.differences)
 
 
 def test_a_run_whose_sessions_differ_from_the_benchmarks_is_refused(
