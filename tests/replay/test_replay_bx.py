@@ -397,6 +397,39 @@ def test_a_candidate_without_shares_for_another_reason_is_skipped_not_the_night(
     assert decision.payload["shares"] == n2
 
 
+def test_a_candidate_dearer_than_the_whole_gross_room_is_skipped_not_the_night(
+    tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, ref: pd.DataFrame
+) -> None:
+    # the whole book may take $55 (0.055% of 100k): one AAA share (58.89) exceeds it even with
+    # nothing held, so AAA is passed over (the real shape: one BRK.A share above an $80,000 cap)
+    # and BBB (49.72) is bought; the book was empty, so this is no full book ending the night
+    strategy_dir = bx_strategy(tmp_path / "strategies", sizing={"max_gross_pct": 0.055})
+    cfg_sizing = sizing_of(strategy_dir)
+    root = market_root(tmp_path)
+    build_world(root, [AAA, BBB])
+    b = CAL[BOTH_I]
+    tonight = pd.DataFrame(ref[ref["session_date"] == b])
+    tonight["rise"] = tonight["bx_weekly"] - tonight["bx_weekly_prev"]
+    ranked = tonight.sort_values(["rise", "security_id"], ascending=[False, True])
+    assert list(ranked["security_id"]) == ["S_AAA", "S_BBB"]  # fixture: AAA ranks first
+    c1, c2 = bar_of(AAA, b)["close"], bar_of(BBB, b)["close"]
+    a1, a2 = hand_atr(AAA.bars(), b, ATR_DAYS), hand_atr(BBB.bars(), b, ATR_DAYS)
+    room = INITIAL * cfg_sizing.max_gross_pct / 100
+    assert c2 <= room < c1  # one AAA share is above the whole gross room, one BBB share fits
+    assert INITIAL * cfg_sizing.max_position_pct / 100 >= c1  # not the position cap
+    assert INITIAL * cfg_sizing.risk_pct / 100 >= cfg_sizing.atr_mult * max(a1, a2)  # nor risk
+    assert expected_shares(cfg_sizing, equity=INITIAL, close=c1, atr=a1) == 0
+    n2 = expected_shares(cfg_sizing, equity=INITIAL, close=c2, atr=a2)
+    assert n2 == 1
+
+    run_id = replay(session, con, root, strategy_dir, b, b)
+
+    [decision] = decisions(session, run_id)
+    assert cand(decision)["security_id"] == "S_BBB"
+    assert int(cand(decision)["rank"]) == 2
+    assert decision.payload["shares"] == n2
+
+
 def test_a_held_security_gets_no_second_decision_until_it_is_sold(
     tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, strategy_dir: Path
 ) -> None:

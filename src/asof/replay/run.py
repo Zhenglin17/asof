@@ -592,14 +592,19 @@ class _BxReplay(_Replay):
             if not atr > 0:
                 continue  # too little history to size it: not a full book
             equity = self.equity()
-            gross = self._open_value()
-            if equity * sizing.max_gross_pct / 100 - gross < close:
-                return  # no room for one share under the gross cap: the rest of the night waits
+            if bx_shares(equity=equity, close=close, atr=atr, sizing=sizing, gross_exposure=0) == 0:
+                # not one share even with an empty book (BRK.A at $554,300 against an $80,000
+                # gross cap): this candidate, not the book, is the reason
+                continue
             shares = bx_shares(
-                equity=equity, close=close, atr=atr, sizing=sizing, gross_exposure=gross
+                equity=equity,
+                close=close,
+                atr=atr,
+                sizing=sizing,
+                gross_exposure=self._open_value(),
             )
             if shares == 0:
-                continue  # above the one-position cap or the risk budget (BRK.A), not a full book
+                return  # the gross cap is reached: the rest of the night waits
             decision = Decision(
                 run_id=self.run.id,  # pyright: ignore[reportArgumentType]
                 kind=DecisionKind.TRADE.value,
