@@ -9,13 +9,16 @@
    and its takes enter by conviction, highest first.
 
 Bars reach the simulator only through ``BarCache.bars_at(as_of)``; the scanner reads through
-``visible_bars`` itself. A replay ending on day E writes exactly what was knowable at E 20:00:
-legs still open and decisions whose window is still open are left out.
+``visible_bars`` itself. Spin-offs are read once as known at the window's end and used only as
+far as they were known each day: a record on file before the ex-date's open freezes the
+decision, an event decides it from its ``known_on`` close, and a child is sold at its first
+open after that, read with the day's as_of. A replay ending on day E writes exactly what was
+knowable at E 20:00: legs still open and decisions whose window is still open are left out.
 """
 
 import subprocess
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,13 +37,14 @@ from asof.execute import (
     LegResult,
     position_shares,
     sell_price,
+    spinoff_proceeds,
 )
 from asof.judge.cache import CacheMiss, LLMCache
 from asof.judge.llm import JudgeOutcome, judge_candidate, one_per_security, order_for_entry
 from asof.judge.take_all import judge
 from asof.replay.cache import BarCache
 from asof.scan.earnings_gap import Candidate, scan
-from asof.store.market import visible_master, visible_sessions, visible_splits
+from asof.store.market import visible_bars, visible_master, visible_sessions, visible_splits
 from asof.store.models import (
     Decision,
     DecisionCitation,
@@ -52,6 +56,7 @@ from asof.store.models import (
     RunMode,
     Trade,
 )
+from asof.store.spinoffs import spinoff_events, visible_spinoffs
 from asof.store.universe import filer_securities
 from asof.strategy import StrategyConfig, apply_overrides, load_strategy, register_version
 
@@ -89,6 +94,31 @@ def _git_sha() -> str:
         return "unknown"
 
 
+@dataclass(frozen=True)
+class _SpinEvent:
+    """One spin-off of a security as known at the window's end; ``first_known`` is when its
+    first record reached the store, ``known_on`` the day its status became decidable."""
+
+    ex_date: date
+    first_known: datetime
+    status: str
+    factor: float | None
+    known_on: date | None
+    children: tuple[tuple[str, float], ...]  # (child symbol, child shares per parent share)
+
+
+@dataclass
+class _Spin:
+    """A decision between a spin-off's ex-date and the sale of its children."""
+
+    event: _SpinEvent
+    first_session: int  # calendar index of the ex-date's session (wait session 0)
+    resolved: bool = False
+    sale: dict[str, float] = field(default_factory=dict)  # child symbol -> sale price
+    missing: dict[str, int] = field(default_factory=dict)
+    selling: bool = False
+
+
 class _Active:
     """One decision being simulated, with what the loop needs around it."""
 
@@ -105,6 +135,7 @@ class _Active:
         self.symbol = candidate.symbol
         self.symbols = {candidate.symbol}
         self.missing = 0
+        self.spin: _Spin | None = None
 
 
 class _Replay:
@@ -116,7 +147,9 @@ class _Replay:
         cfg: StrategyConfig,
         run: Run,
         calendar: list[date],
+        spinoffs: dict[str, list[_SpinEvent]] | None = None,
     ) -> None:
+        self.spinoffs = spinoffs or {}
         self.session = session
         self.con = con
         self.root = root
@@ -145,6 +178,9 @@ class _Replay:
             if a.sim.open is not None:
                 state = a.sim.open.state
                 total += state.shares * (a.last_close - state.entry_price)
+            unpaid = a.sim.unpaid
+            if unpaid is not None:  # sold, its children not yet: booked once they are
+                total += unpaid.open.state.shares * (unpaid.price - unpaid.open.state.entry_price)
         return total
 
     def equity(self) -> float:
@@ -182,7 +218,9 @@ class _Replay:
 
     # ---- one evening -----------------------------------------------------------------------
 
-    def _book(self, a: _Active, leg: LegResult) -> None:
+    def _book(self, a: _Active, leg: LegResult, known: date | None = None) -> None:
+        """``known``: the evening the result was complete, if later than its exit (a leg paid
+        its spin-off children after its shares were sold)."""
         trade = Trade(
             decision_id=a.decision.id,  # pyright: ignore[reportArgumentType]
             run_id=self.run.id,  # pyright: ignore[reportArgumentType]
@@ -205,7 +243,9 @@ class _Replay:
             holding_sessions=leg.holding_sessions,
             mae_pct=leg.mae_pct,
             mfe_pct=leg.mfe_pct,
-            available_at=close_of(leg.exit_session),
+            child_proceeds=leg.child_proceeds,
+            spinoff=leg.spinoff,
+            available_at=close_of(max(leg.exit_session, known or leg.exit_session)),
         )
         self.session.add(trade)
         a.trades.append(trade)
@@ -243,6 +283,7 @@ class _Replay:
             a.missing = 0
             a.symbols.add(row["symbol"])
             a.symbol = row["symbol"]
+            self._begin_spinoff(a, day)
             ratio = self._split_ratio(a.symbols, a.last_session, day, as_of)
             if ratio != 1.0:
                 a.sim.apply_split(ratio)
@@ -265,6 +306,93 @@ class _Replay:
                 self._book(a, leg)
             a.last_close = row["close"]
             a.last_session = day
+        for a in self.active:
+            if a.spin is not None:
+                self._step_spinoff(a, day, as_of)
+
+    # ---- spin-offs -------------------------------------------------------------------------
+
+    def _begin_spinoff(self, a: _Active, day: date) -> None:
+        """Every spin-off with its ex-date since the last bar, on file before today's open. One
+        is settled at a time: another going ex meanwhile is not priced (``overlap_spinoff``)."""
+        before_open = datetime.combine(day, time(9, 30), tzinfo=ET)
+        for event in self.spinoffs.get(a.candidate.security_id, ()):
+            if not (a.last_session < event.ex_date <= day and event.first_known <= before_open):
+                continue
+            if a.spin is not None:
+                a.sim.overlap_spinoff()
+                continue
+            first = next(i for i, d in enumerate(self.calendar) if d >= event.ex_date)
+            a.spin = _Spin(event=event, first_session=first)
+            a.sim.begin_spinoff()
+
+    def _step_spinoff(self, a: _Active, day: date, as_of: datetime) -> None:
+        spin = a.spin
+        assert spin is not None
+        event = spin.event
+        if spin.selling:
+            self._sell_children(a, day, as_of)
+        elif not spin.resolved:
+            known = event.known_on is not None and event.known_on <= day
+            if known and event.status == "adjust":
+                assert event.factor is not None
+                spin.resolved = True
+                a.sim.apply_spinoff(event.factor)
+                held = a.sim.open if a.sim.open is not None else None
+                owed = (held is not None and held.entitled) or a.sim.unpaid is not None
+                spin.selling = owed
+                if not owed:
+                    a.spin = None
+            elif (known and event.status == "restart") or (
+                self.index[day] - spin.first_session >= self.cfg.execute.data.spinoff_max_wait
+            ):
+                for leg in a.sim.end_spinoff_unpriced():
+                    self._book(a, leg, day)
+                a.spin = None
+
+    def _sell_children(self, a: _Active, day: date, as_of: datetime) -> None:
+        """Each child at its first open after the event's known_on; one without a bar for
+        ``max_missing_sessions`` sessions at its last close visible now."""
+        spin = a.spin
+        assert spin is not None and spin.event.known_on is not None
+        if day <= spin.event.known_on:
+            return
+        left = [c for c, _ in spin.event.children if c not in spin.sale]
+        bars = visible_bars(
+            self.con,
+            self.root,
+            "1Day",
+            as_of,
+            symbols=left,
+            start=datetime.combine(spin.event.ex_date, time(0), tzinfo=ET),
+        ).to_pylist()
+        for child in left:
+            rows = sorted(
+                (r for r in bars if r["symbol"] == child), key=lambda r: r["session_date"]
+            )
+            today = [r for r in rows if r["session_date"] == day]
+            if today:
+                spin.sale[child] = today[0]["open"]
+                continue
+            spin.missing[child] = spin.missing.get(child, 0) + 1
+            if spin.missing[child] >= self.cfg.execute.data.max_missing_sessions:
+                if not rows:
+                    # no child bar readable at all: nothing to sell it at, the event is unpriced
+                    for leg in a.sim.end_spinoff_unpriced():
+                        self._book(a, leg, day)
+                    a.spin = None
+                    return
+                spin.sale[child] = rows[-1]["close"]
+        if len(spin.sale) < len(spin.event.children):
+            return
+        proceeds = spinoff_proceeds(
+            a.sim.entitled_shares(),
+            [(ratio, spin.sale[c]) for c, ratio in spin.event.children],
+            self.cfg.execute.fills.slippage_bps,
+        )
+        for leg in a.sim.credit_children(proceeds):
+            self._book(a, leg, day)
+        a.spin = None
 
     def attribute_finished(self, day: date) -> None:
         still: list[_Active] = []
@@ -396,6 +524,42 @@ def _universe_symbols(
     return sorted({r["symbol"] for r in master if r["security_id"] in securities})
 
 
+def _spinoffs(
+    con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime
+) -> dict[str, list[_SpinEvent]]:
+    """Every spin-off of a known parent security as known at ``as_of``, by security. An event's
+    first record is matched under every symbol its security carried."""
+    events = [e for e in spinoff_events(con, root, as_of).to_pylist() if e["security_id"]]
+    if not events:
+        return {}
+    names: dict[str, set[str]] = {}
+    for seg in visible_master(con, root, as_of).to_pylist():
+        names.setdefault(seg["security_id"], set()).add(seg["symbol"])
+    records = visible_spinoffs(con, root, as_of).to_pylist()
+    out: dict[str, list[_SpinEvent]] = {}
+    for e in events:
+        sid = e["security_id"]
+        symbols = names.get(sid, set()) | {e["parent_symbol"]}
+        known = [
+            r["available_at"]
+            for r in records
+            if r["ex_date"] == e["ex_date"] and r["parent_symbol"] in symbols
+        ]
+        out.setdefault(sid, []).append(
+            _SpinEvent(
+                ex_date=e["ex_date"],
+                first_known=min(known),
+                status=e["status"],
+                factor=e["factor"],
+                known_on=e["known_on"],
+                children=tuple(zip(e["child_symbols"], e["ratio"], strict=True)),
+            )
+        )
+    for rows in out.values():
+        rows.sort(key=lambda r: r.ex_date)
+    return out
+
+
 def run_replay(
     session: Session,
     con: duckdb.DuckDBPyConnection,
@@ -454,7 +618,7 @@ def run_replay(
         start=datetime.combine(steps[0], time(0), tzinfo=ET),
         end=datetime.combine(steps[-1] + timedelta(days=1), time(0), tzinfo=ET),
     )
-    replay = _Replay(session, con, root, cfg, run, calendar)
+    replay = _Replay(session, con, root, cfg, run, calendar, _spinoffs(con, root, end_as_of))
     for day in steps:
         as_of = close_of(day)
         replay.step_positions(day, as_of, cache)

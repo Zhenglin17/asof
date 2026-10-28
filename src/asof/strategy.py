@@ -163,6 +163,9 @@ class DataConfig(_Section):
     # An open above this multiple of the last close with no split on record is taken for an
     # unrecorded reverse split: the leg leaves at the last close. Drops are left to the stops.
     max_jump_ratio: float
+    # Sessions a leg held through a spin-off's ex-date (session 0) waits frozen for the event's
+    # factor; still undecided at that close, it resumes on raw prices without the child.
+    spinoff_max_wait: int
 
 
 class ExecuteConfig(_Section):

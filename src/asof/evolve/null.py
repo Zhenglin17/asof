@@ -5,7 +5,11 @@ uniformly from the strategy's candidate pool of that day: what its scanner could
 the evening before entry without the signal (for the earnings gap: one security per 8-K filer,
 over the price and dollar-volume thresholds of scan.yaml). A drawn leg buys the entry
 session's open and sells the exit session's open or close, with the replay's slippage on both
-sides and splits in between applied, so real and random legs are priced the same way. Repeating
+sides and splits in between applied, so real and random legs are priced the same way. A
+spin-off in between pays its children as the replay does: sold at each child's first open after
+the event's ``known_on`` (its last close after ``max_missing_sessions`` sessions without a bar);
+an event the replay could not price (restart, or decided after ``spinoff_max_wait``) leaves the
+raw prices, and ``restart_crossings`` counts the draws that held one. Repeating
 the draw K times gives what luck alone earns per leg in the same market and the same pool: a
 bull market or a watchlist picked with hindsight lifts both sides equally.
 
@@ -24,7 +28,7 @@ reading as the benchmarks. Dividends are left out on both sides (the replay book
 import hashlib
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Literal
@@ -39,6 +43,7 @@ from asof.scan import earnings_gap
 from asof.scan.earnings_gap import lookback_sessions
 from asof.store.market import visible_bars, visible_master, visible_sessions, visible_splits
 from asof.store.models import Run, Trade
+from asof.store.spinoffs import spinoff_events
 from asof.store.universe import filer_securities
 from asof.strategy import StrategyConfig
 
@@ -59,12 +64,24 @@ class Span:
 
 
 @dataclass(frozen=True)
+class SpinoffAdjust:
+    """A priced spin-off: ``children`` holds (child shares per parent share, sale price before
+    slippage)."""
+
+    ex_date: date
+    known_on: date
+    children: tuple[tuple[float, float], ...]
+
+
+@dataclass(frozen=True)
 class Panel:
     sessions: tuple[date, ...]
     open: Mapping[str, Mapping[date, float]]  # security_id -> session -> raw open
     close: Mapping[str, Mapping[date, float]]
     splits: Mapping[str, Sequence[tuple[date, float]]]  # security_id -> (ex_date, new/old)
     pools: Mapping[date, frozenset[str]]  # entry session -> security_ids a draw may pick
+    spinoffs: Mapping[str, Sequence[SpinoffAdjust]] = field(default_factory=dict)
+    restarts: Mapping[str, Sequence[date]] = field(default_factory=dict)  # ex-dates
 
 
 @dataclass(frozen=True)
@@ -83,14 +100,64 @@ def _key_seed(key: str) -> int:
     return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big")
 
 
+def _held(span: Span, ex_date: date) -> bool:
+    """Held at the ex-date's open: bought before it, sold at or after it."""
+    return span.entry_session < ex_date <= span.exit_session
+
+
 def _leg_return(panel: Panel, sid: str, span: Span, bps: float) -> float:
     exit_prices = panel.open if span.exit_at == "open" else panel.close
-    factor = 1.0
-    for ex_date, ratio in panel.splits.get(sid, ()):
-        if span.entry_session < ex_date <= span.exit_session:
-            factor *= ratio
+    splits = [(d, r) for d, r in panel.splits.get(sid, ()) if _held(span, d)]
+    factor = math.prod(r for _, r in splits)
+    # per share bought: a child ratio is per share held at its ex-date, after earlier splits
+    child = sum(
+        math.prod(r for d, r in splits if d <= event.ex_date)
+        * sum(ratio * price for ratio, price in event.children)
+        for event in panel.spinoffs.get(sid, ())
+        if _held(span, event.ex_date)
+    )
     entry = panel.open[sid][span.entry_session]
-    return exit_prices[sid][span.exit_session] * factor * (1 - bps) / (entry * (1 + bps)) - 1
+    value = (exit_prices[sid][span.exit_session] * factor + child) * (1 - bps)
+    return value / (entry * (1 + bps)) - 1
+
+
+def _draws(
+    span: Span, panel: Panel, *, permutations: int, seed: int
+) -> tuple[list[str], list[bool], list[int]]:
+    """The pool's members, which are priced for the span, and each permutation's pick."""
+    pool = panel.pools.get(span.entry_session)
+    if pool is None:
+        raise ValueError(f"{span.key}: no pool for entry session {span.entry_session}")
+    members = sorted(pool)
+    exit_prices = panel.open if span.exit_at == "open" else panel.close
+    priced = [
+        span.entry_session in panel.open.get(sid, {})
+        and span.exit_session in exit_prices.get(sid, {})
+        for sid in members
+    ]
+    if not any(priced):
+        raise ValueError(
+            f"{span.key}: no security in the pool of {span.entry_session} has prices "
+            f"for the entry and the {span.exit_at} of {span.exit_session}"
+        )
+    # Each permutation walks its own fixed row of draws from the whole pool and takes the
+    # first priced member: uniform over the priced ones, and two variants holding this leg
+    # with different exits still get the same security whenever it is priced for both. A
+    # row is never shifted by another row's redraws.
+    key_seed = _key_seed(span.key)
+    rows = np.random.default_rng([seed, key_seed]).integers(
+        0, len(members), size=(permutations, _CANDIDATES)
+    )
+    picks = []
+    for k in range(permutations):
+        pick = next((int(i) for i in rows[k] if priced[i]), None)
+        if pick is None:
+            spare = np.random.default_rng([seed, key_seed, k])
+            pick = int(spare.integers(0, len(members)))
+            while not priced[pick]:
+                pick = int(spare.integers(0, len(members)))
+        picks.append(pick)
+    return members, priced, picks
 
 
 def null_returns(
@@ -103,42 +170,25 @@ def null_returns(
     bps = slippage_bps / 10_000
     out = np.empty((permutations, len(spans)))
     for j, span in enumerate(spans):
-        pool = panel.pools.get(span.entry_session)
-        if pool is None:
-            raise ValueError(f"{span.key}: no pool for entry session {span.entry_session}")
-        members = sorted(pool)
-        exit_prices = panel.open if span.exit_at == "open" else panel.close
-        priced = [
-            span.entry_session in panel.open.get(sid, {})
-            and span.exit_session in exit_prices.get(sid, {})
-            for sid in members
-        ]
-        if not any(priced):
-            raise ValueError(
-                f"{span.key}: no security in the pool of {span.entry_session} has prices "
-                f"for the entry and the {span.exit_at} of {span.exit_session}"
-            )
+        members, priced, picks = _draws(span, panel, permutations=permutations, seed=seed)
         returns = [
             _leg_return(panel, sid, span, bps) if ok else math.nan
             for sid, ok in zip(members, priced, strict=True)
         ]
-        # Each permutation walks its own fixed row of draws from the whole pool and takes the
-        # first priced member: uniform over the priced ones, and two variants holding this leg
-        # with different exits still get the same security whenever it is priced for both. A
-        # row is never shifted by another row's redraws.
-        key_seed = _key_seed(span.key)
-        rows = np.random.default_rng([seed, key_seed]).integers(
-            0, len(members), size=(permutations, _CANDIDATES)
-        )
-        for k in range(permutations):
-            pick = next((int(i) for i in rows[k] if priced[i]), None)
-            if pick is None:
-                spare = np.random.default_rng([seed, key_seed, k])
-                pick = int(spare.integers(0, len(members)))
-                while not priced[pick]:
-                    pick = int(spare.integers(0, len(members)))
+        for k, pick in enumerate(picks):
             out[k, j] = returns[pick]
     return out
+
+
+def restart_crossings(spans: Sequence[Span], panel: Panel, *, permutations: int, seed: int) -> int:
+    """How many of ``null_returns``' draws (same seed) held a security through a spin-off that
+    could not be priced: those returns are on raw prices, the ex-date drop counted as a loss."""
+    count = 0
+    for span in spans:
+        members, _, picks = _draws(span, panel, permutations=permutations, seed=seed)
+        crossed = [any(_held(span, ex) for ex in panel.restarts.get(sid, ())) for sid in members]
+        count += sum(crossed[pick] for pick in picks)
+    return count
 
 
 def max_statistic(
@@ -294,13 +344,87 @@ def build_panel(
             ):
                 ratio = float(s["new_rate"]) / float(s["old_rate"])
                 splits.setdefault(seg["security_id"], set()).add((s["ex_date"], ratio))
+    adjusts, restarts = _spinoff_panel(con, root, as_of, pooled, cfg, calendar)
     return Panel(
         sessions=tuple(d for d in calendar if d >= first),
         open=opens,
         close=closes,
         splits={sid: sorted(rows) for sid, rows in splits.items()},
         pools=pools,
+        spinoffs=adjusts,
+        restarts=restarts,
     )
+
+
+def _spinoff_panel(
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    as_of: datetime,
+    pooled: frozenset[str],
+    cfg: StrategyConfig,
+    calendar: Sequence[date],
+) -> tuple[dict[str, list[SpinoffAdjust]], dict[str, list[date]]]:
+    """The pooled securities' spin-offs decided at ``as_of``, under the replay's rules."""
+    data = cfg.execute.data
+    index = {d: i for i, d in enumerate(calendar)}
+    events = [e for e in spinoff_events(con, root, as_of).to_pylist() if e["security_id"] in pooled]
+    adjusts: dict[str, list[SpinoffAdjust]] = {}
+    restarts: dict[str, list[date]] = {}
+    children = sorted({c for e in events for c in e["child_symbols"]})
+    bars = (
+        visible_bars(con, root, "1Day", as_of, symbols=children, end=as_of).to_pylist()
+        if children
+        else []
+    )
+    for e in events:
+        sid, ex, known = e["security_id"], e["ex_date"], e["known_on"]
+        first = next((i for i, d in enumerate(calendar) if d >= ex), None)
+        late = first is None or known not in index or index[known] - first > data.spinoff_max_wait
+        # pending at as_of: undecided, so on raw prices like a restart
+        if e["status"] != "adjust" or late:
+            restarts.setdefault(sid, []).append(ex)
+            continue
+        priced = [_child_sale(bars, c, ex, known, calendar, data.max_missing_sessions)
+                  for c in e["child_symbols"]]  # fmt: skip
+        sales = [price for price in priced if price is not None]
+        if len(sales) < len(priced):
+            restarts.setdefault(sid, []).append(ex)  # not sold by as_of: on raw prices
+            continue
+        adjusts.setdefault(sid, []).append(
+            SpinoffAdjust(
+                ex_date=ex,
+                known_on=known,
+                children=tuple(
+                    (float(r), float(p)) for r, p in zip(e["ratio"], sales, strict=True)
+                ),
+            )
+        )
+    return adjusts, restarts
+
+
+def _child_sale(
+    bars: Sequence[dict],
+    child: str,
+    ex: date,
+    known: date,
+    calendar: Sequence[date],
+    max_missing: int,
+) -> float | None:
+    """The replay's sale price: the first open after ``known``, or the last close once
+    ``max_missing`` sessions passed without a bar."""
+    rows = sorted(
+        (r for r in bars if r["symbol"] == child and r["session_date"] >= ex),
+        key=lambda r: r["session_date"],
+    )
+    by_day = {r["session_date"]: r for r in rows}
+    after = [d for d in calendar if d > known]
+    for missing, day in enumerate(after):
+        if day in by_day:
+            return float(by_day[day]["open"])
+        if missing + 1 >= max_missing:
+            seen = [r for r in rows if r["session_date"] <= day]
+            return float(seen[-1]["close"]) if seen else None
+    return None
 
 
 def null_test(
@@ -322,7 +446,11 @@ def null_test(
         if not legs:
             raise ValueError(f"run {r} has no closed trades to test")
     every = [s for legs in spans.values() for s in legs]
-    as_of = _close_of(max(s.exit_session for s in every))
+    # A leg paid spin-off children after its exit is complete only then.
+    known = session.exec(
+        select(Trade.available_at).where(col(Trade.run_id).in_(list(run_ids)))
+    ).all()
+    as_of = max([_close_of(max(s.exit_session for s in every)), *known])
     panel = build_panel(session, con, root, every, cfg=cfg, as_of=as_of)
     real = {str(r): np.array([s.ret for s in legs]) for r, legs in spans.items()}
     null = {

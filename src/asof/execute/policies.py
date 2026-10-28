@@ -11,9 +11,14 @@ does not say what happened first, so the order is the conservative one):
    -> the watch resets;
 4. the key trails the highest close by ``trail_atr`` ATRs and never falls; the next bar's zone
    and hard stop come from the new key.
+
+A split rescales every level and the share count (``adjust_for_split``); a spin-off rescales only
+the levels that drive later stops (``adjust_for_spinoff``), once its factor is known. Until then
+the simulator does not step the leg at all (``DecisionSim.begin_spinoff``).
 """
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 
@@ -83,9 +88,12 @@ def sell_price(price: float, slippage_bps: float) -> float:
     return price * (1 - slippage_bps / 1e4)
 
 
-def r_multiple(entry_price: float, exit_price: float, hard: float) -> float:
-    """Gain per share in units of the risk taken at entry (entry minus the initial hard stop)."""
-    return (exit_price - entry_price) / (entry_price - hard)
+def r_multiple(
+    entry_price: float, exit_price: float, hard: float, extra_per_share: float = 0.0
+) -> float:
+    """Gain per share in units of the risk taken at entry (entry minus the initial hard stop);
+    ``extra_per_share`` is what else a share paid out while held (spin-off children)."""
+    return (exit_price - entry_price + extra_per_share) / (entry_price - hard)
 
 
 def step_leg(state: LegState, bar: DailyBar, params: LegParams) -> tuple[LegState, Fill | None]:
@@ -172,3 +180,20 @@ def adjust_for_split(state: LegState, ratio: float) -> LegState:
         entry_price=state.entry_price / ratio,
         initial_hard=state.initial_hard / ratio,
     )
+
+
+def adjust_for_spinoff(state: LegState, factor: float) -> LegState:
+    """A spin-off priced at ``factor`` on a held leg: the levels that drive the next stops are
+    rescaled; the shares, the entry and its hard stop stay the raw record the R unit is cut
+    from (the child's value is paid in cash, see ``spinoff_proceeds``)."""
+    if factor == 1:
+        return state
+    return replace(state, key=state.key * factor, highest_close=state.highest_close * factor)
+
+
+def spinoff_proceeds(
+    shares: int, children: Sequence[tuple[float, float]], slippage_bps: float
+) -> float:
+    """Selling the children of ``shares`` parent shares: ``children`` holds (child shares per
+    parent share, sale price). A fraction of a child share is paid at the same price."""
+    return sum(shares * ratio * sell_price(price, slippage_bps) for ratio, price in children)

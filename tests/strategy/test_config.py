@@ -136,7 +136,7 @@ def test_repository_earnings_gap_has_the_approved_defaults() -> None:
         },
         "fills": {"slippage_bps": 5.0},
         "account": {"initial_equity": 100_000},
-        "data": {"max_missing_sessions": 5, "max_jump_ratio": 1.8},
+        "data": {"max_missing_sessions": 5, "max_jump_ratio": 1.8, "spinoff_max_wait": 5},
     }
     assert dumped(cfg.attribution) == {"metrics": ["r_multiple", "exit_reason", "holding_sessions"]}
 

@@ -207,8 +207,9 @@ def _excursion_lines(trades: list[Trade]) -> list[str]:
     rows = [t for t in trades if t.mae_pct is not None and t.mfe_pct is not None]
     if not rows:
         return ["no excursions recorded (trades from before they were recorded)"]
+    # realized from the pnl, so a spin-off leg's children count
     kept = [
-        100 * (t.exit_price / t.entry_price - 1) / t.mfe_pct
+        100 * t.pnl / (t.shares * t.entry_price) / t.mfe_pct
         for t in rows
         if t.mfe_pct is not None and t.mfe_pct > 0
     ]
@@ -223,6 +224,20 @@ def _excursion_lines(trades: list[Trade]) -> list[str]:
         f"- median kept: {statistics.median(kept):.2f} (n={len(kept)})"
         if kept
         else "- median kept: n/a (n=0)",
+    ]
+
+
+def _spinoff_lines(trades: list[Trade]) -> list[str]:
+    """Legs held through a spin-off: their pnl includes the children sold (adjust) or ran on
+    raw prices after an event that could not be priced (restart)."""
+    rows = [t for t in trades if t.spinoff is not None]
+    if not rows:
+        return ["no legs held through a spin-off"]
+    child = sum(t.child_proceeds or 0.0 for t in rows)
+    return [
+        f"- adjust: {sum(t.spinoff == 'adjust' for t in rows)}",
+        f"- restart: {sum(t.spinoff == 'restart' for t in rows)}",
+        f"- child proceeds: {child:,.2f}",
     ]
 
 
@@ -285,6 +300,7 @@ def build_report(
     else:
         lines.append("no closed trades")
     lines += ["", "## Excursions (MAE / MFE)", "", *_excursion_lines(trades)]
+    lines += ["", "## Spin-offs", "", *_spinoff_lines(trades)]
     lines += ["", f"## Largest decisions by absolute pnl (top {TOP_N})", ""]
     lines += _top_decisions(session, run_id, trades)
     lines += [
@@ -307,5 +323,11 @@ def build_report(
         "exits as data_gap and an order for the next open is dropped.",
         "- Unrecorded splits: an upward jump exits at the last close (price_jump); a downward "
         "one goes through the stops, booking a loss even if it was a split.",
+        "- A leg held through a spin-off is frozen (no stop) from the ex-date until the factor "
+        "is known; its children are sold at their next open. Until then the account marks the "
+        "parent at its raw close without the children. An event still unpriced after "
+        "spinoff_max_wait sessions resumes on raw prices with no child (restart).",
+        "- MAE / MFE of a spin-off leg are on prices adjusted by the factor; its children are "
+        "sold a day later, so its realized % may sit slightly outside them.",
     ]
     return "\n".join(lines) + "\n"

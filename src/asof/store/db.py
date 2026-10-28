@@ -57,10 +57,16 @@ def _upgrade_citation_table(conn: Connection) -> None:
 
 
 def _upgrade_trade_table(conn: Connection) -> None:
-    # A trade table from before `symbol` or the excursions existed gains the nullable columns;
-    # old rows keep NULL.
+    # A trade table from before `symbol`, the excursions or the spin-off columns existed gains
+    # the nullable columns; old rows keep NULL.
     have = {c["name"] for c in inspect(conn).get_columns("trade")}
-    for name, kind in (("symbol", "VARCHAR"), ("mae_pct", "FLOAT"), ("mfe_pct", "FLOAT")):
+    for name, kind in (
+        ("symbol", "VARCHAR"),
+        ("mae_pct", "FLOAT"),
+        ("mfe_pct", "FLOAT"),
+        ("child_proceeds", "FLOAT"),
+        ("spinoff", "VARCHAR"),
+    ):
         if name not in have:
             conn.exec_driver_sql(f"ALTER TABLE trade ADD COLUMN {name} {kind}")
 

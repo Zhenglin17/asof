@@ -481,7 +481,18 @@ run so far. Each leg also records its excursions: the lowest (MAE) and highest (
 while held, in percent of the entry fill. The entry day's whole range counts (the fill is at
 its open); on the exit day only the fill counts, plus the open when an intraday stop filled.
 The report gives their medians and how much of the best move a leg kept (realized percent
-over MFE, for legs with MFE above zero). The judge here takes every candidate. It is the baseline a reading judge has to
+over MFE, for legs with MFE above zero).
+
+A position held into a spin-off's ex-date is not stepped from that open until the event's
+factor is known (`asof.store.spinoffs`, usually the ex-date's own close): no stop fires on the
+drop, an order for that open is cancelled (`spinoff_ex`) and re-entry waits. Then the key, the
+trailing high, ATR and the re-entry level are scaled by the factor, and the children are sold
+at their first open after it (their last close after `max_missing_sessions` without a bar), the
+proceeds added to that leg's P&L and R; the entry and the initial stop stay the raw ones.
+An event that cannot be priced, or is still undecided `execute.data.spinoff_max_wait` (5)
+sessions after the ex-date, resumes on raw prices with no child. Such legs carry
+`trade.spinoff` (`adjust` / `restart`) and `trade.child_proceeds`, and the report counts them
+under "Spin-offs". The random-entry null pays a drawn security's children the same way. The judge here takes every candidate. It is the baseline a reading judge has to
 beat, and its decisions carry no claims. Limits: the universe is today's watchlist (chosen
 with hindsight); bars are daily, so within a bar the worst order is assumed; drawdown counts
 closed trades only; no significance test yet.

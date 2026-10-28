@@ -33,3 +33,6 @@ account:
 data:
   max_missing_sessions: 5
   max_jump_ratio: 1.8
+  # A held parent stays frozen through a spin-off's ex-date until its factor is known; this
+  # many sessions after the ex-date (itself 0) it resumes on raw prices with no child.
+  spinoff_max_wait: 5

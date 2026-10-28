@@ -373,6 +373,10 @@ class Trade(_Table, table=True):
     # were recorded).
     mae_pct: float | None = None
     mfe_pct: float | None = None
+    # Spin-off children sold while held, in the pnl; "adjust" or "restart" for a leg held
+    # through a spin-off (NULL on rows from before they were recorded).
+    child_proceeds: float | None = None
+    spinoff: str | None = None
     available_at: datetime = Field(sa_type=UTCDateTime, index=True)
 
 
