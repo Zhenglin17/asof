@@ -54,8 +54,8 @@ class BxParams(_Section):
 
 class WarmupConfig(_Section):
     """Bars of each period a series needs before it may signal: the seed of the EMA20 fades
-    only after about this many (series started 2020-01 vs 2021-01 agree on the direction of
-    99% of steps from about 40 bars on, at every period)."""
+    slowly. Series started 2020-01 vs 2021-01 agree on the direction of 99% of steps from 40
+    daily, 44 weekly and 36 monthly bars on (the table is in the strategy's scan.yaml)."""
 
     daily: int
     weekly: int
@@ -103,7 +103,7 @@ class BxCandidate:
     state_complete_on: date  # the session that completed the state bar read
     daily_bx: float
     daily_bx_prev: float
-    rank: int  # 1 = highest state_bx tonight; ties by security_id
+    rank: int  # 1 = largest state_bx - state_bx_prev tonight; ties by security_id
     bx_since: date
     state_bars: int
     adv_usd: float
@@ -171,7 +171,10 @@ def signals(
     ok = _eligible(rows, tier, cfg)
     rises = (ok[f"bx_{state}"] > ok[f"bx_{state}_prev"]) & (ok["bx_daily"] > ok["bx_daily_prev"])
     ok = pd.DataFrame(ok[rises.to_numpy()])
-    ok = ok.sort_values([f"bx_{state}", "security_id"], ascending=[False, True])
+    # the bar that turned up most ranks first: a value pinned near +50 that rose 0.01 does not
+    # outrank one that just turned (2025-03-14: JTAI weekly 49.99 after 49.99 led by level)
+    ok["_rise"] = ok[f"bx_{state}"] - ok[f"bx_{state}_prev"]
+    ok = ok.sort_values(["_rise", "security_id"], ascending=[False, True])
     return [
         BxCandidate(
             security_id=str(r["security_id"]),

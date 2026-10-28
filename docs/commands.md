@@ -700,14 +700,15 @@ candidate when it is in that night's liquid tier (common stocks only), its last 
 state bar is above the one before it, its daily histogram is above the previous traded
 session's, and its series is warm: at least `warmup` bars of the daily and the state period
 since the series start. Series start at a security's first bar, or at a spin-off's ex-date
-when the spin-off cannot be priced. Candidates are ranked by the state value.
+when the spin-off cannot be priced. Candidates are ranked by how much the state bar rose, so a
+value pinned near the +50 ceiling does not outrank one that has just turned.
 
 The warm-up is measured, not chosen: series started 2020-01 and 2021-01 agree on whether a
-step went up or down for 99.6% of 1,100 liquid stocks after 40 daily bars, 98.9% after 40
-weekly and 99.4% after 36 monthly bars. Data start in 2020, so the long variant has no
+step went up or down for 99.6% of 1,100 liquid stocks after 40 daily bars, 99.4% after 44
+weekly and 99.4% after 36 monthly bars (the fewest bars reaching 99%). Data start in 2020, so the long variant has no
 candidate before 2023.
 
-On 2025-03-14 the mid variant returns 262 of 1,314 warm liquid stocks. A replay window is
+On 2025-03-14 the mid variant returns 262 of 1,312 warm liquid stocks. A replay window is
 scanned in one pass (`asof.scan.bx_trender.scan_range`, `pool_range`), checked equal to the
 nightly scan on the real store over 2024-03-25 to 2024-04-12 (GE's spin-off of GEV) and over
 April 2022, when the security master recorded the DISCA and CFX changes four weeks late. A

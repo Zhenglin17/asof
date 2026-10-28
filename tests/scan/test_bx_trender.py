@@ -19,7 +19,8 @@
 Signal on session s (mid: state = weekly, long: state = monthly; the trigger is daily): in that
 night's liquid tier with the config's classes, state_bx > state_bx_prev, bx_daily >
 bx_daily_prev, daily_bars >= warmup.daily, <state>_bars >= warmup.<state>; any NaN among the four
-values -> no signal and not in the pool. Rank: state_bx descending, then security_id.
+values -> no signal and not in the pool. Rank: state_bx - state_bx_prev descending, then
+security_id.
 
 Expected values come from ``tests.features.test_bx.reference`` (period_bars + bx_histogram, no
 store, no scanner code), over the walk prices each fixture security is built from.
@@ -29,7 +30,7 @@ Interface points this file pins down where the spec left a choice:
 - ``signals`` drops a tier row whose class is not in ``cfg.universe.classes`` even when the
   caller passed a wider tier.
 - ``BxCandidate.symbol`` is the tier's symbol (the one in use at as_of).
-- Ties in state_bx take consecutive ranks (1, 2), ordered by security_id.
+- Ties in the rise take consecutive ranks (1, 2), ordered by security_id.
 - ``scan_range`` may leave out sessions with no candidate; a missing key reads as [].
 
 Fake data: tests/scan/bx_world.py (provenance there). No network.
@@ -217,7 +218,7 @@ def test_the_real_scan_yaml_loads_with_the_agreed_values() -> None:
     assert cfg.universe.lookback_sessions == 20
     assert tuple(cfg.universe.classes) == ("common",)
     assert (cfg.bx.l1, cfg.bx.l2, cfg.bx.l3) == (5, 20, 5)
-    assert (cfg.warmup.daily, cfg.warmup.weekly, cfg.warmup.monthly) == (40, 40, 36)
+    assert (cfg.warmup.daily, cfg.warmup.weekly, cfg.warmup.monthly) == (40, 44, 36)
     assert load_scan_config(REAL_SCAN_YAML, ["variant=long"]).variant == "long"
 
 
@@ -344,15 +345,19 @@ RANK_DAY = find_session(
 )
 
 
-def test_rank_by_state_bx_then_security_id(
+def rise(security_id: str, day: date) -> float:
+    r = ref_row(RANK_REF, security_id, day)
+    return float(r["bx_weekly"] - r["bx_weekly_prev"])
+
+
+def test_rank_by_state_rise_then_security_id(
     con: duckdb.DuckDBPyConnection, root: Path, cfg_file: Path
 ) -> None:
     # write the tie's securities in reverse so the store's order is not the expected one
     build(root, [OTHER, TIE2, TIE1])
     cfg = load_scan_config(cfg_file)
-    tie = ref_row(RANK_REF, "S_TIE1", RANK_DAY)["bx_weekly"]
-    other = ref_row(RANK_REF, "S_OTH", RANK_DAY)["bx_weekly"]
-    assert tie == ref_row(RANK_REF, "S_TIE2", RANK_DAY)["bx_weekly"]
+    tie, other = rise("S_TIE1", RANK_DAY), rise("S_OTH", RANK_DAY)
+    assert tie == rise("S_TIE2", RANK_DAY)
     assert tie != other
 
     found = scan(con, root, close_of(RANK_DAY), cfg)
@@ -393,18 +398,25 @@ def test_signals_on_hand_set_values(
         "weekly_bars": 20,
     }
     for column, value in hand.items():
-        rows[column] = value  # both securities: equal state, rank by security_id
-    rows.loc[rows["security_id"] == "S_BBB", "bx_weekly"] = 12.0
+        rows[column] = value
+    # BBB stands higher (12 vs 10) but rose less (1 vs 5): the rise ranks, not the level
+    is_bbb = rows["security_id"] == "S_BBB"
+    rows.loc[is_bbb, "bx_weekly"] = 12.0
+    rows.loc[is_bbb, "bx_weekly_prev"] = 11.0
 
     found = signals(rows, tier, cfg)
 
-    assert ids(found) == ["S_BBB", "S_AAA"]
-    bbb, aaa = found
-    assert (bbb.state_bx, bbb.state_bx_prev, bbb.daily_bx, bbb.daily_bx_prev) == (12, 5, 3, 2)
-    assert (aaa.state_bx, aaa.rank, aaa.state_bars) == (10, 2, 20)
+    assert ids(found) == ["S_AAA", "S_BBB"]
+    aaa, bbb = found
+    assert (bbb.state_bx, bbb.state_bx_prev, bbb.daily_bx, bbb.daily_bx_prev) == (12, 11, 3, 2)
+    assert (aaa.state_bx, aaa.rank, aaa.state_bars) == (10, 1, 20)
+    assert bbb.rank == 2
     assert aaa.adv_usd == pytest.approx(adv_of(tier, "S_AAA"))
     # a DataFrame tier answers the same
-    assert ids(signals(rows, tier.to_pandas(), cfg)) == ["S_BBB", "S_AAA"]
+    assert ids(signals(rows, tier.to_pandas(), cfg)) == ["S_AAA", "S_BBB"]
+    # equal rises: security_id decides
+    rows.loc[is_bbb, "bx_weekly_prev"] = 7.0
+    assert ids(signals(rows, tier, cfg)) == ["S_AAA", "S_BBB"]
 
 
 def test_signals_equals_scan_on_the_panel_rows(
