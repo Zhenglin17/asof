@@ -755,16 +755,19 @@ At each 20:00 close, in order:
    stock is a new decision.
 4. Candidates are taken in rank order, skipping stocks already held. Each is sized on the
    bars visible that night: the close, and the mean of the last 14 true ranges (the signal
-   day's included), adjusted only by splits on file then whose ex-date has come. The night
-   stops when the gross cap has no room for one share. A stock that cannot get one share for
-   another reason (a $550,000 BRK.A against a $10,000 position cap) is skipped. Only
-   candidates that get shares are recorded.
+   day's included), adjusted only by splits on file then whose ex-date has come. A stock
+   that would not get one share even with an empty book is skipped: one BRK.A share
+   ($554,300) is more than the whole $80,000 gross cap. Otherwise a candidate without a share
+   means the gross cap is reached, and the night stops. Only candidates that get shares are
+   recorded.
 
 On the real store, S1 over 2024-01-02 to 2024-04-30 (82 sessions) ran in 63 s with a 4.1 GB
 peak. It gave 109 decisions and 169 tranches (94 `daily_red`, 75 `weekly_down`), and no stock
 had two decisions at once. The book averaged 75% gross and 21.7 positions. The median position
 was 3.7% of equity; 42 of 109 were under 2%, the room left under the cap. These are checks of
-the mechanics, not a result: the development replay and the gate report come next.
+the mechanics, not a result: the development replay and the gate report come next. BRK.A
+and NVR were candidates on 39 night-slots, but the book was full before their rank each
+time (on 2024-01-10 it filled at rank 5; BRK.A was 11th).
 
 ## Layout
 
