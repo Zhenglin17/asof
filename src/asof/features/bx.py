@@ -153,13 +153,44 @@ def period_bars(daily: pd.DataFrame, period: Period) -> pd.DataFrame:
 # -- all three per session ------------------------------------------------------------------------
 
 
-def bx_features(daily: pd.DataFrame, *, l1: int = 5, l2: int = 20, l3: int = 5) -> pd.DataFrame:
+BX_COLUMNS = ["bx_daily", "bx_weekly", "bx_monthly"]
+
+
+def bx_features(
+    daily: pd.DataFrame,
+    *,
+    spinoffs: pd.DataFrame | None = None,
+    l1: int = 5,
+    l2: int = 20,
+    l3: int = 5,
+) -> pd.DataFrame:
     """``daily`` (already split-adjusted) sorted by security and session, with ``bx_daily`` and
     ``bx_weekly`` / ``bx_monthly``: the histogram of the latest completed period whose
     ``complete_on`` is not after the session. Two rows for one security and session (a
-    rename day read under both symbols) are an error, not a value."""
+    rename day read under both symbols) are an error, not a value.
+
+    ``spinoffs`` (``asof.store.spinoffs.spinoff_events``) changes a parent's sessions from each
+    ex-date E on: NaN until the event's ``known_on`` (and for good while it is pending), then
+    the series with the prices before E multiplied by ``factor`` ("adjust") or a series that
+    starts at E ("restart"). Sessions before E keep their values: multiplying every earlier
+    price by one constant leaves an RSI of EMA differences unchanged. ``bx_since`` is the first
+    session of the series a row's values come from."""
     out = daily.sort_values(["security_id", "session_date"]).reset_index(drop=True)
     _require_one_row_per_session(out)
+    out[BX_COLUMNS] = _bx_columns(out, l1, l2, l3)
+    out["bx_since"] = out.groupby("security_id", sort=False)["session_date"].transform("first")
+    if spinoffs is None or spinoffs.empty:
+        return out
+    rows = out.groupby("security_id", sort=False).indices
+    for sid, events in spinoffs.groupby("security_id", sort=False):
+        if sid in rows:
+            _apply_spinoffs(out, rows[sid], events, l1, l2, l3)
+    return out
+
+
+def _bx_columns(frame: pd.DataFrame, l1: int, l2: int, l3: int) -> np.ndarray:
+    """The three histograms for ``frame`` (sorted by security and session), row-aligned."""
+    out = frame.copy()
     out["bx_daily"] = out.groupby("security_id", sort=False)["close"].transform(
         lambda c: bx_histogram(c, l1, l2, l3)
     )
@@ -170,7 +201,59 @@ def bx_features(daily: pd.DataFrame, *, l1: int = 5, l2: int = 20, l3: int = 5) 
             lambda c: bx_histogram(c, l1, l2, l3)
         )
         out[name] = _as_of_join(out, bars, name)
-    return out
+    return out[BX_COLUMNS].to_numpy(dtype=float)
+
+
+def _apply_spinoffs(
+    out: pd.DataFrame, idx: np.ndarray, events: pd.DataFrame, l1: int, l2: int, l3: int
+) -> None:
+    """Rewrite one security's rows ``idx`` of ``out`` in place for its spin-off events.
+
+    Each session gets a state from the events with E <= session: blank while one of them is
+    undecided at that session, else (series start, the adjust factors in force). Sessions
+    sharing a state are computed together on that state's series."""
+    statuses = events["status"].tolist()
+    known_on = [
+        None if status == "pending" or pd.isna(k) else _as_dates(pd.Series([k]))[0]
+        for status, k in zip(statuses, events["known_on"], strict=True)
+    ]
+    factors = [None if pd.isna(f) else float(f) for f in events["factor"]]
+    decided = sorted(
+        zip(_as_dates(pd.Series(events["ex_date"])), statuses, factors, known_on, strict=True),
+        key=lambda d: d[0],
+    )
+    first = out.at[idx[0], "session_date"]
+    days = _as_dates(out.loc[idx, "session_date"])
+
+    states: dict[tuple, list[int]] = {}
+    for i, day in zip(idx, days, strict=True):
+        live = [d for d in decided if d[0] <= day]
+        if not live:
+            continue  # before every ex-date: the plain values stand
+        if any(known is None or day < known for _, _, _, known in live):
+            states.setdefault(("blank",), []).append(int(i))
+            continue
+        start = max([ex for ex, status, _, _ in live if status == "restart"], default=first)
+        factors = tuple(
+            (ex, f) for ex, status, f, _ in live if status == "adjust" and ex > start and f
+        )
+        states.setdefault((start, factors), []).append(int(i))
+
+    for state, members in states.items():
+        if state == ("blank",):
+            out.loc[members, BX_COLUMNS] = np.nan
+            continue
+        start, factors = state
+        part = out.loc[idx].copy()
+        part = part[[d >= start for d in _as_dates(part["session_date"])]]
+        part_days = _as_dates(part["session_date"])
+        for ex, factor in factors:
+            before = np.array([d < ex for d in part_days])
+            for column in PRICES:
+                part.loc[before, column] = part.loc[before, column] * factor
+        values = pd.DataFrame(_bx_columns(part, l1, l2, l3), index=part.index, columns=BX_COLUMNS)
+        out.loc[members, BX_COLUMNS] = values.loc[members].to_numpy()
+        out.loc[members, "bx_since"] = start
 
 
 def _require_one_row_per_session(daily: pd.DataFrame) -> None:

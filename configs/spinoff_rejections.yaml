@@ -1,0 +1,14 @@
+# Vendor spin-off records the prices disprove. asof.store.spinoffs leaves out every record of a
+# listed (parent, ex_date), so no parent history is rescaled by a distribution that did not
+# happen. Same fields as configs/split_rejections.yaml:
+#
+#   - key: "HON:2026-06-29"      # PARENT:YYYY-MM-DD, the record's parent symbol and ex-date
+#     reason: "..."              # the prices that disprove it
+#     added: 2026-10-27
+#     by: greyson
+#
+# A genuine spin-off whose ex-date total return is merely large stays an audit S6 exception.
+- key: "HON:2026-06-29"
+  reason: "HONA 0.5 per share; HON closes 232.21 -> 227.80 with HONA at 220.19, a +45.5% total return; the same day carries the rejected false 2:1 split"
+  added: 2026-10-27
+  by: greyson

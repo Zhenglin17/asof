@@ -71,6 +71,7 @@ from asof.store.market import (
     visible_master,
     visible_splits,
 )
+from asof.store.spinoffs import spinoff_events
 from asof.store.universe import LIQUID_CLASSES
 
 ET = ZoneInfo("America/New_York")
@@ -181,6 +182,8 @@ CHECKS: dict[str, CheckSpec] = dict(
         # gated everywhere, not only in the liquid tier: every reader multiplies the events of a
         # day, so a wrong one silently rescales any position held across it
         _spec("S5", "several split events on one day", "all", f"{_SYM}:{_DATE}"),
+        # listed, not gated: the event is already read as a restart, nothing is rescaled by it
+        _spec("S6", "spin-off factor the prices disprove (restarted)", None, f"{_SYM}:{_DATE}"),
         _spec(
             "N1", "rename recorded long after the old name stopped", None, f"{_SYM}/{_SYM}:{_DATE}"
         ),  # fmt: skip
@@ -1330,6 +1333,36 @@ class _Audit:
             """
         )
         return table, {}
+
+    def s6(self) -> tuple[pa.Table, dict]:
+        # restarts whose factor the ex-session prices disprove (BBIG 2022-06-30: -19.6%): a
+        # record worth a look, perhaps a rejection, though no reader rescales anything by it
+        events = spinoff_events(self.con, self.root, self.as_of)
+        self.con.execute("SET TimeZone = 'UTC'")
+        self.con.register("_audit_spinoffs", events)
+        if self.dated_tier:
+            liq = (
+                f"coalesce(EXISTS (SELECT 1 FROM {_TIER} l WHERE l.security_id = e.security_id "
+                f"AND abs(date_diff('day', l.day, e.ex_date)) <= {SPLIT_LIQUID_DAYS}), false)"
+            )
+        else:
+            liq = f"e.security_id IN (SELECT security_id FROM {_LIQ_IDS})"
+        table = self._q(
+            f"""
+            SELECT e.parent_symbol || ':' || {_day("e.ex_date")} AS key, {liq} AS _liq,
+                   e.parent_symbol, e.security_id, e.ex_date,
+                   array_to_string(e.child_symbols, ',') AS children,
+                   e.parent_prev_close, array_to_string(e.child_closes, ',') AS child_closes,
+                   array_to_string(e.ratio, ',') AS ratios, e.total_return
+            FROM _audit_spinoffs e
+            WHERE e.status = 'restart' AND e.reason = 'factor_disproved'
+            ORDER BY e.parent_symbol, e.ex_date
+            """
+        )
+        statuses = events.column("status").to_pylist()
+        return table, {
+            status: statuses.count(status) for status in ("adjust", "restart", "pending")
+        }
 
     # -- N: name changes against the bars --------------------------------------------------------
 

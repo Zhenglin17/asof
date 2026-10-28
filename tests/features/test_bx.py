@@ -2,7 +2,8 @@
 EMA / RMA seeding, wrong RSI edge cases), against split-unadjusted prices faking a crash on the
 ex-date, against weekly / monthly bars that leak the rest of their period (a running week used as
 if it were finished, a holiday week emitted before it is known to be over), and against values
-that change when later rows or later-knowable splits are added.
+that change when later rows or later-knowable splits are added; and against a spin-off
+faking a crash on its ex-date, or its factor being used before the child's price existed.
 
 Target API (asof.features.bx):
 
@@ -39,6 +40,16 @@ Target API (asof.features.bx):
         the daily closes), bx_weekly and bx_monthly (histogram over the completed weekly /
         monthly closes, taken from the latest period whose complete_on <= session_date; NaN
         before the first such period or while the period histogram is undefined).
+    bx_features(daily, *, spinoffs=None, l1=5, l2=20, l3=5) -> pd.DataFrame
+        ``spinoffs``: asof.store.spinoffs.spinoff_events(...).to_pandas() (security_id, ex_date
+        E, factor, status, known_on, ...); a "pending" row blanks the sessions from E on. Adds
+        ``bx_since``: the first session of the price series a row's values come from (the
+        security's first bar when no event applies). For a session s of a security with an
+        event: s < E -> values as without the event; E <= s < known_on -> all three NaN;
+        s >= known_on -> "adjust": computed on the series whose open / high / low / close
+        before E are multiplied by factor, bx_since unchanged; "restart": computed on the
+        series starting at E, bx_since = E. Several events compose (factors multiply, a later
+        restart resets bx_since). No events -> exactly the output without ``spinoffs``.
 
 Pine semantics: TradingView's Pine v4 reference pseudo-code for ema / rma / rsi (documentation,
 not observed output). The indicator is "B-Xtrender @Puppytherapy", shortTermXtrender with the
@@ -52,9 +63,18 @@ tests/store/test_golden_cases.py: close 2024-06-07 1208.88, 2024-06-10 open 120.
 Independence Day 2024-07-04 (NYSE calendar, documentation). Split rows go through the real
 visible_splits on a tmp store in the leakage tests.
 
+Spin-off section: event rows are hand-made (status, factor and known_on chosen per test); the
+one-shot vs day-by-day test builds a store (tests/store/test_spinoffs.py builders) and reads it
+through the real visible_bars / spinoff_events. BX's invariance to scaling every price by one
+constant (EMA linear, RSI a ratio of gains to losses) is what makes "s < E unchanged" hold while
+the adjusted series rescales those sessions; it is tested on its own.
+
 Assumptions a real-data check must confirm (tests/store/test_golden_cases.py):
 - the matching rule attributes NVDA's 2024-06-10 split to NVDA and adjusts 2024-06-07 to 120.888.
 - the rejected HON / AIIO records never reach the adjustment on the real store.
+- with GE's two spin-offs applied, GE's BX matches TradingView (weekly 21.50 on 2025-06-27,
+  monthly 28.93 / 22.20 / -19.61 for 2025-06 / 2025-12 / 2026-09), and NVS restarts on
+  2023-10-04 (tests/store/test_golden_spinoffs.py).
 """
 
 import math
@@ -732,3 +752,417 @@ def test_rejected_split_records_never_reach_the_adjustment(
     assert shipped.empty and explicit.empty and len(unrejected) == 1
     assert adjust_for_splits(bars, shipped)["close"].tolist() == [220.0] * len(days)
     assert adjust_for_splits(bars, explicit)["close"].tolist() == [220.0] * len(days)
+
+
+# =============================================================================================
+# spin-offs: scale invariance, the NaN window, adjust / restart, composition, bx_since
+# =============================================================================================
+
+SPIN_DAYS = sessions("2024-01-02", "2024-12-31")  # 252 sessions
+E1, K1 = SPIN_DAYS[150], SPIN_DAYS[153]  # an adjust decided three sessions after its ex-date
+E2, K2 = SPIN_DAYS[200], SPIN_DAYS[220]  # a later event decided twenty sessions after it
+SPIN_DAILY = frame(walk("A", SPIN_DAYS, seed=21) + walk("B", SPIN_DAYS, seed=22, start=30.0))
+EVENT_COLUMNS = [
+    "security_id",
+    "parent_symbol",
+    "child_symbols",
+    "ex_date",
+    "ratio",
+    "parent_prev_session",
+    "parent_prev_close",
+    "child_session",
+    "child_closes",
+    "factor",
+    "total_return",
+    "status",
+    "reason",
+    "known_on",
+]
+SINCE = "bx_since"
+
+
+def event(
+    security_id: str,
+    ex_date: date,
+    status: str,
+    *,
+    factor: float | None = None,
+    known_on: date | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """One spinoff_events row; only security_id, ex_date, status, factor and known_on matter
+    to the feature, the rest is filled in the table's shape."""
+    return {
+        "security_id": security_id,
+        "parent_symbol": security_id,
+        "child_symbols": ["KID"],
+        "ex_date": ex_date,
+        "ratio": [0.5],
+        "parent_prev_session": None,
+        "parent_prev_close": None,
+        "child_session": known_on if status == "adjust" else None,
+        "child_closes": [10.0] if status == "adjust" else [],
+        "factor": factor,
+        "total_return": 0.0 if status == "adjust" else None,
+        "status": status,
+        "reason": reason,
+        "known_on": known_on,
+    }
+
+
+def events_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame.from_records(rows, columns=EVENT_COLUMNS)
+
+
+def scaled_before(daily: pd.DataFrame, security_id: str, day: date, k: float) -> pd.DataFrame:
+    """``daily`` with the OHLC of ``security_id``'s sessions before ``day`` multiplied by k."""
+    out = daily.copy()
+    mask = (out["security_id"] == security_id) & (out["session_date"] < day)
+    for column in ("open", "high", "low", "close"):
+        out.loc[mask, column] = out.loc[mask, column] * k
+    return out
+
+
+def from_day(daily: pd.DataFrame, security_id: str, day: date) -> pd.DataFrame:
+    """``daily`` with ``security_id``'s sessions before ``day`` dropped."""
+    keep = (daily["security_id"] != security_id) | (daily["session_date"] >= day)
+    return where(daily, keep)
+
+
+def values(df: pd.DataFrame, security_id: str, lo: date, hi: date | None = None) -> pd.DataFrame:
+    """The BX columns of ``security_id`` for lo <= session < hi, indexed by session."""
+    part = of(df, security_id)
+    mask = part["session_date"] >= lo
+    if hi is not None:
+        mask &= part["session_date"] < hi
+    return pd.DataFrame(part.loc[mask, ["session_date", *BX_COLUMNS]]).set_index("session_date")
+
+
+def assert_same_values(got: pd.DataFrame, expected: pd.DataFrame) -> None:
+    """Same sessions, same NaN, values equal to 1e-9 (an implementation may compute the
+    unchanged sessions on the rescaled series: equal up to rounding, by scale invariance)."""
+    assert list(got.index) == list(expected.index)
+    assert len(got) > 0
+    for column in BX_COLUMNS:
+        g = got[column].to_numpy(dtype=float)
+        e = expected[column].to_numpy(dtype=float)
+        assert (np.isnan(g) == np.isnan(e)).all(), column
+        ok = ~np.isnan(e)
+        assert g[ok] == pytest.approx(e[ok], rel=1e-9, abs=1e-9), column
+
+
+def as_day(value: Any) -> date:
+    return value if type(value) is date else date.fromisoformat(str(value)[:10])
+
+
+def since(df: pd.DataFrame, security_id: str, lo: date, hi: date | None = None) -> set[date]:
+    part = of(df, security_id)
+    mask = part["session_date"] >= lo
+    if hi is not None:
+        mask &= part["session_date"] < hi
+    return {as_day(v) for v in part.loc[mask, SINCE]}
+
+
+# -- normal path -------------------------------------------------------------------------------
+
+
+def test_bx_is_invariant_to_scaling_every_price() -> None:
+    close = col(of(SPIN_DAILY, "A"), "close")
+    base = bx_histogram(close)
+    for k in (0.37, 0.8004, 12.5):
+        got = bx_histogram(close * k)
+        assert (got.isna() == base.isna()).all()
+        assert got.dropna().tolist() == pytest.approx(base.dropna().tolist(), rel=1e-9, abs=1e-9)
+
+    scaled = scaled_before(SPIN_DAILY, "A", date(2100, 1, 1), 0.25)  # every A price
+    assert_same_values(
+        values(bx_features(scaled), "A", SPIN_DAYS[0]),
+        values(bx_features(SPIN_DAILY), "A", SPIN_DAYS[0]),
+    )
+
+
+def test_scaling_only_a_prefix_does_change_later_values() -> None:
+    # why a spin-off needs handling at all: a level shift in the middle of a series is not
+    # a scale change of the series
+    shifted = bx_features(scaled_before(SPIN_DAILY, "A", E1, 0.6))
+    plain = bx_features(SPIN_DAILY)
+    after = (of(shifted, "A")["session_date"] >= E1).to_numpy()
+    diff = np.abs(
+        of(shifted, "A")["bx_daily"].to_numpy()[after]
+        - of(plain, "A")["bx_daily"].to_numpy()[after]
+    )
+    assert np.nanmax(diff) > 1.0
+
+
+def test_no_events_is_exactly_todays_output_plus_bx_since() -> None:
+    plain = bx_features(SPIN_DAILY)
+    for spin in (None, events_frame([])):
+        out = bx_features(SPIN_DAILY, spinoffs=spin)
+        pd.testing.assert_frame_equal(out[BX_COLUMNS], plain[BX_COLUMNS])
+        assert since(out, "A", SPIN_DAYS[0]) == {SPIN_DAYS[0]}
+        assert since(out, "B", SPIN_DAYS[0]) == {SPIN_DAYS[0]}
+
+
+def test_bx_since_is_each_securitys_own_first_bar() -> None:
+    late_start = frame(walk("A", SPIN_DAYS, seed=21) + walk("C", SPIN_DAYS[40:], seed=23))
+    out = bx_features(late_start, spinoffs=events_frame([]))
+    assert since(out, "A", SPIN_DAYS[0]) == {SPIN_DAYS[0]}
+    assert since(out, "C", SPIN_DAYS[0]) == {SPIN_DAYS[40]}
+
+
+def test_adjust_event_before_window_after() -> None:
+    spin = events_frame([event("A", E1, "adjust", factor=0.8, known_on=K1)])
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    plain = bx_features(SPIN_DAILY)
+    adjusted = bx_features(scaled_before(SPIN_DAILY, "A", E1, 0.8))
+
+    # before the ex-date: as if nothing happened
+    assert_same_values(values(out, "A", SPIN_DAYS[0], E1), values(plain, "A", SPIN_DAYS[0], E1))
+    # from the ex-date until known_on: nothing (the child's price is not known yet)
+    window = values(out, "A", E1, K1)
+    assert len(window) == 3 and window.isna().all().all()
+    # from known_on: the adjusted series
+    assert_same_values(values(out, "A", K1), values(adjusted, "A", K1))
+    assert since(out, "A", SPIN_DAYS[0], E1) == {SPIN_DAYS[0]}
+    assert since(out, "A", K1) == {SPIN_DAYS[0]}
+
+
+def test_restart_event_before_window_after() -> None:
+    spin = events_frame([event("A", E2, "restart", known_on=K2, reason="no_child_price")])
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    plain = bx_features(SPIN_DAILY)
+    restarted = bx_features(from_day(SPIN_DAILY, "A", E2))
+
+    assert_same_values(values(out, "A", SPIN_DAYS[0], E2), values(plain, "A", SPIN_DAYS[0], E2))
+    window = values(out, "A", E2, K2)
+    assert len(window) == 20 and window.isna().all().all()
+    assert_same_values(values(out, "A", K2), values(restarted, "A", K2))
+    assert not np.isnan(values(out, "A", K2)["bx_daily"].iloc[0])  # 20 rows in: defined
+    assert since(out, "A", K2) == {E2}
+    assert since(out, "A", SPIN_DAYS[0], E2) == {SPIN_DAYS[0]}
+
+
+def test_events_of_one_security_leave_another_untouched() -> None:
+    spin = events_frame(
+        [
+            event("A", E1, "adjust", factor=0.5, known_on=K1),
+            event("A", E2, "restart", known_on=K2, reason="child_too_late"),
+        ]
+    )
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    plain = bx_features(SPIN_DAILY)
+
+    pd.testing.assert_frame_equal(of(out, "B")[BX_COLUMNS], of(plain, "B")[BX_COLUMNS])
+    assert since(out, "B", SPIN_DAYS[0]) == {SPIN_DAYS[0]}
+
+
+# -- boundaries --------------------------------------------------------------------------------
+
+
+def test_adjust_known_on_its_ex_date_has_no_nan_window() -> None:
+    # GE -> GEV: the child traded on the ex-date itself
+    spin = events_frame([event("A", E1, "adjust", factor=0.8004, known_on=E1)])
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    adjusted = bx_features(scaled_before(SPIN_DAILY, "A", E1, 0.8004))
+
+    assert_same_values(values(out, "A", E1), values(adjusted, "A", E1))
+    assert not values(out, "A", E1).isna().any().any()
+
+
+def test_two_adjusts_compose() -> None:
+    spin = events_frame(
+        [
+            event("A", E1, "adjust", factor=0.8, known_on=K1),
+            event("A", E2, "adjust", factor=0.5, known_on=K2),
+        ]
+    )
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    first_only = bx_features(scaled_before(SPIN_DAILY, "A", E1, 0.8))
+    both = bx_features(scaled_before(scaled_before(SPIN_DAILY, "A", E1, 0.8), "A", E2, 0.5))
+
+    assert_same_values(values(out, "A", K1, E2), values(first_only, "A", K1, E2))
+    assert values(out, "A", E2, K2).isna().all().all()
+    assert_same_values(values(out, "A", K2), values(both, "A", K2))
+    assert since(out, "A", K2) == {SPIN_DAYS[0]}
+
+
+def test_adjust_then_restart_resets_bx_since() -> None:
+    spin = events_frame(
+        [
+            event("A", E1, "adjust", factor=0.8, known_on=K1),
+            event("A", E2, "restart", known_on=K2, reason="no_child_price"),
+        ]
+    )
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    first_only = bx_features(scaled_before(SPIN_DAILY, "A", E1, 0.8))
+    restarted = bx_features(from_day(SPIN_DAILY, "A", E2))
+
+    assert_same_values(values(out, "A", K1, E2), values(first_only, "A", K1, E2))
+    assert since(out, "A", K1, E2) == {SPIN_DAYS[0]}
+    assert_same_values(values(out, "A", K2), values(restarted, "A", K2))
+    assert since(out, "A", K2) == {E2}
+
+
+def test_restart_then_adjust_keeps_the_restart_start() -> None:
+    k1 = SPIN_DAYS[170]  # the restart's known_on, before E2
+    spin = events_frame(
+        [
+            event("A", E1, "restart", known_on=k1, reason="no_child_price"),
+            event("A", E2, "adjust", factor=0.7, known_on=K2),
+        ]
+    )
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    restarted = bx_features(from_day(SPIN_DAILY, "A", E1))
+    both = bx_features(scaled_before(from_day(SPIN_DAILY, "A", E1), "A", E2, 0.7))
+
+    assert_same_values(values(out, "A", k1, E2), values(restarted, "A", k1, E2))
+    assert_same_values(values(out, "A", K2), values(both, "A", K2))
+    assert since(out, "A", k1, E2) == {E1}
+    assert since(out, "A", K2) == {E1}
+
+
+def test_pending_event_blanks_from_its_ex_date() -> None:
+    # undecided at as_of: the sessions from the ex-date on have no trustworthy series yet, as in
+    # the NaN window of a decided event (one-shot == day-by-day needs exactly this)
+    spin = events_frame([event("A", E2, "pending")])
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    plain = bx_features(SPIN_DAILY)
+
+    assert_same_values(values(out, "A", SPIN_DAYS[0], E2), values(plain, "A", SPIN_DAYS[0], E2))
+    assert values(out, "A", E2).isna().all().all()
+    pd.testing.assert_frame_equal(of(out, "B")[BX_COLUMNS], of(plain, "B")[BX_COLUMNS])
+    assert since(out, "A", SPIN_DAYS[0]) == {SPIN_DAYS[0]}
+
+
+def test_an_event_after_the_last_bar_changes_nothing() -> None:
+    last = SPIN_DAYS[-1]
+    spin = events_frame(
+        [event("A", date(2025, 1, 6), "adjust", factor=0.8, known_on=date(2025, 1, 6))]
+    )
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    plain = bx_features(SPIN_DAILY)
+
+    assert_same_values(
+        values(out, "A", SPIN_DAYS[0], last + timedelta(days=1)),
+        values(plain, "A", SPIN_DAYS[0], last + timedelta(days=1)),
+    )
+
+
+# -- leakage -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        event("A", E1, "adjust", factor=0.3, known_on=K1),
+        event("A", E1, "adjust", factor=0.99, known_on=K1),
+        event("A", E1, "restart", known_on=K1, reason="factor_out_of_range"),
+    ],
+    ids=["factor_0.3", "factor_0.99", "restart"],
+)
+def test_the_decision_cannot_reach_sessions_before_known_on(other: dict[str, Any]) -> None:
+    # (d) whatever the event turns out to be, every session before known_on reads the same
+    base = bx_features(
+        SPIN_DAILY, spinoffs=events_frame([event("A", E1, "adjust", factor=0.8, known_on=K1)])
+    )
+    alt = bx_features(SPIN_DAILY, spinoffs=events_frame([other]))
+
+    assert_same_values(values(alt, "A", SPIN_DAYS[0], K1), values(base, "A", SPIN_DAYS[0], K1))
+    assert since(alt, "A", SPIN_DAYS[0], E1) == since(base, "A", SPIN_DAYS[0], E1)
+
+
+def test_later_rows_change_nothing_known_at_a_cut_with_events() -> None:
+    # the prefix-stability property of the plain feature, with a decided event in the prefix
+    spin = events_frame([event("A", E1, "adjust", factor=0.8, known_on=K1)])
+    cut = SPIN_DAYS[190]
+    full = bx_features(SPIN_DAILY, spinoffs=spin)
+    part = bx_features(where(SPIN_DAILY, SPIN_DAILY["session_date"] <= cut), spinoffs=spin)
+
+    for sid in ("A", "B"):
+        assert_same_values(
+            values(part, sid, SPIN_DAYS[0]),
+            values(full, sid, SPIN_DAYS[0], cut + timedelta(days=1)),
+        )
+
+
+def test_one_shot_equals_day_by_day_on_a_store(con: duckdb.DuckDBPyConnection, root: Path) -> None:
+    # (e) the feature computed once with every event known at the end equals, for every
+    # session, the feature computed from what was visible at that session's 20:00 New York.
+    # P1: spin-off on E (index 150), child K1 first trades three sessions later (adjust).
+    # P2: spin-off on index 170, child never trades (restart twenty sessions later).
+    from asof.store.market import visible_bars
+    from asof.store.spinoffs import spinoff_events
+    from tests.store.audit_world import bar as raw_bar
+    from tests.store.test_market import Seg, avail, write_master
+    from tests.store.test_spinoffs import spin_row, write_bars, write_other_rows
+
+    days = sessions("2024-01-02", "2024-10-31")
+    e1, e2 = days[150], days[170]
+    k1_first = days[153]
+
+    def raw(
+        symbol: str, rows: list[dict[str, Any]], scale_from: date | None = None, k: float = 1.0
+    ) -> list[dict[str, Any]]:
+        out = []
+        for r in rows:
+            m = k if scale_from is not None and r["session_date"] >= scale_from else 1.0
+            out.append(
+                raw_bar(
+                    symbol,
+                    r["session_date"],
+                    close=round(r["close"] * m, 4),
+                    open=round(r["open"] * m, 4),
+                    high=round(r["high"] * m, 4),
+                    low=round(r["low"] * m, 4),
+                    volume=10_000,
+                )
+            )
+        return out
+
+    bars = (
+        raw("P1", walk("x", days, seed=31, start=100.0), e1, 0.7)
+        + raw("P2", walk("x", days, seed=32, start=40.0), e2, 0.8)
+        + raw("K1", walk("x", [d for d in days if d >= k1_first], seed=33, start=60.0))
+    )
+    write_bars(root, bars)
+    write_master(
+        root,
+        [
+            Seg("S_P1", "P1"),
+            Seg("S_P2", "P2"),
+            Seg("S_K1", "K1", valid_from=k1_first, available_at=known(k1_first)),
+        ],
+    )
+    write_other_rows(root, [spin_row("P1", "K1", e1, 0.5), spin_row("P2", "K2", e2, 0.2)])
+
+    def features(as_of: datetime) -> pd.DataFrame:
+        daily = visible_bars(con, root, "1Day", as_of).to_pandas()
+        spin = spinoff_events(con, root, as_of, rejected=()).to_pandas()
+        return bx_features(daily, spinoffs=spin)
+
+    end = datetime(2026, 10, 27, tzinfo=UTC)
+    final_events = spinoff_events(con, root, end, rejected=()).to_pylist()
+    assert sorted((r["security_id"], r["status"]) for r in final_events) == [
+        ("S_P1", "adjust"),
+        ("S_P2", "restart"),
+    ]
+    windows = {r["security_id"]: (r["ex_date"], r["known_on"]) for r in final_events}
+    assert windows["S_P1"] == (e1, k1_first) and windows["S_P2"] == (e2, days[190])
+    once = features(end)
+
+    for day in [*days[148:196], *days[-3:]]:
+        seen = features(avail(day))
+        for sid in ("S_P1", "S_P2", "S_K1"):
+            now = seen.loc[(seen["security_id"] == sid) & (seen["session_date"] == day)]
+            then = once.loc[(once["security_id"] == sid) & (once["session_date"] == day)]
+            assert len(now) == len(then), (sid, day)
+            if now.empty:
+                continue
+            for column in BX_COLUMNS:
+                a, b = float(now[column].iloc[0]), float(then[column].iloc[0])
+                assert (math.isnan(a) and math.isnan(b)) or a == pytest.approx(
+                    b, rel=1e-9, abs=1e-9
+                ), (sid, day, column, a, b)
+            ex, known_on = windows.get(sid, (None, None))
+            if ex is None or not (ex <= day < known_on):
+                assert as_day(now[SINCE].iloc[0]) == as_day(then[SINCE].iloc[0]), (sid, day)

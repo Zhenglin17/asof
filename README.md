@@ -159,12 +159,13 @@ count. It is still a search to anyone who picks its best cell, and is shown as s
 | Citing a passage that was not public yet | The validator checks the instant; the prompt holds only visible chunks | `tests/judge/test_llm.py`, `tests/judge/test_window.py` |
 | A model that already knows the outcome | Results split at the training cutoff; the prompt names the ticker, not today's company name | `tests/replay/test_compare.py`, `tests/judge/test_llm.py` |
 | Outcomes visible before they happened | A trade is visible from its exit-day close, an outcome after its re-entry window | `tests/attribute/test_trades.py`, `tests/replay/test_replay.py` |
+| Rescaling history with a price not yet known | A spin-off's factor needs the child's first close: it is used only from the day every price it rests on is visible, and sessions in between have no value | `tests/store/test_spinoffs.py`, `tests/features/test_bx.py` |
 | A result that depends on later days | Replaying to day N gives the same decisions as replaying further | `tests/replay/test_replay.py` |
 | Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
 | Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
 
-On the real store, `asof market audit` runs 34 data checks with reviewed exceptions, and
-hand-checked reference histories (renames, ticker reuse, splits) are asserted as tests.
+On the real store, `asof market audit` runs 35 data checks with reviewed exceptions, and
+hand-checked reference histories (renames, ticker reuse, splits, spin-offs) are asserted as tests.
 
 ## Known limitations
 
@@ -223,7 +224,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] Demo page on GitHub Pages
 - [ ] Minute bars, XBRL facts, FRED
 - [x] Gate report: random entries, walk-forward, thin edge, benchmarks, side by side
-- [x] First feature: B-Xtrender on split-adjusted daily, weekly and monthly bars, matched against the chart
+- [x] First feature: B-Xtrender on split- and spin-off-adjusted daily, weekly and monthly bars, matched against the chart
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

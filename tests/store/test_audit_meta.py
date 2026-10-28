@@ -57,6 +57,7 @@ from tests.store.audit_world import (
     replace,
     rows,
     series,
+    spin_off,
     split,
 )
 from tests.store.test_audit import (
@@ -285,6 +286,15 @@ def _c2(w: MetaWorld) -> None:
     w.bars = listed_after(w.bars, "CCC", 13)  # 11 sessions behind the store's end
 
 
+def _s6(w: MetaWorld) -> None:
+    # tests/store/test_audit_spinoffs.py shape: AAA keeps trading at 100 after handing out a
+    # child worth 40 per share (+40%)
+    ex = DAYS[10]
+    w.bars += series("KID", DAYS[10:], 40.0, 7_000, start=10)
+    w.segs = [*w.segs, Seg(SID_X1, "KID", valid_from=ex, available_at=known(ex))]
+    w.others = [spin_off("AAA", "KID", ex, 1.0)]
+
+
 BROKEN: dict[str, Callable[[MetaWorld], None]] = {
     "P1": _p1,
     "P2": _p2,
@@ -315,6 +325,7 @@ BROKEN: dict[str, Callable[[MetaWorld], None]] = {
     "S3": _s3,
     "S4": _s4,
     "S5": _s5,
+    "S6": _s6,
     "N1": _n1,
     "N2": _n2,
     "N3": _n3,

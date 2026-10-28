@@ -6,6 +6,7 @@ every check breakable (tests/store/test_audit_meta.py). Fake data provenance is 
 tests/store/test_audit.py.
 """
 
+import json
 import shutil
 from collections import defaultdict
 from collections.abc import Sequence
@@ -19,7 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from asof.ingest.bars import bucket_of
-from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA, SPLIT_SCHEMA
+from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA, OTHER_SCHEMA, SPLIT_SCHEMA
 from asof.ingest.instrument_class import CLASS_FILE, CLASS_SCHEMA
 from asof.ingest.sec_ticker_history import HISTORY_SCHEMA
 from asof.ingest.security_master import (
@@ -214,6 +215,30 @@ def split(
     }
 
 
+def spin_off(parent: str, child: str, ex_date: date, ratio: float) -> dict[str, Any]:
+    """A spin_off row of others.parquet as the ingest writes it (rate = new / source rate);
+    the full builder lives in tests/store/test_spinoffs.py."""
+    raw = {
+        "ex_date": ex_date.isoformat(),
+        "new_rate": ratio,
+        "new_symbol": child,
+        "source_rate": 1,
+        "source_symbol": parent,
+        "_kind": "spin_offs",
+    }
+    return {
+        "kind": "spin_off",
+        "symbol": None,
+        "source_symbol": parent,
+        "new_symbol": child,
+        "ex_date": ex_date,
+        "process_date": ex_date,
+        "rate": ratio,
+        "raw_json": json.dumps(raw),
+        "available_at": known(ex_date),  # ingest rule: 00:00 New York of the ex_date
+    }
+
+
 def rename(old: str, new: str, process_date: date) -> dict[str, Any]:
     return {
         "old_symbol": old,
@@ -287,6 +312,7 @@ class World:
     class_rows: list[dict[str, Any]] | None = None  # None: one row per segment
     splits: list[dict[str, Any]] = field(default_factory=list)
     name_changes: list[dict[str, Any]] = field(default_factory=list)
+    others: list[dict[str, Any]] = field(default_factory=list)  # spin-offs and the rest
     conflicts: list[dict[str, Any]] | None = None  # None: no file
     sec: list[tuple[date, str, int]] | None = None  # None: agrees with the master
     misfiled: list[tuple[int, dict[str, Any]]] = field(default_factory=list)  # (hive year, bar)
@@ -313,6 +339,11 @@ class World:
             _write(
                 self.root / "corporate_actions" / "name_changes.parquet",
                 pa.Table.from_pylist(self.name_changes, schema=NAME_CHANGE_SCHEMA),
+            )
+        if self.others:
+            _write(
+                self.root / "corporate_actions" / "others.parquet",
+                pa.Table.from_pylist(self.others, schema=OTHER_SCHEMA),
             )
         if self.conflicts is not None:
             _write(

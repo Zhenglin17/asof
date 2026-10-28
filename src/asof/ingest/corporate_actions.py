@@ -392,14 +392,21 @@ def _other_row(row: Mapping[str, Any]) -> dict[str, Any]:
     source = _optional_symbol(row, "source_symbol")
     if symbol is None and source is None:
         raise Rejected("missing symbol and source_symbol")
+    kind = _kind_of(row)
+    rate = _optional_float(row, "rate")
+    if kind == "spin_off":
+        # the feed has no `rate` here: child shares per parent share is new_rate / source_rate
+        new_rate = _optional_float(row, "new_rate")
+        source_rate = _optional_float(row, "source_rate")
+        rate = new_rate / source_rate if new_rate is not None and source_rate else None
     return {
-        "kind": _kind_of(row),
+        "kind": kind,
         "symbol": symbol,
         "source_symbol": source,
         "new_symbol": _optional_symbol(row, "new_symbol"),
         "ex_date": ex_date,
         "process_date": process_date,
-        "rate": _optional_float(row, "rate"),
+        "rate": rate,
         "raw_json": json.dumps(dict(row)),
         "available_at": available_at(day),
     }
@@ -407,7 +414,8 @@ def _other_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def parse_others(rows: Iterable[Mapping[str, Any]]) -> tuple[pa.Table, pa.Table]:
     """Spin-offs, stock dividends, rights, worthless removals, redemptions: fixed columns plus
-    the original JSON, since these are stored for later and not yet read by anything."""
+    the original JSON. Spin-offs are read by ``asof.store.spinoffs``; the other kinds are stored
+    for later."""
     return _parse(rows, OTHER_SCHEMA, _other_row)
 
 

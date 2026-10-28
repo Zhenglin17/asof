@@ -58,8 +58,8 @@ The [README](../README.md) is the short tour.
       sealed holdout are refused unless the strategy opens it, once
 - [x] Benchmarks: SPY and QQQ with dividends reinvested and a monthly top-10 dollar-volume
       basket, members picked point in time (`asof benchmark`)
-- [x] First shared feature: the B-Xtrender short-term histogram on split-adjusted daily,
-      weekly and monthly bars, with Pine's EMA / RMA / RSI so the values match the chart; a
+- [x] First shared feature: the B-Xtrender short-term histogram on split- and
+      spin-off-adjusted daily, weekly and monthly bars, with Pine's EMA / RMA / RSI so the values match the chart; a
       weekly or monthly value is used only from the close that completes its period
       (`asof.features.bx`)
 - [x] Random-entry null: each replay leg against random picks from the scanner's pool on
@@ -239,6 +239,21 @@ record the prices disprove (HON's 2:1 reverse split of 2026-06-29: the next open
 1.00 and 0.98 of the previous close) is listed in `configs/split_rejections.yaml` with a reason
 and a date and is left out by every reader at every instant, since it never happened; a
 genuine split whose prices moved by a different multiple stays an audit exception instead. `resolve=False` returns the raw store for audits.
+
+Spin-offs (`asof.store.spinoffs`) are read the same way, one event per parent security and
+ex-date. GE handed out one GEV share per four GE shares on 2024-04-02 and opened about 20%
+lower; without an adjustment that reads as a crash. When every child trades within 20 of the
+parent's sessions, the parent's earlier prices are multiplied by
+`(previous close - child first close x ratio) / previous close` (GE: 0.8004), from the day that
+close, the record and the previous close are all visible. An event that cannot be priced this
+way (the child never trades on the store, as Sandoz's ADR after Novartis's 2023-10-04
+distribution; it lists too late; parent and child share a symbol; two ratios for one child) is
+a restart: features start the parent's series again at the ex-date rather than guess. So is
+an event the prices disprove: the parent's ex-session close plus the children's value lies more
+than 15% from the previous close (BBIG 2022-06-30, -19.6%, as TYDE fell from 3.10 to 2.03 on
+its first day); the audit's S6 lists these. Several children of one day are one event (OPEN's
+three warrant series of 2025-11-18), a record stored twice is read once, and a record for an
+event that never happened (HON 2026-06-29) is listed in `configs/spinoff_rejections.yaml`.
 
 The vendor files a symbol's whole history under its current holder, so when a ticker is reused
 the old holder's history can disappear: after Banzai took PARA in 2026, Paramount Global's
