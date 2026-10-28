@@ -18,9 +18,12 @@ tranches sold while owed and the shares still held.
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date
+from typing import Any
+
+import pandas as pd
 
 from asof.execute.holding import Holding
 from asof.execute.policies import DailyBar, buy_price, position_shares, r_multiple, sell_price
@@ -34,6 +37,35 @@ _EPS = 1e-9
 class ExitFlags:
     daily_red: bool  # tonight's daily histogram < 0
     weekly_down: bool  # last completed weekly bar < the one before it
+
+
+def _value(row: Mapping[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    return None if value is None or math.isnan(value) else float(value)
+
+
+def exit_flags(row: Mapping[str, Any]) -> ExitFlags:
+    """The exit flags of one panel row; a flag with a missing value among its inputs is down."""
+    daily, weekly = _value(row, "bx_daily"), _value(row, "bx_weekly")
+    prev = _value(row, "bx_weekly_prev")
+    return ExitFlags(
+        daily_red=daily is not None and daily < 0,
+        weekly_down=weekly is not None and prev is not None and weekly < prev,
+    )
+
+
+def signal_atr(bars: pd.DataFrame, days: int) -> float:
+    """Mean of the last ``days`` true ranges of ``bars`` (one security in date order, already
+    split-adjusted), the last row's included: at the signal close its range is known. NaN with
+    fewer than ``days + 1`` rows, the first true range needing a previous close."""
+    if len(bars) < days + 1:
+        return math.nan
+    window = bars.iloc[-(days + 1) :]
+    high = window["high"].to_numpy()[1:]
+    low = window["low"].to_numpy()[1:]
+    prev = window["close"].to_numpy()[:-1]
+    tr = [max(h - lo, abs(h - c), abs(lo - c)) for h, lo, c in zip(high, low, prev, strict=True)]
+    return float(sum(tr) / days)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -120,6 +152,21 @@ class BxPositionSim:
 
     def outcome(self) -> DecisionOutcome:
         return DecisionOutcome(legs=list(self.legs), cancelled=self.cancelled)
+
+    @property
+    def held_shares(self) -> int:
+        return self.shares
+
+    def exposure(self, last_close: float) -> float:
+        """Shares held or waiting to be bought, at ``last_close``; a held-back tranche is gone."""
+        return (self.shares + (self.order or 0)) * last_close
+
+    def unrealized(self, last_close: float) -> float:
+        """Not yet booked: the shares held at ``last_close``, the tranches sold but held back for
+        their children at their sale price, and the children already paid to the shares held."""
+        held = self.shares * (last_close - self.entry_price) if self.shares > 0 else 0.0
+        back = sum(s.shares * (s.price - s.entry_price) + s.prior_child for s in self.held_back)
+        return held + back + self.open_child
 
     @property
     def hard(self) -> float:

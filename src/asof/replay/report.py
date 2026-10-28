@@ -177,8 +177,9 @@ def _top_decisions(session: Session, run_id: int, trades: list[Trade]) -> list[s
             if doc
             else ""
         )
+        ticker = entity.ticker if entity else decision.symbol or "?"
         lines.append(
-            f"| {entity.ticker if entity else '?'} | {decision.as_of.astimezone(ET):%Y-%m-%d} "
+            f"| {ticker} | {decision.as_of.astimezone(ET):%Y-%m-%d} "
             f"| {len(rows)} "
             f"| {sum(t.pnl for t in rows):,.2f} "
             f"| {', '.join(f'{t.r_multiple:+.2f}' for t in rows)} "
@@ -303,26 +304,41 @@ def build_report(
     lines += ["", "## Spin-offs", "", *_spinoff_lines(trades)]
     lines += ["", f"## Largest decisions by absolute pnl (top {TOP_N})", ""]
     lines += _top_decisions(session, run_id, trades)
+    # a trade decision naming a security and no entity comes from a mechanical scan of the
+    # liquid tier (bx_trender), not from a company's filing
+    by_security = any(
+        d.security_id is not None and d.entity_id is None for d in _decisions(session, run_id)
+    )
+    lines += ["", "## Known limits", ""]
+    if by_security:
+        lines += [
+            "- Universe: the liquid tier as of each night (point in time), common stocks only.",
+            "- There is no price stop: R is cut from atr_mult x the signal night's ATR below "
+            "the entry, a sizing yardstick; a falling position leaves only on its exit flags.",
+            "- Candidates enter in rank order until one gets no share under the gross cap; the "
+            "last entry of a night may take only the room left, a much smaller position.",
+        ]
+    else:
+        lines += [
+            "- Universe: companies on today's watchlist, picked with hindsight.",
+            "- R is per share, from the entry to the leg's initial hard stop; size comes from "
+            "the decision-day close and is capped, so 1R is not exactly the budgeted share of "
+            "equity.",
+            "- When positions fill the gross cap, later candidates of the day are skipped in "
+            "security-id order, which has nothing to do with their merit.",
+            "- ATR is fixed at the decision; after a large move the stop distance is stale.",
+        ]
     lines += [
-        "",
-        "## Known limits",
-        "",
-        "- Universe: companies on today's watchlist, picked with hindsight.",
         "- Daily bars only: within a bar the worst order is assumed; exits decided at a close "
         "fill at the next open.",
         "- Drawdown counts realized pnl only; open positions are not marked to market.",
         "- No borrow, commission or market impact beyond the fixed slippage.",
-        "- R is per share, from the entry to the leg's initial hard stop; size comes from the "
-        "decision-day close and is capped, so 1R is not exactly the budgeted share of equity.",
-        "- When positions fill the gross cap, later candidates of the day are skipped in "
-        "security-id order, which has nothing to do with their merit.",
-        "- ATR is fixed at the decision; after a large move the stop distance is stale.",
         "- A data-gap exit fills at the last close before the gap, which flatters halts that "
         "reopen lower.",
         "- A rename the vendor records late leaves no bars under the new symbol: the position "
         "exits as data_gap and an order for the next open is dropped.",
         "- Unrecorded splits: an upward jump exits at the last close (price_jump); a downward "
-        "one goes through the stops, booking a loss even if it was a split.",
+        "one is held through as a loss even if it was a split.",
         "- A leg held through a spin-off is frozen (no stop) from the ex-date until the factor "
         "is known; its children are sold at their next open. Until then the account marks the "
         "parent at its raw close without the children. An event still unpriced after "

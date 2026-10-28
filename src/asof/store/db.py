@@ -38,6 +38,29 @@ def make_engine(path: Path) -> Engine:
     return engine
 
 
+def _upgrade_decision_table(conn: Connection) -> None:
+    # A decision table from before `security_id` is rebuilt from the model with its rows and
+    # ids (ALTER cannot change the trade check). Trade, attribution and citation rows point at
+    # decision ids: the foreign keys are checked at commit, once every row is back, and a
+    # violation then rolls the whole upgrade back.
+    if "security_id" in {c["name"] for c in inspect(conn).get_columns("decision")}:
+        return
+    conn.exec_driver_sql("PRAGMA defer_foreign_keys=ON")
+    old = [c["name"] for c in inspect(conn).get_columns("decision")]
+    rows = [dict(r._mapping) for r in conn.exec_driver_sql("SELECT * FROM decision")]
+    conn.exec_driver_sql("DROP TABLE decision")
+    table = SQLModel.metadata.tables["decision"]
+    table.create(conn)
+    if rows:
+        # raw values, as stored: the column types would re-encode them on the way back
+        columns = ", ".join(f'"{name}"' for name in old)
+        marks = ", ".join("?" for _ in old)
+        conn.exec_driver_sql(
+            f"INSERT INTO decision ({columns}) VALUES ({marks})",
+            [tuple(row[name] for name in old) for row in rows],
+        )
+
+
 def _upgrade_citation_table(conn: Connection) -> None:
     # create_all never alters an existing table, and ALTER cannot add a CHECK constraint. A
     # citation table built before `quote` existed is rebuilt from the model with its rows; a
@@ -91,6 +114,7 @@ def init_db(engine: Engine) -> None:
         # CREATE would each commit on their own and a failed upgrade would lose the old rows.
         # An explicit BEGIN makes the rebuild all or nothing.
         conn.exec_driver_sql("BEGIN")
+        _upgrade_decision_table(conn)
         _upgrade_citation_table(conn)
         _upgrade_trade_table(conn)
         _upgrade_holdout_opening_table(conn)

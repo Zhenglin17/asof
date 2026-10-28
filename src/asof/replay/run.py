@@ -25,6 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
+import pandas as pd
 from sqlmodel import Session
 
 from asof.attribute import attribute_decision
@@ -39,10 +40,13 @@ from asof.execute import (
     sell_price,
     spinoff_proceeds,
 )
+from asof.execute.bx import BxPlan, BxPositionSim, ExitFlags, bx_shares, exit_flags
 from asof.judge.cache import CacheMiss, LLMCache
 from asof.judge.llm import JudgeOutcome, judge_candidate, one_per_security, order_for_entry
 from asof.judge.take_all import judge
+from asof.replay.bx import signal_inputs
 from asof.replay.cache import BarCache
+from asof.scan.bx_trender import BxCandidate, scan_nights
 from asof.scan.earnings_gap import Candidate, scan
 from asof.store.market import visible_bars, visible_master, visible_sessions, visible_splits
 from asof.store.models import (
@@ -58,10 +62,17 @@ from asof.store.models import (
 )
 from asof.store.spinoffs import spinoff_events, visible_spinoffs
 from asof.store.universe import filer_securities
-from asof.strategy import StrategyConfig, apply_overrides, load_strategy, register_version
+from asof.strategy import (
+    BxStrategyConfig,
+    StrategyConfig,
+    apply_overrides,
+    load_any_strategy,
+    register_version,
+)
 
 ET = ZoneInfo("America/New_York")
-_OPEN_FILLS = {"break", "observe_timeout", "max_sessions", "hard_gap"}
+_NO_EXIT = ExitFlags(daily_red=False, weekly_down=False)
+_OPEN_FILLS = {"break", "observe_timeout", "max_sessions", "hard_gap", "daily_red", "weekly_down"}
 
 
 def close_of(day: date) -> datetime:
@@ -120,22 +131,39 @@ class _Spin:
 
 
 class _Active:
-    """One decision being simulated, with what the loop needs around it."""
+    """One decision being simulated, with what the loop needs around it. ``window_end`` None:
+    attributed once its sim is finished and the window is past (a later session than the
+    calendar has means never)."""
 
     def __init__(
-        self, decision: Decision, candidate: Candidate, sim: DecisionSim, window_end: date | None
+        self,
+        decision: Decision,
+        *,
+        security_id: str,
+        symbol: str,
+        close: float,
+        session: date,
+        sim: Any,
+        window_end: date | None,
     ) -> None:
         self.decision = decision
-        self.candidate = candidate
-        self.sim = sim
+        self.security_id = security_id
+        self.sim = sim  # DecisionSim or BxPositionSim
         self.window_end = window_end
         self.trades: list[Trade] = []
-        self.last_close = candidate.gap_close
-        self.last_session = candidate.reaction_session
-        self.symbol = candidate.symbol
-        self.symbols = {candidate.symbol}
+        self.last_close = close
+        self.last_session = session
+        self.symbol = symbol
+        self.symbols = {symbol}
         self.missing = 0
         self.spin: _Spin | None = None
+
+
+def _legs(result: LegResult | list[LegResult] | None) -> list[LegResult]:
+    """``force_exit`` of either simulator as a list."""
+    if result is None:
+        return []
+    return result if isinstance(result, list) else [result]
 
 
 class _Replay:
@@ -164,24 +192,11 @@ class _Replay:
     # ---- portfolio -------------------------------------------------------------------------
 
     def _open_value(self) -> float:
-        total = 0.0
-        for a in self.active:
-            if a.sim.open is not None:
-                total += a.sim.open.state.shares * a.last_close
-            if a.sim.order is not None:
-                total += a.sim.order.shares * a.last_close
-        return total
+        return sum(a.sim.exposure(a.last_close) for a in self.active)
 
     def _unrealized(self) -> float:
-        total = 0.0
-        for a in self.active:
-            if a.sim.open is not None:
-                state = a.sim.open.state
-                total += state.shares * (a.last_close - state.entry_price)
-            unpaid = a.sim.unpaid
-            if unpaid is not None:  # sold, its children not yet: booked once they are
-                total += unpaid.open.state.shares * (unpaid.price - unpaid.open.state.entry_price)
-        return total
+        # a leg sold before its children were paid counts at its sale price until booked
+        return sum(a.sim.unrealized(a.last_close) for a in self.active)
 
     def equity(self) -> float:
         return self.cfg.execute.account.initial_equity + self.realized + self._unrealized()
@@ -200,9 +215,7 @@ class _Replay:
 
     def mark(self, day: date) -> None:
         """The account at ``day``'s close; a position without a bar today keeps its last close."""
-        held = [
-            a.sim.open.state.shares * a.last_close for a in self.active if a.sim.open is not None
-        ]
+        held = [a.sim.held_shares * a.last_close for a in self.active if a.sim.held_shares > 0]
         self.session.add(
             EquityDaily(
                 run_id=self.run.id,  # pyright: ignore[reportArgumentType]
@@ -225,7 +238,7 @@ class _Replay:
             decision_id=a.decision.id,  # pyright: ignore[reportArgumentType]
             run_id=self.run.id,  # pyright: ignore[reportArgumentType]
             strategy_id=self.cfg.strategy.name,
-            security_id=a.candidate.security_id,
+            security_id=a.security_id,
             symbol=a.symbol,
             leg=leg.leg,
             direction=Direction.LONG.value,
@@ -271,13 +284,13 @@ class _Replay:
         for a in self.active:
             if a.sim.finished:
                 continue
-            row = by_security.get(a.candidate.security_id)
+            row = by_security.get(a.security_id)
             if row is None:
                 a.missing += 1
                 a.sim.skip_session()
-                if a.missing >= data.max_missing_sessions and a.sim.open is not None:
-                    leg = a.sim.force_exit(day, sell_price(a.last_close, bps), "data_gap")
-                    if leg is not None:
+                if a.missing >= data.max_missing_sessions and a.sim.held_shares > 0:
+                    price = sell_price(a.last_close, bps)
+                    for leg in _legs(a.sim.force_exit(day, price, "data_gap")):
                         self._book(a, leg)
                 continue
             a.missing = 0
@@ -290,8 +303,8 @@ class _Replay:
                 a.last_close /= ratio
             elif row["open"] > data.max_jump_ratio * a.last_close:
                 # An unrecorded reverse split would read as a windfall: leave at the last close.
-                leg = a.sim.force_exit(day, sell_price(a.last_close, bps), "price_jump")
-                if leg is not None:
+                price = sell_price(a.last_close, bps)
+                for leg in _legs(a.sim.force_exit(day, price, "price_jump")):
                     self._book(a, leg)
                 a.last_session = day
                 continue
@@ -302,7 +315,7 @@ class _Replay:
                 low=row["low"],
                 close=row["close"],
             )
-            for leg in a.sim.step(bar):
+            for leg in self._step_sim(a, bar, day):
                 self._book(a, leg)
             a.last_close = row["close"]
             a.last_session = day
@@ -310,13 +323,16 @@ class _Replay:
             if a.spin is not None:
                 self._step_spinoff(a, day, as_of)
 
+    def _step_sim(self, a: _Active, bar: DailyBar, day: date) -> list[LegResult]:
+        return a.sim.step(bar)
+
     # ---- spin-offs -------------------------------------------------------------------------
 
     def _begin_spinoff(self, a: _Active, day: date) -> None:
         """Every spin-off with its ex-date since the last bar, on file before today's open. One
         is settled at a time: another going ex meanwhile is not priced (``overlap_spinoff``)."""
         before_open = datetime.combine(day, time(9, 30), tzinfo=ET)
-        for event in self.spinoffs.get(a.candidate.security_id, ()):
+        for event in self.spinoffs.get(a.security_id, ()):
             if not (a.last_session < event.ex_date <= day and event.first_known <= before_open):
                 continue
             if a.spin is not None:
@@ -393,6 +409,10 @@ class _Replay:
             self._book(a, leg, day)
         a.spin = None
 
+    def _window_end(self, a: _Active, day: date) -> date | None:
+        """The last session another leg of ``a`` could start: the re-entry window."""
+        return a.window_end
+
     def attribute_finished(self, day: date) -> None:
         still: list[_Active] = []
         for a in self.active:
@@ -401,13 +421,14 @@ class _Replay:
                 reason = a.sim.cancelled or "no_entry"
                 a.decision.payload = {**a.decision.payload, "cancelled": reason}
                 continue
-            if a.sim.finished and a.window_end is not None and day >= a.window_end:
+            window_end = self._window_end(a, day)
+            if a.sim.finished and window_end is not None and day >= window_end:
                 if a.trades:
                     row = attribute_decision(
                         a.decision,
                         a.trades,
                         equity_at_decision=a.sim.plan.equity,
-                        window_end=a.window_end,
+                        window_end=window_end,
                     )
                     self.session.add(row)
                 continue
@@ -479,12 +500,22 @@ class _Replay:
         sim = DecisionSim(plan, self.cfg.execute, self._sizer)
         window_index = self.index[day] + self.cfg.execute.reentry.window_sessions
         window_end = self.calendar[window_index] if window_index < len(self.calendar) else None
-        self.active.append(_Active(decision, candidate, sim, window_end))
+        self.active.append(
+            _Active(
+                decision,
+                security_id=candidate.security_id,
+                symbol=candidate.symbol,
+                close=candidate.gap_close,
+                session=candidate.reaction_session,
+                sim=sim,
+                window_end=window_end,
+            )
+        )
 
     def decide(self, day: date, as_of: datetime) -> None:
         sessions = self.calendar[: self.index[day] + 1]
         candidates = scan(self.session, self.con, self.root, as_of, self.cfg, sessions=sessions)
-        held = {a.candidate.security_id for a in self.active}
+        held = {a.security_id for a in self.active}
         if self.cfg.judge.kind == "llm":
             fresh = one_per_security([c for c in candidates if c.security_id not in held])
             outcomes = [
@@ -503,13 +534,117 @@ class _Replay:
             held.add(candidate.security_id)
 
 
-def _payload(candidate: Candidate, cfg: StrategyConfig, equity: float) -> dict[str, Any]:
-    fields = asdict(candidate)
+class _BxReplay(_Replay):
+    """The B-Xtrender loop: the scan's nights are read once for the window; each night held
+    positions sell on that night's exit flags, then the night's candidates are bought in rank
+    order until the gross cap leaves no room for a share. One live position per security; a
+    position is attributed the night its last share is sold."""
+
+    cfg: BxStrategyConfig  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    def __init__(
+        self,
+        session: Session,
+        con: duckdb.DuckDBPyConnection,
+        root: Path,
+        cfg: BxStrategyConfig,
+        run: Run,
+        calendar: list[date],
+        spinoffs: dict[str, list[_SpinEvent]],
+        nights: dict[date, tuple[list[BxCandidate], pd.DataFrame]],
+        cache: BarCache,
+    ) -> None:
+        super().__init__(session, con, root, cfg, run, calendar, spinoffs)  # pyright: ignore[reportArgumentType]
+        self.nights = nights
+        self.bars = cache
+        self._flags: dict[str, ExitFlags] = {}
+        self._flags_day: date | None = None
+
+    def _step_sim(self, a: _Active, bar: DailyBar, day: date) -> list[LegResult]:
+        if self._flags_day != day:
+            rows = self.nights[day][1] if day in self.nights else pd.DataFrame()
+            self._flags = {str(r["security_id"]): exit_flags(r) for r in rows.to_dict("records")}
+            self._flags_day = day
+        return a.sim.step(bar, self._flags.get(a.security_id, _NO_EXIT))
+
+    def _window_end(self, a: _Active, day: date) -> date | None:
+        return day  # no re-entry window: a later signal is a new decision
+
+    def decide(self, day: date, as_of: datetime) -> None:
+        candidates = self.nights.get(day, ([], None))[0]
+        held = {a.security_id for a in self.active}
+        fresh = [c for c in candidates if c.security_id not in held]
+        if not fresh:
+            return
+        sizing = self.cfg.execute.sizing
+        lookback = self.calendar[max(0, self.index[day] - 2 * sizing.atr_days)]
+        bars = self.bars.bars_at(as_of, start=datetime.combine(lookback, time(0), tzinfo=ET))
+        frame = bars.to_pandas()
+        wanted = {c.security_id for c in fresh}
+        frame = pd.DataFrame(frame[frame["security_id"].isin(wanted)])
+        symbols = sorted(set(frame["symbol"]))
+        splits = visible_splits(self.con, self.root, as_of, symbols).to_pandas()
+        inputs = signal_inputs(frame, splits, day, sizing.atr_days)
+        for c in fresh:
+            if c.security_id not in inputs:
+                continue
+            close, atr = inputs[c.security_id]
+            if not atr > 0:
+                continue  # too little history to size it: not a full book
+            equity = self.equity()
+            gross = self._open_value()
+            if equity * sizing.max_gross_pct / 100 - gross < close:
+                return  # no room for one share under the gross cap: the rest of the night waits
+            shares = bx_shares(
+                equity=equity, close=close, atr=atr, sizing=sizing, gross_exposure=gross
+            )
+            if shares == 0:
+                continue  # above the one-position cap or the risk budget (BRK.A), not a full book
+            decision = Decision(
+                run_id=self.run.id,  # pyright: ignore[reportArgumentType]
+                kind=DecisionKind.TRADE.value,
+                as_of=as_of,
+                strategy_id=self.cfg.strategy.name,
+                security_id=c.security_id,
+                symbol=c.symbol,
+                direction=Direction.LONG.value,
+                payload={
+                    "equity_at_decision": equity,
+                    "close": close,
+                    "atr": atr,
+                    "shares": shares,
+                    "candidate": _jsonable(asdict(c)),
+                },
+            )
+            self.session.add(decision)
+            self.session.flush()
+            plan = BxPlan(
+                signal_session=day, signal_close=close, atr=atr, shares=shares, equity=equity
+            )
+            self.active.append(
+                _Active(
+                    decision,
+                    security_id=c.security_id,
+                    symbol=c.symbol,
+                    close=close,
+                    session=day,
+                    sim=BxPositionSim(plan, self.cfg.execute),
+                    window_end=None,
+                )
+            )
+
+
+def _jsonable(fields: dict[str, Any]) -> dict[str, Any]:
     for key, value in fields.items():
         if isinstance(value, datetime | date):
             fields[key] = value.isoformat()
         elif isinstance(value, tuple):
             fields[key] = list(value)
+    return fields
+
+
+def _payload(candidate: Candidate, cfg: StrategyConfig, equity: float) -> dict[str, Any]:
+    fields = _jsonable(asdict(candidate))
     return {"judge": cfg.judge.kind, "equity_at_decision": equity, "candidate": fields}
 
 
@@ -519,6 +654,15 @@ def _universe_symbols(
     """Every symbol of every security whose company filed an 8-K by ``as_of``: what the
     simulator may need. Only decides what the cache loads, never what a step may see."""
     securities = filer_securities(session, con, root, as_of)
+    master = visible_master(con, root, as_of).to_pylist()
+    return sorted({r["symbol"] for r in master if r["security_id"] in securities})
+
+
+def _symbols_of(
+    con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime, securities: set[str]
+) -> list[str]:
+    """Every symbol these securities carried, as the master knows at ``as_of``: what the cache
+    loads, never what a step may see."""
     master = visible_master(con, root, as_of).to_pylist()
     return sorted({r["symbol"] for r in master if r["security_id"] in securities})
 
@@ -576,7 +720,7 @@ def run_replay(
     A window reaching the sealed holdout is refused before anything is registered or read."""
     if end < start:
         raise ValueError(f"end {end} is before start {start}")
-    cfg = apply_overrides(load_strategy(strategy_dir), overrides)
+    cfg = apply_overrides(load_any_strategy(strategy_dir), overrides)
     opens = check_window(
         session,
         protocol or load_protocol(),
@@ -600,7 +744,7 @@ def run_replay(
         started_at=datetime.now(UTC),
         git_sha=_git_sha(),
     )
-    if cfg.judge.kind == "llm":
+    if isinstance(cfg, StrategyConfig) and cfg.judge.kind == "llm":
         assert cfg.judge.training_cutoff is not None
         run.model_id = cfg.judge.model
         run.model_training_cutoff = datetime.combine(cfg.judge.training_cutoff, time(0), tzinfo=UTC)
@@ -610,14 +754,31 @@ def run_replay(
         # Committed with the run below: a replay that fails shows nothing and opens nothing.
         record_opening(session, cfg.strategy.name, version.id, start, end, run_id=run.id)  # pyright: ignore[reportArgumentType]
 
-    cache = BarCache(
-        con,
-        root,
-        symbols=_universe_symbols(session, con, root, end_as_of),
-        start=datetime.combine(steps[0], time(0), tzinfo=ET),
-        end=datetime.combine(steps[-1] + timedelta(days=1), time(0), tzinfo=ET),
-    )
-    replay = _Replay(session, con, root, cfg, run, calendar, _spinoffs(con, root, end_as_of))
+    spinoffs = _spinoffs(con, root, end_as_of)
+    replay: _Replay
+    if isinstance(cfg, BxStrategyConfig):
+        nights = {
+            d: (found, rows) for d, found, rows in scan_nights(con, root, start, end, cfg.scan)
+        }
+        held = {c.security_id for found, _ in nights.values() for c in found}
+        lookback = calendar[max(0, calendar.index(steps[0]) - 2 * cfg.execute.sizing.atr_days)]
+        cache = BarCache(
+            con,
+            root,
+            symbols=_symbols_of(con, root, end_as_of, held),
+            start=datetime.combine(lookback, time(0), tzinfo=ET),
+            end=datetime.combine(steps[-1] + timedelta(days=1), time(0), tzinfo=ET),
+        )
+        replay = _BxReplay(session, con, root, cfg, run, calendar, spinoffs, nights, cache)
+    else:
+        cache = BarCache(
+            con,
+            root,
+            symbols=_universe_symbols(session, con, root, end_as_of),
+            start=datetime.combine(steps[0], time(0), tzinfo=ET),
+            end=datetime.combine(steps[-1] + timedelta(days=1), time(0), tzinfo=ET),
+        )
+        replay = _Replay(session, con, root, cfg, run, calendar, spinoffs)
     for day in steps:
         as_of = close_of(day)
         replay.step_positions(day, as_of, cache)

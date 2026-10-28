@@ -218,6 +218,29 @@ class DecisionSim:
         self.legs.append(result)
         return result
 
+    @property
+    def held_shares(self) -> int:
+        return self.open.state.shares if self.open is not None else 0
+
+    def exposure(self, last_close: float) -> float:
+        """The open leg and a waiting order, at ``last_close``."""
+        shares = (self.open.state.shares if self.open is not None else 0) + (
+            self.order.shares if self.order is not None else 0
+        )
+        return shares * last_close
+
+    def unrealized(self, last_close: float) -> float:
+        """Not yet booked: the open leg at ``last_close``, and a leg sold before its children
+        were paid at its sale price."""
+        total = 0.0
+        if self.open is not None:
+            state = self.open.state
+            total += state.shares * (last_close - state.entry_price)
+        if self.unpaid is not None:
+            state = self.unpaid.open.state
+            total += state.shares * (self.unpaid.price - state.entry_price)
+        return total
+
     def _close_leg(self, session: date, price: float, reason: str) -> LegResult | None:
         """Close the open leg; one still owed its children is held back (None) until paid."""
         assert self.open is not None

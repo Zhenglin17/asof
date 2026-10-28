@@ -362,19 +362,25 @@ def _nights(
     return out
 
 
+def scan_nights(
+    con: duckdb.DuckDBPyConnection, root: Path, start: date, end: date, cfg: BxScanConfig
+) -> list[tuple[date, list[BxCandidate], pd.DataFrame]]:
+    """Every session from ``start`` through ``end`` with ``scan``'s candidates (none on a night
+    the market filter fails) and that night's panel rows, which hold every security in the tier
+    on any night of the window: a position held after its security left the tier still reads
+    its exit flags from them."""
+    return [
+        (d, signals(rows, tier, cfg) if _market_open(con, root, _close(d), cfg) else [], rows)
+        for d, rows, tier in _nights(con, root, start, end, cfg)
+    ]
+
+
 def scan_range(
     con: duckdb.DuckDBPyConnection, root: Path, start: date, end: date, cfg: BxScanConfig
 ) -> dict[date, list[BxCandidate]]:
     """``scan`` of every session from ``start`` through ``end``. Sessions without a candidate
     are left out."""
-    out: dict[date, list[BxCandidate]] = {}
-    for d, rows, tier in _nights(con, root, start, end, cfg):
-        if not _market_open(con, root, _close(d), cfg):
-            continue
-        found = signals(rows, tier, cfg)
-        if found:
-            out[d] = found
-    return out
+    return {d: found for d, found, _ in scan_nights(con, root, start, end, cfg) if found}
 
 
 def pool_range(

@@ -133,7 +133,13 @@ from asof.store.universe import (
     month_starts,
     tier_union,
 )
-from asof.strategy import StrategyConfig, apply_overrides, content_hash, load_strategy
+from asof.strategy import (
+    StrategyConfig,
+    apply_overrides,
+    content_hash,
+    load_any_strategy,
+    load_strategy,
+)
 
 SEC_USER_AGENT_ENV = "ASOF_SEC_USER_AGENT"
 ALPACA_KEY_ENV = "ALPACA_API_KEY"
@@ -1601,7 +1607,7 @@ def replay_run(
         _fail(f"--end {last} is before --start {first}")
     path = strategies_dir / strategy
     try:
-        apply_overrides(load_strategy(path), overrides or [])
+        apply_overrides(load_any_strategy(path), overrides or [])
     except (FileNotFoundError, ValueError) as error:
         _fail(f"Strategy {strategy!r}: {error}")
     root = _market_root(data_dir)

@@ -68,7 +68,11 @@ The [README](../README.md) is the short tour.
 - [x] B-Xtrender execution rules: a position sells half at the open after the daily
       histogram closes below 0 and the rest after the last completed weekly bar falls; sized at
       0.5% of equity per 2 ATRs, at most 10% each and 80% in all; splits and spin-offs handled
-      by the same bookkeeping as earnings_gap (`asof.execute.bx`; not yet in the replay)
+      by the same bookkeeping as earnings_gap (`asof.execute.bx`)
+- [x] B-Xtrender replay: the window is scanned once; each night held positions sell on that
+      night's exit flags, then candidates enter in rank order, sized on the bars visible at
+      the signal night, until the gross cap has no room for a share. A trade decision names
+      the security it trades (`asof replay run --strategy bx_trender`)
 - [x] Random-entry null: each replay leg against random picks from the scanner's pool on
       the same dates, max-statistic correction across runs (`asof gate null`)
 - [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
@@ -116,6 +120,7 @@ uv run asof evidence index           # full-text index over the chunks
 uv run asof evidence search "..." --as-of 2025-01-31 --ticker NVDA   # what was public then
 uv run asof scan bx --date 2025-03-14  # B-Xtrender entry candidates of one session
 uv run asof replay run --strategy earnings_gap --start 2023-01-03 --end 2026-10-21
+uv run asof replay run --strategy bx_trender --start 2024-01-02 --end 2024-04-30
 uv run asof replay report --run 1    # markdown report of a replay
 uv run asof judge run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 --max-cost 12
 uv run asof replay run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 \
@@ -729,6 +734,37 @@ nightly scan on the real store over 2024-03-25 to 2024-04-12 (GE's spin-off of G
 April 2022, when the security master recorded the DISCA and CFX changes four weeks late. A
 security carrying a symbol inside such a lag is recomputed as known that night; on these real
 windows that changed nothing, the synthetic tests show the case where it does.
+
+### B-Xtrender replay
+
+```bash
+uv run asof replay run --strategy bx_trender --start 2024-01-02 --end 2024-04-30
+```
+
+`asof replay run` reads the kind in `strategy.yaml` and runs the B-Xtrender loop for this
+directory. The window is scanned once (`scan_nights`: each night's candidates and panel rows).
+At each 20:00 close, in order:
+
+1. Each held position gets the day's bar. A tranche decided at the last close fills at this
+   open. The night's flags are read from its panel row: `daily_red` (daily histogram below 0)
+   and `weekly_down` (last completed weekly bar below the one before). A missing value reads as
+   no exit.
+2. The account is marked: realized pnl, open positions at their last close, tranches sold but
+   waiting for spin-off children at their sale price.
+3. A position whose last share is sold is attributed that night. A later signal on the same
+   stock is a new decision.
+4. Candidates are taken in rank order, skipping stocks already held. Each is sized on the
+   bars visible that night: the close, and the mean of the last 14 true ranges (the signal
+   day's included), adjusted only by splits on file then whose ex-date has come. The night
+   stops when the gross cap has no room for one share. A stock that cannot get one share for
+   another reason (a $550,000 BRK.A against a $10,000 position cap) is skipped. Only
+   candidates that get shares are recorded.
+
+On the real store, S1 over 2024-01-02 to 2024-04-30 (82 sessions) ran in 63 s with a 4.1 GB
+peak. It gave 109 decisions and 169 tranches (94 `daily_red`, 75 `weekly_down`), and no stock
+had two decisions at once. The book averaged 75% gross and 21.7 positions. The median position
+was 3.7% of equity; 42 of 109 were under 2%, the room left under the cap. These are checks of
+the mechanics, not a result: the development replay and the gate report come next.
 
 ## Layout
 

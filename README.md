@@ -164,6 +164,7 @@ count. It is still a search to anyone who picks its best cell, and is shown as s
 | A result that depends on later days | Replaying to day N gives the same decisions as replaying further | `tests/replay/test_replay.py` |
 | A market filter read from tomorrow's index bar | The SPY trend filter reads only the index closes final at that night's close, adjusted by the splits on file then | `tests/scan/test_bx_filters.py` |
 | One pass over a window reading the window's end | The B-Xtrender scan computes each series once at the window's last close and is held equal to a scan run each night; a security whose symbol (or spin-off child) was recorded in the security master late is recomputed as known that night | `tests/scan/test_bx_trender.py` |
+| Sizing on prices rescaled later | A B-Xtrender entry takes its close and ATR from the bars visible at the signal night, adjusted only by the splits on file then whose ex-date has come | `tests/replay/test_replay_bx.py` |
 | Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
 | Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
 
@@ -231,7 +232,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] First feature: B-Xtrender on split- and spin-off-adjusted daily, weekly and monthly bars, matched against the chart
 - [x] B-Xtrender entry scan: liquid common stocks whose weekly (or monthly) and daily histograms both rose, after a measured warm-up (`asof scan bx`)
 - [x] B-Xtrender execution rules: sell half when the daily histogram turns red and the rest when the weekly bar falls, sized by ATR; optional monthly and SPY trend filters (`strategies/bx_trender`)
-- [ ] B-Xtrender in the replay
+- [x] B-Xtrender in the replay: each night held positions sell on that night's flags and candidates enter in rank order, sized on the bars visible then (`asof replay run --strategy bx_trender`)
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

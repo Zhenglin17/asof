@@ -294,6 +294,11 @@ def load_strategy(
     return cfg
 
 
+def load_any_strategy(path: Path) -> AnyStrategyConfig:
+    """The strategy at ``path``, of whatever kind its strategy.yaml names."""
+    return _load(path)
+
+
 def _load(path: Path) -> AnyStrategyConfig:
     """The strategy at ``path``, of whatever kind its strategy.yaml names."""
     raw: dict[str, Any] = {}

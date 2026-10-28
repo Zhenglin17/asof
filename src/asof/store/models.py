@@ -253,7 +253,8 @@ class Decision(_Table, table=True):
         _one_of("direction", Direction),
         CheckConstraint(
             f"kind != '{DecisionKind.TRADE}' OR "
-            "(entity_id IS NOT NULL AND direction IS NOT NULL AND strategy_id IS NOT NULL)",
+            "((entity_id IS NOT NULL OR security_id IS NOT NULL) "
+            "AND direction IS NOT NULL AND strategy_id IS NOT NULL)",
             name="ck_trade_fields",
         ),
         # An observation without a check cannot be judged later, so it is only commentary.
@@ -274,6 +275,11 @@ class Decision(_Table, table=True):
     as_of: datetime = Field(sa_type=UTCDateTime, index=True)
     strategy_id: str | None = Field(default=None, index=True)
     entity_id: int | None = Field(default=None, foreign_key="entity.id", index=True)
+    # A mechanical strategy trades a security with no entity behind it (most of the liquid tier
+    # is not on the watchlist). security_id is the master's id at the run, which a rebuilt master
+    # may renumber; symbol and as_of find it again.
+    security_id: str | None = Field(default=None, index=True)
+    symbol: str | None = None
     direction: str | None = None
     # How sure the judge was, 0 to 1. Kept as a column so calibration and sizing can query it.
     conviction: float | None = None
