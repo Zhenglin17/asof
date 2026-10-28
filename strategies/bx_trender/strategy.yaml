@@ -1,0 +1,8 @@
+# B-Xtrender swing trend, long only: buy the open after the weekly histogram and a green daily
+# histogram both turn up; sell half when the daily histogram turns red, the rest when the last
+# completed weekly bar falls. Mechanical: no rules file, no judge.
+name: bx_trender
+kind: bx_trender
+cadence: daily
+universe: liquid_common
+direction: long

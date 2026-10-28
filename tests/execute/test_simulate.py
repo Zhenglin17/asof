@@ -550,3 +550,16 @@ def test_the_exit_bars_range_does_not_change_the_excursions(
     ]
     assert base[0].mae_pct == pytest.approx(pct(53.0, 56.5))
     assert base[1].mfe_pct == pytest.approx(0.0)
+
+
+def test_a_reverse_split_rounding_the_waiting_order_to_nothing_cancels_it(tmp_path: Path) -> None:
+    # 125 shares ordered at the reaction close; a 1-for-200 before the entry open leaves
+    # floor(0.625) = 0: cancelled for its size, never a leg of 0 shares
+    sim = DecisionSim(PLAN, execute_cfg(tmp_path))
+    for bar in bars_of([REACTION]):
+        sim.step(bar)
+    sim.apply_split(0.005)
+    assert sim.finished
+    assert sim.cancelled == "no_size"
+    assert sim.step(bars_of([(X[1], 11_300.0, 11_400.0, 11_200.0, 11_360.0)])[0]) == []
+    assert sim.outcome().legs == []

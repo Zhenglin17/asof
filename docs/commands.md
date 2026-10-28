@@ -65,6 +65,10 @@ The [README](../README.md) is the short tour.
 - [x] B-Xtrender entry scan: each night's liquid common stocks whose last completed weekly
       (or monthly) bar and daily histogram both rose, series warm by a measured count of bars;
       one pass per replay window, held equal to the nightly scan (`asof scan bx`)
+- [x] B-Xtrender execution rules: a position sells half at the open after the daily
+      histogram closes below 0 and the rest after the last completed weekly bar falls; sized at
+      0.5% of equity per 2 ATRs, at most 10% each and 80% in all; splits and spin-offs handled
+      by the same bookkeeping as earnings_gap (`asof.execute.bx`; not yet in the replay)
 - [x] Random-entry null: each replay leg against random picks from the scanner's pool on
       the same dates, max-statistic correction across runs (`asof gate null`)
 - [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
@@ -691,8 +695,10 @@ three have no equity to pick on); without the best three legs 0.00%; against SPY
 ### B-Xtrender scan
 
 ```bash
-uv run asof scan bx --date 2025-03-14                  # mid: weekly state, daily trigger
-uv run asof scan bx --date 2025-03-14 --set variant=long   # long: monthly state
+uv run asof scan bx --date 2025-03-14                                    # S1
+uv run asof scan bx --date 2025-03-14 --set require_monthly_up=true      # S2
+uv run asof scan bx --date 2025-03-14 --set "market_filter={symbol: SPY, sma_sessions: 200}"  # S3
+uv run asof scan bx --date 2025-03-14 --set variant=long --set daily_min=null   # 2-c long variant
 ```
 
 Settings live in `strategies/bx_trender/scan.yaml`. At a session's 20:00 close a security is a
@@ -703,12 +709,21 @@ since the series start. Series start at a security's first bar, or at a spin-off
 when the spin-off cannot be priced. Candidates are ranked by how much the state bar rose, so a
 value pinned near the +50 ceiling does not outrank one that has just turned.
 
+The swing strategy adds three settings. `daily_min: 0` asks for a green daily histogram (the
+larger periods only need to improve, the smallest must also be positive). Two pre-registered
+variants, one attempt each, switch on the others: `require_monthly_up` (the last completed
+monthly bar rose too) and `market_filter` (no new entry while SPY closes at or below the mean
+of its last 200 closes; such a night has no candidate and an empty random-entry pool).
+
 The warm-up is measured, not chosen: series started 2020-01 and 2021-01 agree on whether a
 step went up or down for 99.6% of 1,100 liquid stocks after 40 daily bars, 99.4% after 44
 weekly and 99.4% after 36 monthly bars (the fewest bars reaching 99%). Data start in 2020, so the long variant has no
 candidate before 2023.
 
-On 2025-03-14 the mid variant returns 262 of 1,312 warm liquid stocks. A replay window is
+On 2025-03-14 the 2-c rule (no `daily_min`) returned 262 of 1,312 warm liquid stocks; S1
+returns 195, S2 76, and S3 none: SPY closed at 562.81, under its 200-session mean of 572.55.
+Since 2023-01 SPY closed above that mean on 91% of sessions, so S3 differs from S1 on few
+nights of the development period. A replay window is
 scanned in one pass (`asof.scan.bx_trender.scan_range`, `pool_range`), checked equal to the
 nightly scan on the real store over 2024-03-25 to 2024-04-12 (GE's spin-off of GEV) and over
 April 2022, when the security master recorded the DISCA and CFX changes four weeks late. A

@@ -1,0 +1,23 @@
+# Buy the open after the signal. Each exit sells half and fires once, read at a close and filled
+# at the next open: daily_red = the daily histogram closes below 0; weekly_down = the last
+# completed weekly bar is below the one before it. No price stop and no holding limit.
+entry:
+  kind: next_open
+exits: [daily_red, weekly_down]
+# shares = risk_pct of equity / (atr_mult x ATR(atr_days)) at the signal close: a volatile stock
+# gets fewer shares. ATR is a yardstick here, not a stop. On 2025-03-14 the S1 candidates' sizes
+# had a median of 6.9% of equity and 16% of them above 10% (IBN 19.4%), hence the position cap.
+sizing:
+  risk_pct: 0.5
+  atr_days: 14
+  atr_mult: 2.0
+  max_position_pct: 10.0
+  max_gross_pct: 80.0
+fills:
+  slippage_bps: 5.0
+account:
+  initial_equity: 100000
+data:
+  max_missing_sessions: 5
+  max_jump_ratio: 1.8
+  spinoff_max_wait: 5

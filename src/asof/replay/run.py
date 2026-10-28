@@ -338,8 +338,7 @@ class _Replay:
                 assert event.factor is not None
                 spin.resolved = True
                 a.sim.apply_spinoff(event.factor)
-                held = a.sim.open if a.sim.open is not None else None
-                owed = (held is not None and held.entitled) or a.sim.unpaid is not None
+                owed = a.sim.owes_children()
                 spin.selling = owed
                 if not owed:
                     a.spin = None

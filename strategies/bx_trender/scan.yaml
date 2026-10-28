@@ -1,8 +1,11 @@
-# B-Xtrender entry scan, long only. A security signals at a session's close when it is in that
-# night's liquid tier, its last completed state bar is above the one before it (mid: weekly,
-# long: monthly) and its daily histogram is above the previous session's. The two variants are
-# one strategy's two versions (variant=long as an override), two attempts in all. Candidates of
-# one night rank by how much the state bar rose (state - previous state), largest first.
+# B-Xtrender entry scan, long only (swing). A security signals at a session's close when it is in
+# that night's liquid tier, its last completed weekly bar is above the one before it, its daily
+# histogram is above the previous session's and at or above daily_min (green). Candidates of one
+# night rank by how much the weekly bar rose (state - previous state), largest first.
+# Pre-registered variants, one attempt each: S1 = this file; S2 = S1 + require_monthly_up=true
+# (the last completed monthly bar rose too); S3 = S1 + market_filter={symbol: SPY,
+# sma_sessions: 200} (no new entry while SPY closes at or below its 200-session mean).
+# variant=long (monthly state) is the 2-c alternative, not part of the swing set.
 variant: mid
 universe:
   min_adv_usd: 50000000
@@ -15,3 +18,6 @@ bx: {l1: 5, l2: 20, l3: 5}
 # whose direction agrees:
 # daily 40 bars 99.6%; weekly 36 98.6%, 40 98.9%, 44 99.4%; monthly 36 99.4%, 40 98.9%, 48 99.7%
 warmup: {daily: 40, weekly: 44, monthly: 36}
+daily_min: 0
+require_monthly_up: false
+market_filter: null

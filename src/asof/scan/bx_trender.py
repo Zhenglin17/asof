@@ -4,7 +4,10 @@ Run at 20:00 New York, when the day's bar is final. A security signals on sessio
 in that night's liquid tier, the last completed state bar (weekly for ``mid``, monthly for
 ``long``) is above the one before it, the daily histogram is above its previous traded
 session's, and its series has run long enough for the seed of the EMAs to have faded
-(``warmup``). Exits and sizing belong to the executor.
+(``warmup``). Optional filters: the daily histogram at or above ``daily_min``, the last completed
+monthly bar above the one before it (``require_monthly_up``), and the index closing above its
+moving average (``market_filter``; a night it fails has no candidate and an empty pool). Exits
+and sizing belong to the executor.
 
 Every series starts at the security's first visible bar (a later start gives other values).
 ``scan_range`` computes the series once, at the close of its last session, and reads each
@@ -62,11 +65,22 @@ class WarmupConfig(_Section):
     monthly: int
 
 
+class MarketFilter(_Section):
+    """New entries only while ``symbol`` closes above the mean of its last ``sma_sessions``
+    closes."""
+
+    symbol: str
+    sma_sessions: int
+
+
 class BxScanConfig(_Section):
     variant: Literal["mid", "long"]
     universe: UniverseConfig
     bx: BxParams
     warmup: WarmupConfig
+    daily_min: float | None = None
+    require_monthly_up: bool = False
+    market_filter: MarketFilter | None = None
 
 
 def load_scan_config(path: Path, overrides: Sequence[str] = ()) -> BxScanConfig:
@@ -154,12 +168,14 @@ def _eligible(rows: pd.DataFrame, tier: pa.Table | pd.DataFrame, cfg: BxScanConf
     merged = rows.drop(columns=["symbol"], errors="ignore").merge(
         pd.DataFrame(tier_df[["security_id", "symbol", "adv_usd"]]), on="security_id"
     )
-    values = merged[[f"bx_{state}", f"bx_{state}_prev", "bx_daily", "bx_daily_prev"]]
-    keep = (
-        values.notna().all(axis=1)
-        & (merged["daily_bars"] >= cfg.warmup.daily)
-        & (merged[f"{state}_bars"] >= getattr(cfg.warmup, state))
+    columns = [f"bx_{state}", f"bx_{state}_prev", "bx_daily", "bx_daily_prev"]
+    warm = (merged["daily_bars"] >= cfg.warmup.daily) & (
+        merged[f"{state}_bars"] >= getattr(cfg.warmup, state)
     )
+    if cfg.require_monthly_up:
+        columns += ["bx_monthly", "bx_monthly_prev"]
+        warm &= merged["monthly_bars"] >= cfg.warmup.monthly
+    keep = merged[columns].notna().all(axis=1) & warm
     return pd.DataFrame(merged[keep.to_numpy()])
 
 
@@ -170,6 +186,10 @@ def signals(
     state = STATE[cfg.variant]
     ok = _eligible(rows, tier, cfg)
     rises = (ok[f"bx_{state}"] > ok[f"bx_{state}_prev"]) & (ok["bx_daily"] > ok["bx_daily_prev"])
+    if cfg.daily_min is not None:
+        rises &= ok["bx_daily"] >= cfg.daily_min
+    if cfg.require_monthly_up:
+        rises &= ok["bx_monthly"] > ok["bx_monthly_prev"]
     ok = pd.DataFrame(ok[rises.to_numpy()])
     # the bar that turned up most ranks first: a value pinned near +50 that rose 0.01 does not
     # outrank one that just turned (2025-03-14: JTAI weekly 49.99 after 49.99 led by level)
@@ -213,6 +233,33 @@ def _tier(
     )
 
 
+def market_ok(
+    con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime, flt: MarketFilter
+) -> bool:
+    """Whether ``flt.symbol``'s last final close at ``as_of`` is above the mean of its last
+    ``sma_sessions`` final closes (that close included), on prices adjusted for the splits
+    visible then. Too short a history, or no bars at all, reads as False: no new entries."""
+    bars = visible_bars(con, root, "1Day", as_of, symbols=[flt.symbol]).to_pandas()
+    if bars.empty:
+        return False
+    bars = adjust_for_splits(bars, visible_splits(con, root, as_of, [flt.symbol]).to_pandas())
+    # the security carrying the symbol tonight; an earlier holder of the label is another one
+    bars = bars.sort_values("session_date")
+    bars = pd.DataFrame(bars[bars["security_id"] == bars["security_id"].iloc[-1]])
+    final = [_close(_day(d)) <= as_of for d in bars["session_date"]]
+    closes = pd.Series(bars["close"]).to_numpy()[final]
+    n = flt.sma_sessions
+    if len(closes) < n:
+        return False
+    return bool(closes[-1] > closes[-n:].mean())
+
+
+def _market_open(
+    con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime, cfg: BxScanConfig
+) -> bool:
+    return cfg.market_filter is None or market_ok(con, root, as_of, cfg.market_filter)
+
+
 def _sessions(con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime) -> list[date]:
     """Sessions final at ``as_of``: visible, and their 20:00 close not after it."""
     return [d for d in visible_sessions(con, root, "1Day", as_of) if _close(d) <= as_of]
@@ -239,6 +286,8 @@ def scan_and_pool(
     if found is None:
         return None, [], frozenset()
     day, rows, tier = found
+    if not _market_open(con, root, as_of, cfg):
+        return day, [], frozenset()
     eligible = frozenset(_eligible(rows, tier, cfg)["security_id"].astype(str))
     return day, signals(rows, tier, cfg), eligible
 
@@ -320,6 +369,8 @@ def scan_range(
     are left out."""
     out: dict[date, list[BxCandidate]] = {}
     for d, rows, tier in _nights(con, root, start, end, cfg):
+        if not _market_open(con, root, _close(d), cfg):
+            continue
         found = signals(rows, tier, cfg)
         if found:
             out[d] = found
@@ -332,5 +383,7 @@ def pool_range(
     """``pool`` of every session from ``start`` through ``end``."""
     return {
         d: frozenset(_eligible(rows, tier, cfg)["security_id"].astype(str))
+        if _market_open(con, root, _close(d), cfg)
+        else frozenset()
         for d, rows, tier in _nights(con, root, start, end, cfg)
     }

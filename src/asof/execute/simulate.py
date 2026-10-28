@@ -21,6 +21,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
 
+from asof.execute.holding import Holding
 from asof.execute.policies import (
     DailyBar,
     LegParams,
@@ -91,18 +92,8 @@ class _Open:
     entry_session: date
     initial_key: float
     state: LegState
-    # Extremes of the bars held before the exit bar; None until one such bar has been seen.
-    low: float | None = None
-    high: float | None = None
-    # Held at a spin-off's ex-date: the extremes from before it wait for the event's factor,
-    # and the MAE / MFE basis is entry_price x basis_factor.
-    pre_low: float | None = None
-    pre_high: float | None = None
-    basis_factor: float = 1.0
-    entitled: bool = False  # children owed and not yet paid
-    entitled_shares: int = 0  # shares held at the ex-date: a later split adds no child
+    holding: Holding = field(default_factory=Holding)
     child_proceeds: float = 0.0
-    spinoff: str | None = None
 
 
 @dataclass
@@ -113,22 +104,6 @@ class _Unpaid:
     session: date
     price: float
     reason: str
-
-
-def _lower(a: float | None, b: float | None) -> float | None:
-    return b if a is None else a if b is None else min(a, b)
-
-
-def _higher(a: float | None, b: float | None) -> float | None:
-    return b if a is None else a if b is None else max(a, b)
-
-
-def _merge_pre(o: _Open, factor: float) -> None:
-    """The extremes from before the ex-date join the later ones, rescaled by ``factor``."""
-    if o.pre_low is not None and o.pre_high is not None:
-        o.low = _lower(o.low, o.pre_low * factor)
-        o.high = _higher(o.high, o.pre_high * factor)
-    o.pre_low = o.pre_high = None
 
 
 class DecisionSim:
@@ -205,26 +180,20 @@ class DecisionSim:
         if self.open is not None:
             self.open.state = adjust_for_split(self.open.state, ratio)
             self.open.initial_key /= ratio
-            if self.open.low is not None and self.open.high is not None:
-                self.open.low /= ratio
-                self.open.high /= ratio
-            if self.open.pre_low is not None and self.open.pre_high is not None:
-                self.open.pre_low /= ratio
-                self.open.pre_high /= ratio
+            self.open.holding.split(ratio)
         if self.order is not None:
             self.order.key /= ratio
             self.order.shares = int(self.order.shares * ratio + 1e-9)
+            if self.order.shares == 0:  # a reverse split left less than one share to buy
+                if self.order.leg == 1:
+                    self.cancelled = "no_size"
+                self.order = None
+                self.done = True
 
     def _result(self, o: _Open, session: date, price: float, reason: str) -> LegResult:
         state = o.state
-        # The exit bar adds only the exit price (and its open before an intraday stop): a daily
-        # bar does not say whether its high or low came before or after the fill. Should a leg
-        # close with nothing seen yet, its entry price stands in.
-        basis = state.entry_price * o.basis_factor
-        held_low, held_high = _lower(o.low, o.pre_low), _higher(o.high, o.pre_high)
-        if held_low is None or held_high is None:
-            held_low = held_high = basis
-        low, high = min(held_low, price), max(held_high, price)
+        # An intraday stop also saw its bar's open (``step``).
+        mae, mfe = o.holding.excursions(state.entry_price, price)
         child = o.child_proceeds
         result = LegResult(
             leg=o.leg,
@@ -241,10 +210,10 @@ class DecisionSim:
                 state.entry_price, price, state.initial_hard, child / state.shares
             ),
             holding_sessions=state.sessions_held + 1,
-            mae_pct=100 * (low / basis - 1),
-            mfe_pct=100 * (high / basis - 1),
+            mae_pct=mae,
+            mfe_pct=mfe,
             child_proceeds=child,
-            spinoff=o.spinoff,
+            spinoff=o.holding.spinoff,
         )
         self.legs.append(result)
         return result
@@ -257,7 +226,7 @@ class DecisionSim:
             self.waiting = True
         else:
             self.done = True
-        if o.entitled:
+        if o.holding.entitled:
             self.unpaid = _Unpaid(open=o, session=session, price=price, reason=reason)
             return None
         return self._result(o, session, price, reason)
@@ -268,12 +237,8 @@ class DecisionSim:
         """A spin-off's ex-date is the next bar: the leg held now is owed the children."""
         self.frozen = True
         self.frozen_closes = []
-        o = self.open
-        if o is not None:
-            o.entitled = True
-            o.entitled_shares = o.state.shares
-            o.pre_low, o.pre_high = _lower(o.pre_low, o.low), _higher(o.pre_high, o.high)
-            o.low = o.high = None
+        if self.open is not None:
+            self.open.holding.begin_spinoff(self.open.state.shares)
 
     def apply_spinoff(self, factor: float) -> None:
         """The event's factor became known at the last bar's close; the next bar sees the
@@ -283,11 +248,9 @@ class DecisionSim:
         self.pre_close *= factor
         held = [x for x in (self.open, self.unpaid.open if self.unpaid else None) if x]
         for o in held:
-            if o.entitled:
-                o.spinoff = "adjust"
-                o.basis_factor *= factor
-                _merge_pre(o, factor)
-        if self.open is not None and self.open.entitled:
+            if o.holding.entitled:
+                o.holding.adjust(factor)
+        if self.open is not None and self.open.holding.entitled:
             self.open.state = adjust_for_spinoff(self.open.state, factor)
         # The frozen closes are ex-date prices, comparable with the scaled re-entry zone now.
         bottom, _ = self._zone(self.pre_close)
@@ -301,9 +264,13 @@ class DecisionSim:
     def entitled_shares(self) -> int:
         """Parent shares the children are owed on (0 when none are owed)."""
         for o in (self.unpaid.open if self.unpaid else None, self.open):
-            if o is not None and o.entitled:
-                return o.entitled_shares
+            if o is not None and o.holding.entitled:
+                return o.holding.entitled_shares
         return 0
+
+    def owes_children(self) -> bool:
+        """Children are still to be paid into a leg (held, or sold and held back)."""
+        return (self.open is not None and self.open.holding.entitled) or self.unpaid is not None
 
     def overlap_spinoff(self) -> None:
         """Another spin-off goes ex while one is still being settled: it is not priced. An
@@ -317,18 +284,18 @@ class DecisionSim:
             self.waiting = False
             self.done = True
         if self.open is not None:
-            self.open.spinoff = "restart"
+            self.open.holding.spinoff = "restart"
 
     def credit_children(self, proceeds: float) -> list[LegResult]:
         """The children's sale: paid into the leg held at the ex-date."""
         if self.unpaid is not None:
             u, self.unpaid = self.unpaid, None
             u.open.child_proceeds += proceeds
-            u.open.entitled = False
+            u.open.holding.entitled = False
             return [self._result(u.open, u.session, u.price, u.reason)]
-        if self.open is not None and self.open.entitled:
+        if self.open is not None and self.open.holding.entitled:
             self.open.child_proceeds += proceeds
-            self.open.entitled = False
+            self.open.holding.entitled = False
         return []
 
     def end_spinoff_unpriced(self) -> list[LegResult]:
@@ -338,15 +305,11 @@ class DecisionSim:
         if self.waiting:
             self.waiting = False
             self.done = True
-        if self.open is not None and self.open.entitled:
-            self.open.entitled = False
-            self.open.spinoff = "restart"
-            _merge_pre(self.open, 1.0)
+        if self.open is not None and self.open.holding.entitled:
+            self.open.holding.restart()
         if self.unpaid is not None:
             u, self.unpaid = self.unpaid, None
-            u.open.entitled = False
-            u.open.spinoff = "restart"
-            _merge_pre(u.open, 1.0)
+            u.open.holding.restart()
             return [self._result(u.open, u.session, u.price, u.reason)]
         return []
 
@@ -426,17 +389,13 @@ class DecisionSim:
             if fill is not None:
                 if fill.reason == "hard":
                     # An intraday stop fills after the open, so the open was seen while held.
-                    o = self.open
-                    o.low = bar.open if o.low is None or bar.open < o.low else o.low
-                    o.high = bar.open if o.high is None or bar.open > o.high else o.high
+                    self.open.holding.see(bar.open, bar.open)
                 leg = self._close_leg(fill.session_date, fill.price, fill.reason)
                 if leg is not None:
                     closed.append(leg)
             else:
                 # Entry fills at the open, so the whole range of every bar held counts.
-                o = self.open
-                o.low = bar.low if o.low is None or bar.low < o.low else o.low
-                o.high = bar.high if o.high is None or bar.high > o.high else o.high
+                self.open.holding.see(bar.low, bar.high)
 
         if bar.close < reentry_bottom:
             self.invalid = True
@@ -471,8 +430,7 @@ class DecisionSim:
                 assert held_back is None  # a leg held at the ex-date is owed its children
             else:
                 o.state = replace(o.state, sessions_held=o.state.sessions_held + 1)
-                o.low = bar.low if o.low is None or bar.low < o.low else o.low
-                o.high = bar.high if o.high is None or bar.high > o.high else o.high
+                o.holding.see(bar.low, bar.high)
         self.frozen_closes.append(bar.close)
         if self.waiting and self.sessions_after > self.cfg.reentry.window_sessions:
             self.waiting = False

@@ -1,4 +1,8 @@
-"""A strategy is a directory of six YAML files: what to scan for, how to judge, how to trade.
+"""A strategy is a directory of YAML files: what to scan for, how to judge, how to trade.
+
+``strategy.yaml`` names the kind. ``earnings_gap`` (the default when no kind is written) has six
+files; ``bx_trender`` has four (strategy, scan, execute, attribution): it is mechanical, so it
+has neither rules nor a judge.
 
 The directory is the unit of versioning. ``content_hash`` identifies one exact parameter set (the
 files plus any ``--set`` overrides), and ``register_version`` records each set as a
@@ -12,12 +16,13 @@ import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlmodel import Session, col, func, select
 
+from asof.scan.bx_trender import BxScanConfig
 from asof.store.models import (
     ChangeKind,
     ProposedBy,
@@ -28,6 +33,8 @@ from asof.store.models import (
 )
 
 FILES = ("strategy", "scan", "rules", "judge", "execute", "attribution")
+BX_FILES = ("strategy", "scan", "execute", "attribution")
+KINDS = {"earnings_gap": FILES, "bx_trender": BX_FILES}
 
 
 class _Section(BaseModel):
@@ -36,6 +43,9 @@ class _Section(BaseModel):
 
 class StrategySection(_Section):
     name: str
+    # Left out of dumps: an earnings_gap config reads and records exactly as before the kind
+    # existed, and a dump without it loads back as earnings_gap.
+    kind: Literal["earnings_gap"] = Field(default="earnings_gap", exclude=True)
     cadence: Literal["daily"]
     universe: Literal["watchlist_with_documents"]
     direction: Literal["long"]
@@ -192,16 +202,102 @@ class StrategyConfig(_Section):
     attribution: AttributionConfig
 
 
-def _validate(raw: dict[str, Any]) -> StrategyConfig:
+# ---- bx_trender ------------------------------------------------------------------------------
+
+
+class BxStrategySection(_Section):
+    name: str
+    kind: Literal["bx_trender"]
+    cadence: Literal["daily"]
+    universe: Literal["liquid_common"]
+    direction: Literal["long"]
+
+
+class BxEntryConfig(_Section):
+    kind: Literal["next_open"]
+
+
+class BxSizingConfig(_Section):
+    """Shares risking ``risk_pct`` of equity over ``atr_mult`` ATRs: a volatility yardstick, not
+    a stop (there is none), capped per position and in gross."""
+
+    risk_pct: float
+    atr_days: int
+    atr_mult: float
+    max_position_pct: float
+    max_gross_pct: float
+
+
+class BxExecuteConfig(_Section):
+    """Each exit sells one share of the position (the last one what is left) and fires once:
+    ``daily_red`` when the daily histogram closes below 0, ``weekly_down`` when the last
+    completed weekly bar is below the one before it."""
+
+    entry: BxEntryConfig
+    exits: tuple[Literal["daily_red", "weekly_down"], ...]
+    sizing: BxSizingConfig
+    fills: FillsConfig
+    account: AccountConfig
+    data: DataConfig
+
+    @model_validator(mode="after")
+    def _distinct_exits(self) -> "BxExecuteConfig":
+        if not self.exits or len(set(self.exits)) != len(self.exits):
+            raise ValueError("exits must name each exit once, at least one")
+        return self
+
+
+class BxStrategyConfig(_Section):
+    strategy: BxStrategySection
+    scan: BxScanConfig
+    execute: BxExecuteConfig
+    attribution: AttributionConfig
+
+
+AnyStrategyConfig = StrategyConfig | BxStrategyConfig
+
+
+def _kind(raw_strategy: Any) -> str:
+    kind = raw_strategy.get("kind", "earnings_gap") if isinstance(raw_strategy, dict) else None
+    if kind not in KINDS:
+        raise ValueError(f"unknown strategy kind {kind!r}")
+    return kind
+
+
+def _validate(raw: dict[str, Any]) -> AnyStrategyConfig:
+    model = BxStrategyConfig if _kind(raw.get("strategy")) == "bx_trender" else StrategyConfig
     try:
-        return StrategyConfig.model_validate(raw)
+        return model.model_validate(raw)
     except ValidationError as error:
         raise ValueError(str(error)) from error
 
 
-def load_strategy(path: Path) -> StrategyConfig:
+def _files(path: Path) -> tuple[str, ...]:
+    """The files of the kind ``path/strategy.yaml`` names."""
+    file = path / "strategy.yaml"
+    if not file.is_file():
+        raise FileNotFoundError(f"{file}: missing strategy file")
+    return KINDS[_kind(yaml.safe_load(file.read_text()) or {})]
+
+
+@overload
+def load_strategy(path: Path) -> StrategyConfig: ...
+@overload
+def load_strategy[C: (StrategyConfig, BxStrategyConfig)](path: Path, kind: type[C]) -> C: ...
+def load_strategy(
+    path: Path, kind: type[StrategyConfig] | type[BxStrategyConfig] = StrategyConfig
+) -> AnyStrategyConfig:
+    """The strategy at ``path``, which must be of ``kind`` (earnings_gap unless told)."""
+    cfg = _load(path)
+    if not isinstance(cfg, kind):
+        raise ValueError(f"{path}: a {cfg.strategy.kind} strategy, not {kind.__name__}")
+    return cfg
+
+
+def _load(path: Path) -> AnyStrategyConfig:
+    """The strategy at ``path``, of whatever kind its strategy.yaml names."""
     raw: dict[str, Any] = {}
-    for name in FILES:
+    for name in _files(path):
         file = path / f"{name}.yaml"
         if not file.is_file():
             raise FileNotFoundError(f"{file}: missing strategy file")
@@ -221,7 +317,13 @@ def _parse_override(override: str) -> tuple[list[str], Any]:
     return keys, yaml.safe_load(value)
 
 
-def apply_overrides(cfg: StrategyConfig, overrides: Sequence[str]) -> StrategyConfig:
+@overload
+def apply_overrides(cfg: StrategyConfig, overrides: Sequence[str]) -> StrategyConfig: ...
+@overload
+def apply_overrides(cfg: BxStrategyConfig, overrides: Sequence[str]) -> BxStrategyConfig: ...
+@overload
+def apply_overrides(cfg: AnyStrategyConfig, overrides: Sequence[str]) -> AnyStrategyConfig: ...
+def apply_overrides(cfg: AnyStrategyConfig, overrides: Sequence[str]) -> AnyStrategyConfig:
     """A new config with each ``a.b.c=value`` applied; the value is read as YAML, then typed by
     the model. An unknown path or a value of the wrong type raises ValueError."""
     raw = cfg.model_dump(mode="json")
@@ -238,13 +340,15 @@ def apply_overrides(cfg: StrategyConfig, overrides: Sequence[str]) -> StrategyCo
         if keys[-1] not in node or isinstance(node[keys[-1]], dict):
             raise ValueError(f"{override!r}: no setting {keys[-1]!r}")
         node[keys[-1]] = value
-    return _validate(raw)
+    out = _validate(raw)
+    assert isinstance(out, type(cfg))  # the strategy section, hence the kind, is never overridden
+    return out
 
 
 def _canonical_overrides(path: Path, overrides: Sequence[str]) -> list[tuple[str, Any]]:
     """Each overridden path with its typed value, sorted: "=1" and "=1.0" on a float setting, or
     the same set in another order, are one parameter set."""
-    cfg = apply_overrides(load_strategy(path), overrides)
+    cfg = apply_overrides(_load(path), overrides)
     raw = cfg.model_dump(mode="json")
     found: dict[str, Any] = {}
     for override in overrides:
@@ -257,10 +361,10 @@ def _canonical_overrides(path: Path, overrides: Sequence[str]) -> list[tuple[str
 
 
 def content_hash(path: Path, overrides: Sequence[str] = ()) -> str:
-    """SHA-256 over the six files' bytes and the canonical overrides. Independent of where the
+    """SHA-256 over the kind's files' bytes and the canonical overrides. Independent of where the
     directory lives and of file times."""
     digest = hashlib.sha256()
-    for name in FILES:
+    for name in _files(path):
         digest.update(name.encode() + b"\0")
         digest.update((path / f"{name}.yaml").read_bytes() + b"\0")
     if overrides:
@@ -284,7 +388,7 @@ def register_version(
 ) -> StrategyVersion:
     """The StrategyVersion row of this parameter set, created on first use. The committed
     directory is the approved base; any override set is a proposed child of it."""
-    cfg = apply_overrides(load_strategy(path), overrides)  # raises before anything is written
+    cfg = apply_overrides(_load(path), overrides)  # raises before anything is written
     strategy_id = cfg.strategy.name
     digest = content_hash(path, overrides)
     existing = _find(session, strategy_id, digest)
