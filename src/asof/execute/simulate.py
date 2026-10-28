@@ -58,6 +58,9 @@ class LegResult:
     pnl: float
     r_multiple: float
     holding_sessions: int  # bars held, entry and exit day included
+    # Lowest / highest price seen while held, in % of entry_price; see DecisionSim.step.
+    mae_pct: float
+    mfe_pct: float
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -79,6 +82,9 @@ class _Open:
     entry_session: date
     initial_key: float
     state: LegState
+    # Extremes of the bars held before the exit bar; None until one such bar has been seen.
+    low: float | None = None
+    high: float | None = None
 
 
 class DecisionSim:
@@ -152,6 +158,9 @@ class DecisionSim:
         if self.open is not None:
             self.open.state = adjust_for_split(self.open.state, ratio)
             self.open.initial_key /= ratio
+            if self.open.low is not None and self.open.high is not None:
+                self.open.low /= ratio
+                self.open.high /= ratio
         if self.order is not None:
             self.order.key /= ratio
             self.order.shares = int(self.order.shares * ratio + 1e-9)
@@ -159,6 +168,13 @@ class DecisionSim:
     def _close_leg(self, session: date, price: float, reason: str) -> LegResult:
         assert self.open is not None
         state = self.open.state
+        # The exit bar adds only the exit price (and its open before an intraday stop): a daily
+        # bar does not say whether its high or low came before or after the fill. Should a leg
+        # close with nothing seen yet, its entry price stands in.
+        held_low, held_high = self.open.low, self.open.high
+        if held_low is None or held_high is None:
+            held_low = held_high = state.entry_price
+        low, high = min(held_low, price), max(held_high, price)
         result = LegResult(
             leg=self.open.leg,
             entry_session=self.open.entry_session,
@@ -172,6 +188,8 @@ class DecisionSim:
             pnl=state.shares * (price - state.entry_price),
             r_multiple=r_multiple(state.entry_price, price, state.initial_hard),
             holding_sessions=state.sessions_held + 1,
+            mae_pct=100 * (low / state.entry_price - 1),
+            mfe_pct=100 * (high / state.entry_price - 1),
         )
         self.legs.append(result)
         self.open = None
@@ -245,7 +263,17 @@ class DecisionSim:
             state, fill = step_leg(self.open.state, bar, self.params)
             self.open.state = state
             if fill is not None:
+                if fill.reason == "hard":
+                    # An intraday stop fills after the open, so the open was seen while held.
+                    o = self.open
+                    o.low = bar.open if o.low is None or bar.open < o.low else o.low
+                    o.high = bar.open if o.high is None or bar.open > o.high else o.high
                 closed.append(self._close_leg(fill.session_date, fill.price, fill.reason))
+            else:
+                # Entry fills at the open, so the whole range of every bar held counts.
+                o = self.open
+                o.low = bar.low if o.low is None or bar.low < o.low else o.low
+                o.high = bar.high if o.high is None or bar.high > o.high else o.high
 
         if bar.close < reentry_bottom:
             self.invalid = True

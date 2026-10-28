@@ -498,3 +498,79 @@ def test_an_unrecorded_reverse_split_exits_at_the_last_close(
     [only] = trades(session, run_id)
     assert (ny_date(only.exit_at), only.exit_price, only.exit_reason) == (X[2], 56.8, "price_jump")
     assert only.pnl == pytest.approx(125 * 0.3)
+
+
+# =============================================================================================
+# excursions (MAE / MFE) written per leg; hand values as in tests/execute/test_simulate.py
+# =============================================================================================
+
+
+def test_replay_writes_each_legs_excursions(
+    tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, strategy_dir: Path
+) -> None:
+    world = gap_world(tmp_path, session, after=TRADED)
+    run_id = run_replay(session, con, world.root, strategy_dir, START, END, ZERO_SLIP)
+    first, second = trades(session, run_id)
+    # leg 1: 56.5 in, sees X1 56.0 .. 57.0 and X2 53.0 .. 56.2, out at X3's open 53.4
+    assert first.mae_pct == pytest.approx(100 * (53.0 / 56.5 - 1))  # -6.1947
+    assert first.mfe_pct == pytest.approx(100 * (57.0 / 56.5 - 1))  # +0.8850
+    # leg 2: in at 51.0 and out at 48.0 on X4, nothing else counts
+    assert second.mae_pct == pytest.approx(100 * (48.0 / 51.0 - 1))  # -5.8824
+    assert second.mfe_pct == pytest.approx(0.0)
+
+    cfg = apply_overrides(load_strategy(strategy_dir), list(ZERO_SLIP)).execute
+    bars = sorted(
+        (
+            DailyBar(session_date=b.t.astimezone(ET).date(), open=b.open, high=b.high,
+                     low=b.low, close=b.close)
+            for b in world.bars
+            if b.symbol == "GAPX" and b.t.astimezone(ET).date() >= X[0]
+        ),
+        key=lambda b: b.session_date,
+    )  # fmt: skip
+    plan = DecisionPlan(
+        reaction_session=X[0], decision_close=GAP[3], gap_low=GAP[2], pre_earnings_close=50.0,
+        atr=2.0, equity=100_000.0,
+    )  # fmt: skip
+    legs = simulate_decision(plan, bars, cfg).legs
+    assert [(t.mae_pct, t.mfe_pct) for t in (first, second)] == [
+        (pytest.approx(leg.mae_pct), pytest.approx(leg.mfe_pct)) for leg in legs
+    ]
+
+
+def test_replay_excursions_through_a_split(
+    tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, strategy_dir: Path
+) -> None:
+    # Split world of test_a_split_while_holding_rescales_the_position: post-split entry 28.25,
+    # entry bar 28.0 .. 28.5, X2 27.9 .. 28.3, X3 26.4 .. 28.1, out at X4's open 26.6.
+    after: list[Ohlcv | None] = [
+        (56.5, 57.0, 56.0, 56.8, 1_200_000),
+        (28.1, 28.3, 27.9, 28.2, 2_400_000),
+        (28.0, 28.1, 26.4, 26.5, 2_400_000),
+        (26.6, 26.7, 26.3, 26.4, 2_000_000),
+        *[(26.5, 26.7, 26.3, 26.5, 2_000_000)] * 22,
+    ]
+    world = gap_world(tmp_path, session, after=after)
+    write_splits(world.root, [("GAPX", X[2], 1.0, 2.0)])
+    run_id = run_replay(session, con, world.root, strategy_dir, START, X[len(after)], ZERO_SLIP)
+    [only] = trades(session, run_id)
+    assert only.mae_pct == pytest.approx(100 * (26.4 / 28.25 - 1))  # -6.5487
+    assert only.mfe_pct == pytest.approx(100 * (28.5 / 28.25 - 1))  # +0.8850
+
+
+def test_replay_excursions_of_a_data_gap_exit(
+    tmp_path: Path, session: Session, con: duckdb.DuckDBPyConnection, strategy_dir: Path
+) -> None:
+    # World of test_five_missing_sessions_exit_at_the_last_close: X1 56.0 .. 57.0, X2 56.0 ..
+    # 57.2, then no bars; forced out at the last close 57.0.
+    after: list[Ohlcv | None] = [
+        (56.5, 57.0, 56.0, 56.8, 1_200_000),
+        (56.6, 57.2, 56.0, 57.0, 1_200_000),
+        *[None] * 24,
+    ]
+    world = gap_world(tmp_path, session, after=after)
+    run_id = run_replay(session, con, world.root, strategy_dir, START, X[len(after)], ZERO_SLIP)
+    [only] = trades(session, run_id)
+    assert only.exit_reason == "data_gap"
+    assert only.mae_pct == pytest.approx(100 * (56.0 / 56.5 - 1))  # -0.8850
+    assert only.mfe_pct == pytest.approx(100 * (57.2 / 56.5 - 1))  # +1.2389

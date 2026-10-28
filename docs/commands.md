@@ -477,7 +477,11 @@ A decision's outcome becomes visible only after its re-entry window has closed. 
 (`$ASOF_DATA_DIR/reports/replay-<id>.md`) gives win rate, mean R and P&L by leg, realized
 return next to SPY buy-and-hold, realized drawdown, profit concentration, exit reasons, the
 largest decisions with the filing behind each, and the number of parameter sets and replays
-run so far. The judge here takes every candidate. It is the baseline a reading judge has to
+run so far. Each leg also records its excursions: the lowest (MAE) and highest (MFE) price
+while held, in percent of the entry fill. The entry day's whole range counts (the fill is at
+its open); on the exit day only the fill counts, plus the open when an intraday stop filled.
+The report gives their medians and how much of the best move a leg kept (realized percent
+over MFE, for legs with MFE above zero). The judge here takes every candidate. It is the baseline a reading judge has to
 beat, and its decisions carry no claims. Limits: the universe is today's watchlist (chosen
 with hindsight); bars are daily, so within a bar the worst order is assumed; drawdown counts
 closed trades only; no significance test yet.

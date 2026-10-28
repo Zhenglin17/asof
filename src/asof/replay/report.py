@@ -202,6 +202,30 @@ def _holdout_lines(session: Session, run: Run, protocol: EvaluationProtocol) -> 
     return []
 
 
+def _excursion_lines(trades: list[Trade]) -> list[str]:
+    """Medians over legs that recorded excursions; kept = realized % / MFE %, over MFE > 0."""
+    rows = [t for t in trades if t.mae_pct is not None and t.mfe_pct is not None]
+    if not rows:
+        return ["no excursions recorded (trades from before they were recorded)"]
+    kept = [
+        100 * (t.exit_price / t.entry_price - 1) / t.mfe_pct
+        for t in rows
+        if t.mfe_pct is not None and t.mfe_pct > 0
+    ]
+    mae = statistics.median(t.mae_pct or 0.0 for t in rows)
+    mfe = statistics.median(t.mfe_pct or 0.0 for t in rows)
+    return [
+        "Lowest (MAE) and highest (MFE) price while held, in % of the entry fill; the exit "
+        "bar counts only its fill. Kept: realized % over MFE %, for legs with MFE > 0.",
+        "",
+        f"- median MAE: {mae:.2f}% (n={len(rows)})",
+        f"- median MFE: {mfe:.2f}% (n={len(rows)})",
+        f"- median kept: {statistics.median(kept):.2f} (n={len(kept)})"
+        if kept
+        else "- median kept: n/a (n=0)",
+    ]
+
+
 def build_report(
     session: Session,
     run_id: int,
@@ -260,6 +284,7 @@ def build_report(
         )
     else:
         lines.append("no closed trades")
+    lines += ["", "## Excursions (MAE / MFE)", "", *_excursion_lines(trades)]
     lines += ["", f"## Largest decisions by absolute pnl (top {TOP_N})", ""]
     lines += _top_decisions(session, run_id, trades)
     lines += [

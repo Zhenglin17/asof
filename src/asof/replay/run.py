@@ -203,6 +203,8 @@ class _Replay:
             pnl=leg.pnl,
             r_multiple=leg.r_multiple,
             holding_sessions=leg.holding_sessions,
+            mae_pct=leg.mae_pct,
+            mfe_pct=leg.mfe_pct,
             available_at=close_of(leg.exit_session),
         )
         self.session.add(trade)

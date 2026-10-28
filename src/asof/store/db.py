@@ -57,9 +57,12 @@ def _upgrade_citation_table(conn: Connection) -> None:
 
 
 def _upgrade_trade_table(conn: Connection) -> None:
-    # A trade table from before `symbol` existed gains the nullable column; old rows keep NULL.
-    if "symbol" not in {c["name"] for c in inspect(conn).get_columns("trade")}:
-        conn.exec_driver_sql("ALTER TABLE trade ADD COLUMN symbol VARCHAR")
+    # A trade table from before `symbol` or the excursions existed gains the nullable columns;
+    # old rows keep NULL.
+    have = {c["name"] for c in inspect(conn).get_columns("trade")}
+    for name, kind in (("symbol", "VARCHAR"), ("mae_pct", "FLOAT"), ("mfe_pct", "FLOAT")):
+        if name not in have:
+            conn.exec_driver_sql(f"ALTER TABLE trade ADD COLUMN {name} {kind}")
 
 
 def _upgrade_holdout_opening_table(conn: Connection) -> None:

@@ -218,3 +218,94 @@ def test_drawdown_of_a_curve_that_only_rises_is_zero(session: Session) -> None:
 def test_unknown_run_raises(session: Session) -> None:
     with pytest.raises((LookupError, ValueError)):
         replay_metrics(session, 12345)
+
+
+# =============================================================================================
+# excursions section
+#
+# Heading (exact): "## Excursions (MAE / MFE)". Over the run's legs whose mae_pct and mfe_pct are
+# not NULL it shows, each on its own line with its label:
+#     "median MAE" -> f"{v:.2f}%" and "n=<legs used>"
+#     "median MFE" -> f"{v:.2f}%" and "n=<legs used>"
+#     "median kept" -> f"{v:.2f}" (a ratio) and "n=<legs used>", where kept = realized % / MFE %
+#         over legs with MFE > 0, realized % = 100 * (exit_price / entry_price - 1)
+# With no such leg the section says "no excursions recorded" and shows no median.
+#
+# Hand set (entry 100, 50 shares, so exit = 100 + pnl / 50):
+#     E1 pnl +300 exit 106 realized +6   mae -2 mfe  8   kept  0.75
+#     E2 pnl -200 exit  96 realized -4   mae -5 mfe  1   kept -4.00
+#     E3 pnl +500 exit 110 realized +10  mae -1 mfe 12   kept  0.8333
+#     E4 pnl -100 exit  98 realized -2   mae -3 mfe  0   (MFE not > 0: no kept)
+#     E5 pnl +100 exit 102               NULL NULL       (an old row: left out everywhere)
+#   median MAE of -5 -3 -2 -1 = -2.50% (n=4); median MFE of 0 1 8 12 = 4.50% (n=4);
+#   median kept of -4 0.75 0.8333 = 0.75 (n=3). Counting E5 as 0 would give MAE -2.00%.
+# =============================================================================================
+
+EXCURSIONS = "## Excursions (MAE / MFE)"
+
+
+def section(text: str, heading: str) -> str:
+    assert heading in text, heading
+    body = text.split(heading, 1)[1]
+    return body.split("\n## ", 1)[0]
+
+
+def line_with(body: str, label: str) -> str:
+    [line] = [ln for ln in body.splitlines() if label in ln.lower()]
+    return line
+
+
+@pytest.fixture
+def excursion_run_id(session: Session) -> int:
+    entity = add(session, Entity(kind="company", ticker="EXC", name="Exc Inc.", cik=997))
+    run = make_run(session, pk(version(session, 0)))
+    rows = [
+        (300.0, -2.0, 8.0),
+        (-200.0, -5.0, 1.0),
+        (500.0, -1.0, 12.0),
+        (-100.0, -3.0, 0.0),
+        (100.0, None, None),
+    ]
+    for i, (pnl, mae, mfe) in enumerate(rows):
+        d = make_decision(session, run, entity, date(2024, 3, 1 + i))
+        t = make_trade(session, d, 1, pnl, pnl / 200, "break", date(2024, 3, 10 + i))
+        t.mae_pct, t.mfe_pct = mae, mfe
+        session.add(t)
+    session.commit()
+    return pk(run)
+
+
+def test_excursions_section_shows_the_hand_computed_medians(
+    session: Session, excursion_run_id: int
+) -> None:
+    body = section(build_report(session, excursion_run_id), EXCURSIONS)
+    mae = line_with(body, "median mae")
+    assert "-2.50%" in mae and "n=4" in mae
+    mfe = line_with(body, "median mfe")
+    assert "4.50%" in mfe and "n=4" in mfe
+    kept = line_with(body, "median kept")
+    assert "0.75" in kept and "n=3" in kept
+
+
+def test_excursions_of_old_rows_alone_are_reported_as_missing(
+    session: Session, run_id: int
+) -> None:
+    # every trade of the base fixture is an old row: mae_pct and mfe_pct NULL
+    body = section(build_report(session, run_id), EXCURSIONS)
+    assert "no excursions recorded" in body.lower()
+    assert "median" not in body.lower()
+
+
+def test_excursions_kept_skips_legs_whose_mfe_is_not_positive(session: Session) -> None:
+    # A single leg that never went above its entry: MAE / MFE are shown, kept has no leg.
+    entity = add(session, Entity(kind="company", ticker="DN", name="Down Inc.", cik=996))
+    run = make_run(session, pk(version(session, 0)))
+    d = make_decision(session, run, entity, date(2024, 4, 1))
+    t = make_trade(session, d, 1, -150.0, -0.75, "hard", date(2024, 4, 5))
+    t.mae_pct, t.mfe_pct = -3.0, 0.0
+    session.add(t)
+    session.commit()
+    body = section(build_report(session, pk(run)), EXCURSIONS)
+    assert "-3.00%" in line_with(body, "median mae")
+    assert "0.00%" in line_with(body, "median mfe")
+    assert "n=0" in line_with(body, "median kept")

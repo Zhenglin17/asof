@@ -32,7 +32,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from asof.execute import DailyBar, DecisionPlan, simulate_decision
+from asof.execute import DailyBar, DecisionPlan, DecisionSim, simulate_decision
 from asof.strategy import apply_overrides, load_strategy
 from tests.strategy.files import write_strategy
 
@@ -341,3 +341,212 @@ def test_leg_one_is_the_same_whether_or_not_later_bars_exist(tmp_path: Path) -> 
         simulate_decision(RDDT_PLAN, upto_exit, cfg).legs[0]
         == simulate_decision(RDDT_PLAN, RDDT, cfg).legs[0]
     )
+
+
+# =============================================================================================
+# excursions (MAE / MFE) per leg
+#
+# mae_pct = 100 * (lowest price seen while held / entry_price - 1), mfe_pct likewise with the
+# highest. Seen while held: the entry bar's low and high (the fill is at its open, so its whole
+# range comes after the fill), every later bar's low and high before the exit bar, and the exit
+# price. The exit bar adds only the exit price (and its open before an intraday stop): a daily
+# bar does not say whether its high or low came before or after the fill. A leg entered and
+# exited on one bar sees only its entry and exit prices (plus that open). Not clipped at 0.
+# =============================================================================================
+
+
+def pct(price: float, entry: float) -> float:
+    return 100 * (price / entry - 1)
+
+
+def test_golden_rddt_excursions(tmp_path: Path) -> None:
+    first, second = simulate_decision(RDDT_PLAN, RDDT, execute_cfg(tmp_path)).legs
+    # leg 1 holds 05-04 .. 05-08 (lows 164.65 167.62 162.55 159.60 155.21, highs 175.29 177.13
+    # 172.65 169.10 162.90) and exits 05-11 at 153.50, below every low it saw
+    assert first.mae_pct == pytest.approx(pct(153.50, 170.08))  # -9.7484
+    assert first.mfe_pct == pytest.approx(pct(177.13, 170.08))  # +4.1451
+    # leg 2 holds 05-14 .. 05-22 (lowest low 140.67 on 05-22, highest high 161.49 on 05-19) and
+    # exits 05-26 at the open 143.50; 05-26's own low 139.55 is not counted
+    assert second.mae_pct == pytest.approx(pct(140.67, 155.78))  # -9.6996
+    assert second.mfe_pct == pytest.approx(pct(161.49, 155.78))  # +3.6654
+
+
+def test_excursions_of_a_multi_bar_leg_and_a_same_bar_reentry(tmp_path: Path) -> None:
+    bars = bars_of(
+        [
+            REACTION,
+            ENTRY_DAY,  # entry 56.5; low 56.0, high 57.0 count
+            BREAK_DAY,  # low 53.0, high 56.2 count
+            (X[3], 53.4, 53.5, 50.2, 50.8),  # exit bar: only the fill 53.4 counts, not low 50.2
+            (X[4], 51.0, 51.5, 47.0, 47.5),  # leg 2 in at 51.0 and out at 48.0 on this bar
+            quiet(5),
+        ]
+    )
+    first, second = simulate_decision(PLAN, bars, execute_cfg(tmp_path)).legs
+    # leg 1: lowest 53.0, highest 57.0
+    assert first.mae_pct == pytest.approx(pct(53.0, 56.5))  # -6.1947
+    assert first.mfe_pct == pytest.approx(pct(57.0, 56.5))  # +0.8850
+    # leg 2 has its own window and one bar: only 51.0 and 48.0 (not X4's 47.0 / 51.5, not leg
+    # 1's 57.0)
+    assert second.mae_pct == pytest.approx(pct(48.0, 51.0))  # -5.8824
+    assert second.mfe_pct == pytest.approx(0.0)
+
+
+def test_excursions_when_the_open_gaps_through_the_hard_stop(tmp_path: Path) -> None:
+    bars = bars_of(
+        [
+            REACTION,
+            ENTRY_DAY,
+            (X[2], 51.0, 51.5, 50.4, 51.0),  # hard_gap at the open 51.0; low 50.4 not counted
+            (X[3], 51.2, 52.0, 51.0, 51.8),
+            (X[4], 51.5, 51.6, 47.5, 48.2),
+            quiet(5),
+        ]
+    )
+    [first] = simulate_decision(PLAN, bars, execute_cfg(tmp_path)).legs
+    assert first.exit_reason == "hard_gap"
+    assert first.mae_pct == pytest.approx(pct(51.0, 56.5))  # -9.7345
+    assert first.mfe_pct == pytest.approx(pct(57.0, 56.5))  # +0.8850
+
+
+def test_excursions_when_an_intraday_hard_stop_fills(tmp_path: Path) -> None:
+    bars = bars_of(
+        [
+            REACTION,
+            (X[1], 53.51, 54.0, 53.4, 53.9),  # entry 53.51; low 53.4, high 54.0 count
+            (X[2], 53.0, 53.2, 51.5, 52.0),  # low 51.5 <= 52 -> out at 52.0; 51.5 not counted
+            quiet(3),
+        ]
+    )
+    [first] = simulate_decision(PLAN, bars, execute_cfg(tmp_path)).legs
+    assert (first.exit_price, first.exit_reason) == (52.0, "hard")
+    assert first.mae_pct == pytest.approx(pct(52.0, 53.51))  # -2.8219
+    assert first.mfe_pct == pytest.approx(pct(54.0, 53.51))  # +0.9157
+
+
+def test_the_open_before_an_intraday_stop_counts(tmp_path: Path) -> None:
+    # X2 gaps up to 60 and then trades down through the hard stop 52: the open came before the
+    # stop filled, so it was seen while held; the rest of X2's range was not.
+    bars = bars_of([REACTION, ENTRY_DAY, (X[2], 60.0, 61.0, 51.0, 51.5), quiet(3)])
+    [first] = simulate_decision(PLAN, bars, execute_cfg(tmp_path)).legs
+    assert (first.exit_price, first.exit_reason) == (52.0, "hard")
+    assert first.mfe_pct == pytest.approx(pct(60.0, 56.5))  # +6.1947, not 61.0's +7.96
+    assert first.mae_pct == pytest.approx(pct(52.0, 56.5))  # the fill, not 51.0
+
+
+def test_excursions_are_not_clipped_at_zero(tmp_path: Path) -> None:
+    # 5 bps: entry 56.5 * 1.0005 = 56.52825, above the entry bar's high 56.5 and every later
+    # high, so the best price seen is below the fill and mfe is negative.
+    cfg = execute_cfg(tmp_path, "execute.fills.slippage_bps=5")
+    bars = bars_of(
+        [
+            REACTION,
+            (X[1], 56.5, 56.5, 55.0, 55.2),  # close above the zone, key stays 54
+            (X[2], 55.0, 55.4, 53.0, 53.4),  # close 53.4 < 53.5 -> break at the next open
+            (X[3], 53.4, 53.5, 52.2, 52.4),  # out at 53.4 * 0.9995 = 53.3733
+        ]
+    )
+    first = simulate_decision(PLAN, bars, cfg).legs[0]
+    entry = 56.5 * (1 + 5 / 1e4)
+    assert first.entry_price == pytest.approx(entry)
+    assert first.mae_pct == pytest.approx(pct(53.0, entry))  # -6.2416
+    assert first.mfe_pct == pytest.approx(pct(56.5, entry))  # -0.0500
+    assert first.mfe_pct < 0
+
+
+def test_a_split_while_held_leaves_the_excursions_in_percent(tmp_path: Path) -> None:
+    # 2:1 before X2: entry 56.5 -> 28.25, the entry bar's 56.0 .. 57.0 -> 28.0 .. 28.5, key 27
+    # (zone 26.75 .. 27.25 with ATR 1, hard 26). X3 closes 26.5 -> break, out at X4's 26.6.
+    sim = DecisionSim(PLAN, execute_cfg(tmp_path))
+    for bar in bars_of([REACTION, ENTRY_DAY]):
+        sim.step(bar)
+    sim.apply_split(2.0)
+    closed = []
+    for bar in bars_of(
+        [
+            (X[2], 28.1, 28.3, 27.9, 28.2),
+            (X[3], 28.0, 28.1, 26.4, 26.5),
+            (X[4], 26.6, 26.7, 26.3, 26.4),
+        ]
+    ):
+        closed += sim.step(bar)
+    [leg] = closed
+    assert (leg.entry_price, leg.exit_price) == (pytest.approx(28.25), 26.6)
+    # lowest 26.4 (X3), highest 28.5 (the entry bar's 57.0 after the split)
+    assert leg.mae_pct == pytest.approx(pct(26.4, 28.25))  # -6.5487
+    assert leg.mfe_pct == pytest.approx(pct(28.5, 28.25))  # +0.8850 = pct(57.0, 56.5)
+
+
+def test_a_forced_exit_counts_the_bars_stepped_and_the_forced_price(tmp_path: Path) -> None:
+    sim = DecisionSim(PLAN, execute_cfg(tmp_path))
+    for bar in bars_of([REACTION, ENTRY_DAY, (X[2], 56.6, 57.2, 56.0, 57.0)]):
+        assert sim.step(bar) == []
+    leg = sim.force_exit(X[7], 57.0, "data_gap")
+    assert leg is not None
+    assert leg.mae_pct == pytest.approx(pct(56.0, 56.5))  # -0.8850
+    assert leg.mfe_pct == pytest.approx(pct(57.2, 56.5))  # +1.2389
+
+
+def test_a_forced_exit_below_every_low_is_the_mae(tmp_path: Path) -> None:
+    sim = DecisionSim(PLAN, execute_cfg(tmp_path))
+    for bar in bars_of([REACTION, ENTRY_DAY, (X[2], 56.6, 57.2, 56.0, 57.0)]):
+        sim.step(bar)
+    leg = sim.force_exit(X[3], 55.0, "price_jump")
+    assert leg is not None
+    assert leg.mae_pct == pytest.approx(pct(55.0, 56.5))  # -2.6549
+    assert leg.mfe_pct == pytest.approx(pct(57.2, 56.5))
+
+
+# leakage: nothing at or after the exit bar's range moves the excursions
+
+
+def test_bars_after_the_exit_do_not_change_the_excursions(tmp_path: Path) -> None:
+    cfg = execute_cfg(tmp_path)
+    rows = [
+        REACTION,
+        ENTRY_DAY,
+        (X[2], 51.0, 51.5, 50.4, 51.0),  # hard_gap, the only leg (budget used up)
+    ]
+    future = [(X[3], 51.2, 400.0, 0.5, 51.8), (X[4], 51.5, 900.0, 0.1, 48.2), quiet(5)]
+    [short] = simulate_decision(PLAN, bars_of(rows), cfg).legs
+    [full] = simulate_decision(PLAN, bars_of(rows + future), cfg).legs
+    assert (full.mae_pct, full.mfe_pct) == (short.mae_pct, short.mfe_pct)
+    assert full.mae_pct == pytest.approx(pct(51.0, 56.5))
+    assert full == short
+
+
+@pytest.mark.parametrize(
+    ("high", "low"), [(99.0, 50.2), (53.5, 1.0), (99.0, 1.0)], ids=["high", "low", "both"]
+)
+def test_the_exit_bars_range_does_not_change_the_excursions(
+    tmp_path: Path, high: float, low: float
+) -> None:
+    # Leg 1 exits at X3's open; leg 2 enters and exits on X4. Editing the range of either exit
+    # bar (keeping its open and close, so every fill and the re-entry stay as they were) must
+    # leave both legs' excursions alone.
+    cfg = execute_cfg(tmp_path)
+
+    def world(x3: tuple[float, float], x4: tuple[float, float]) -> list[DailyBar]:
+        return bars_of(
+            [
+                REACTION,
+                ENTRY_DAY,
+                BREAK_DAY,
+                (X[3], 53.4, x3[0], x3[1], 50.8),
+                (X[4], 51.0, x4[0], x4[1], 47.5),
+                quiet(5),
+            ]
+        )
+
+    base = simulate_decision(PLAN, world((53.5, 50.2), (51.5, 47.0)), cfg).legs
+    edited = simulate_decision(
+        PLAN, world((high, low), (max(high, 51.5), min(low, 47.0))), cfg
+    ).legs
+    assert [(leg.exit_price, leg.exit_reason) for leg in edited] == [
+        (leg.exit_price, leg.exit_reason) for leg in base
+    ]
+    assert [(leg.mae_pct, leg.mfe_pct) for leg in edited] == [
+        (leg.mae_pct, leg.mfe_pct) for leg in base
+    ]
+    assert base[0].mae_pct == pytest.approx(pct(53.0, 56.5))
+    assert base[1].mfe_pct == pytest.approx(0.0)

@@ -369,6 +369,10 @@ class Trade(_Table, table=True):
     pnl: float
     r_multiple: float
     holding_sessions: int | None = None
+    # Lowest / highest price seen while held, in % of entry_price (NULL on rows from before they
+    # were recorded).
+    mae_pct: float | None = None
+    mfe_pct: float | None = None
     available_at: datetime = Field(sa_type=UTCDateTime, index=True)
 
 
