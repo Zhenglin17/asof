@@ -165,7 +165,8 @@ count. It is still a search to anyone who picks its best cell, and is shown as s
 | Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
 | Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
 
-On the real store, `asof market audit` runs 35 data checks with reviewed exceptions, and
+On the real store, `asof market audit` runs 37 data checks with reviewed exceptions (the session
+calendar among them, against the NYSE schedule), and
 hand-checked reference histories (renames, ticker reuse, splits, spin-offs) are asserted as tests.
 
 ## Known limitations

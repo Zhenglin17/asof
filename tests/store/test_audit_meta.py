@@ -50,6 +50,7 @@ from tests.store.audit_world import (
     base_bars,
     class_row,
     conflict,
+    dividend,
     drop,
     find,
     flat,
@@ -241,6 +242,11 @@ def _i10(w: MetaWorld) -> None:
     w.exchange = [("INBX", 1739614, "NASDAQ", THREE)]  # listed three times, no bars at all
 
 
+def _i12(w: MetaWorld) -> None:
+    for symbol in ("AAA", "BBB", "CCC"):  # a mid-window NYSE session with no bar at all
+        w.bars = drop(w.bars, symbol, [DAYS[10]])
+
+
 def _s1(w: MetaWorld) -> None:
     w.splits = [split("AAA", date(2020, 1, 11), 1.0, 2.0)]  # a Saturday: no bar that day
 
@@ -260,6 +266,12 @@ def _s4(w: MetaWorld) -> None:
 def _s5(w: MetaWorld) -> None:
     # the MDRR 2024-07-03 shape (tests/store/test_split_events.py): two factors on one day
     w.splits = [split("AAA", DAYS[10], 10.0, 1.0), split("AAA", DAYS[10], 1.0, 5.0)]
+
+
+def _d1(w: MetaWorld) -> None:
+    # the FMX 2026-04-22 shape (tests/store/test_audit_invariants.py): one payout stored twice,
+    # the second copy with one more digit
+    w.dividends = [dividend("AAA", DAYS[5], 1.039579), dividend("AAA", DAYS[5], 1.0395792)]
 
 
 def _n1(w: MetaWorld) -> None:
@@ -320,12 +332,14 @@ BROKEN: dict[str, Callable[[MetaWorld], None]] = {
     "I8": _i8,
     "I9": _i9,
     "I10": _i10,
+    "I12": _i12,
     "S1": _s1,
     "S2": _s2,
     "S3": _s3,
     "S4": _s4,
     "S5": _s5,
     "S6": _s6,
+    "D1": _d1,
     "N1": _n1,
     "N2": _n2,
     "N3": _n3,

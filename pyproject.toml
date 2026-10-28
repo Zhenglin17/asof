@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "httpx>=0.28.1",
     "numpy>=2.5",
+    "exchange-calendars>=4.13.2",
 ]
 
 [project.scripts]

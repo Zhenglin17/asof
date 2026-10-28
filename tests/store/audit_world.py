@@ -20,7 +20,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from asof.ingest.bars import bucket_of
-from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA, OTHER_SCHEMA, SPLIT_SCHEMA
+from asof.ingest.corporate_actions import (
+    DIVIDEND_SCHEMA,
+    NAME_CHANGE_SCHEMA,
+    OTHER_SCHEMA,
+    SPLIT_SCHEMA,
+)
 from asof.ingest.instrument_class import CLASS_FILE, CLASS_SCHEMA
 from asof.ingest.sec_ticker_history import HISTORY_SCHEMA
 from asof.ingest.security_master import (
@@ -215,6 +220,28 @@ def split(
     }
 
 
+def dividend(
+    symbol: str,
+    ex_date: date,
+    rate: float,
+    *,
+    special: bool = False,
+    sub_type: str | None = None,
+    available_at: datetime | None = None,
+) -> dict[str, Any]:
+    """A dividends.parquet row as the ingest writes it (the convention of
+    tests/evolve/test_benchmark.py::write_dividends, plus ``special`` / ``sub_type`` and a
+    settable ``available_at`` so a record not yet knowable can be put on disk)."""
+    return {
+        "symbol": symbol,
+        "ex_date": ex_date,
+        "rate": rate,
+        "special": special,
+        "sub_type": sub_type,
+        "available_at": available_at or known(ex_date),  # ingest rule: 00:00 New York
+    }
+
+
 def spin_off(parent: str, child: str, ex_date: date, ratio: float) -> dict[str, Any]:
     """A spin_off row of others.parquet as the ingest writes it (rate = new / source rate);
     the full builder lives in tests/store/test_spinoffs.py."""
@@ -313,6 +340,7 @@ class World:
     splits: list[dict[str, Any]] = field(default_factory=list)
     name_changes: list[dict[str, Any]] = field(default_factory=list)
     others: list[dict[str, Any]] = field(default_factory=list)  # spin-offs and the rest
+    dividends: list[dict[str, Any]] = field(default_factory=list)
     conflicts: list[dict[str, Any]] | None = None  # None: no file
     sec: list[tuple[date, str, int]] | None = None  # None: agrees with the master
     misfiled: list[tuple[int, dict[str, Any]]] = field(default_factory=list)  # (hive year, bar)
@@ -344,6 +372,11 @@ class World:
             _write(
                 self.root / "corporate_actions" / "others.parquet",
                 pa.Table.from_pylist(self.others, schema=OTHER_SCHEMA),
+            )
+        if self.dividends:
+            _write(
+                self.root / "corporate_actions" / "dividends.parquet",
+                pa.Table.from_pylist(self.dividends, schema=DIVIDEND_SCHEMA),
             )
         if self.conflicts is not None:
             _write(

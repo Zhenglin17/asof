@@ -26,7 +26,7 @@ The [README](../README.md) is the short tour.
 - [x] Resolved read path: every bar read carries the permanent id of the security that owned
       its symbol that day, as the security master was known at the time; relabelled copies
       and the vendor's volume-0 filler bars are gone by default
-- [x] Data audit: 34 checks over the real store with reviewed exceptions, clean in the
+- [x] Data audit: 37 checks over the real store with reviewed exceptions, clean in the
       liquid tier, and hand-checked reference histories asserted as tests against it
 - [x] Truncation test: the security master rebuilt from only the inputs knowable at an
       instant and compared with what the full master shows then; every identity fact (a

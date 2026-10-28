@@ -35,6 +35,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import duckdb
+import exchange_calendars as xc
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
@@ -68,6 +69,7 @@ from asof.store.market import (
     _source,
     bars_source_sql,
     visible_bars,
+    visible_dividends,
     visible_master,
     visible_splits,
 )
@@ -106,6 +108,11 @@ COPY_SHARE_WARN = 0.10  # M7: share of an old-holder segment's days copied from 
 SPLIT_LIQUID_DAYS = 92  # S1, S2: tier as_of this many days either side of the ex-date gates it
 SPLIT_TRADED_SESSIONS = 20  # S1: no traded bar this many sessions before (or after, if it ended)
 SPLIT_LATE_SESSIONS = 2  # S2: the move may land this many sessions after the ex-date (ULTY: 1)
+DIVIDEND_TWIN_TOLERANCE = 1e-5  # D1: relative gap within which two rates are one payout
+# D1: or this absolute gap -- a small rate stored at 6 and 7 decimals (ABEV 2025-12-22: 0.012354 /
+# 0.012355); real gaps are <= 1.1e-6 or >= 8e-6 (DDHRF 2020-10-29, two figures)
+DIVIDEND_TWIN_ABS = 1.5e-6
+CALENDAR = "XNYS"  # I12: the exchange calendar sessions are checked against
 REVIEWED_RESOLUTIONS = ("unresolved", "relabelled")  # M6: conflicts a human reads once
 I10_MIN_SNAPSHOTS = 3  # I10: exchange snapshots that make a listing (fewer: stale or not started)
 # I10: the SEC exchange table's spellings of a listing; "OTC" and "" are none
@@ -175,6 +182,7 @@ CHECKS: dict[str, CheckSpec] = dict(
         _spec("I8", "security silent for more than 10 sessions", None, f"{_SID}:{_DATE}"),
         _spec("I9", "price discontinuity across a segment change", None, f"{_SID}:{_DATE}"),
         _spec("I10", "exchange-listed ticker with no bars of its own", None, rf"{_SYM}:\d+"),
+        _spec("I12", "session calendar disagrees with NYSE", "all", _DATE),
         _spec("S1", "split record with no bar on its ex-date", "liquid", f"{_SYM}:{_DATE}"),
         _spec("S2", "split record without the price move", "liquid", f"{_SYM}:{_DATE}"),
         _spec("S3", "one-day thin-volume spike, no split", "liquid", f"{_SYM}:{_DATE}"),
@@ -184,6 +192,9 @@ CHECKS: dict[str, CheckSpec] = dict(
         _spec("S5", "several split events on one day", "all", f"{_SYM}:{_DATE}"),
         # listed, not gated: the event is already read as a restart, nothing is rescaled by it
         _spec("S6", "spin-off factor the prices disprove (restarted)", None, f"{_SYM}:{_DATE}"),
+        # listed, not gated: two real payouts of one amount on one day (F 2025-02-18, regular
+        # and supplemental) look the same; only the benchmark reads dividends
+        _spec("D1", "dividend records differing only by rounding", None, f"{_SYM}:{_DATE}"),
         _spec(
             "N1", "rename recorded long after the old name stopped", None, f"{_SYM}/{_SYM}:{_DATE}"
         ),  # fmt: skip
@@ -336,6 +347,8 @@ _LISTED = "_audit_listed"  # the Alpaca listing as of the audit (C2)
 _TIER = "_audit_tier"  # (security_id, day): liquid-tier rows knowable at as_of (S1, S2)
 _EXCHANGES = "_audit_exchanges"  # SEC exchange snapshots knowable at as_of (I10)
 _SPLIT_OWNERS = "_audit_split_owners"  # split record -> security owning its symbol that day
+_DIVIDENDS = "_audit_dividends"  # dividends as visible_dividends returns them (D1)
+_CAL = "_audit_calendar"  # exchange sessions over the stored span (I12)
 
 _REGISTERED = (
     _RES,
@@ -350,6 +363,8 @@ _REGISTERED = (
     _LISTED,
     _TIER,
     _EXCHANGES,
+    _DIVIDENDS,
+    _CAL,
 )
 _TEMP_TABLES = (_LIQ_SYMS, _SESSIONS, _TRADED, _ORPHANS, _SPLIT_DAYS, _SPLIT_OWNERS)
 _TEMP_VIEWS = (_RAW, _ALPACA_KEYS)
@@ -551,7 +566,12 @@ class _Audit:
         return pa.Table.from_pylist(rows, schema=ASSET_SCHEMA)
 
     def close(self) -> None:
-        for name in (*_REGISTERED, "_audit_raw_empty", "_audit_alpaca_keys_empty"):
+        for name in (
+            *_REGISTERED,
+            "_audit_raw_empty",
+            "_audit_alpaca_keys_empty",
+            "_audit_spinoffs",
+        ):
             try:
                 self.con.unregister(name)
             except duckdb.Error:
@@ -611,6 +631,17 @@ class _Audit:
                    symbol, session_date, open, high, low, close, reason
             FROM (
                 SELECT *, CASE
+                    -- before the comparisons below: DuckDB orders NaN above every number, so a
+                    -- NaN close read as 'high_below_body' and an infinite high passed
+                    WHEN NOT coalesce(
+                        isfinite(open) AND isfinite(high) AND isfinite(low)
+                        AND isfinite(close) AND volume IS NOT NULL
+                        -- vwap may be absent (imported bars) but never NaN: the liquid tier's
+                        -- dollar volume is vwap x volume
+                        AND (vwap IS NULL OR isfinite(vwap)),
+                        false
+                    ) THEN 'not_finite'
+                    WHEN volume < 0 THEN 'negative_volume'
                     WHEN least(open, high, low, close) <= 0 THEN 'nonpositive'
                     WHEN high < low THEN 'high_below_low'
                     WHEN low > least(open, close) THEN 'low_above_body'
@@ -1136,6 +1167,35 @@ class _Audit:
         )
         return table, {}
 
+    def i12(self) -> tuple[pa.Table, dict]:
+        """Session dates against the exchange calendar, from the first to the last stored
+        session: an exchange session with no bar at all, or a bar dated on a day the exchange
+        was closed. Every reader takes its calendar from the bars (``visible_sessions``), so a
+        missing day silently stretches a 20-session window. Days after the last stored session
+        are stale data, C2's business."""
+        stored = [
+            r[0] for r in self.con.execute(f"SELECT session_date FROM {_SESSIONS}").fetchall()
+        ]
+        days: list[date] = []
+        if stored:
+            calendar = xc.get_calendar(
+                CALENDAR, start=min(stored).isoformat(), end=max(stored).isoformat()
+            )
+            days = [d.date() for d in calendar.sessions_in_range(min(stored), max(stored))]
+        self.con.register(_CAL, pa.table({"day": pa.array(days, pa.date32())}))
+        table = self._q(
+            f"""
+            SELECT {_day("day")} AS key, false AS _liq, day, reason FROM (
+                SELECT day, 'missing_session' AS reason FROM {_CAL}
+                WHERE day NOT IN (SELECT session_date FROM {_SESSIONS})
+                UNION ALL
+                SELECT session_date AS day, 'session_on_holiday' AS reason FROM {_SESSIONS}
+                WHERE session_date NOT IN (SELECT day FROM {_CAL})
+            )
+            """
+        )
+        return table, {"sessions": len(stored), "exchange_sessions": len(days)}
+
     # -- S: splits and price jumps ---------------------------------------------------------------
 
     def _split_liq(self, owner: str, record: str) -> str:
@@ -1363,6 +1423,32 @@ class _Audit:
         return table, {
             status: statuses.count(status) for status in ("adjust", "restart", "pending")
         }
+
+    # -- D: dividends ----------------------------------------------------------------------------
+
+    def d1(self) -> tuple[pa.Table, dict]:
+        """One payout stored twice with its rate rounded differently (FMX 2026-04-22: 1.039579
+        and 1.0395792), or once more under another flag (SATA 2026-08-11: sub_type null and
+        'return_of_capital'): the benchmark pays every visible row. Read through
+        ``visible_dividends``, so rows identical in every column already count once."""
+        self.con.register(_DIVIDENDS, visible_dividends(self.con, self.root, self.as_of))
+        self.con.execute("SET TimeZone = 'UTC'")
+        table = self._q(
+            f"""
+            WITH d AS (SELECT row_number() OVER () AS id, * FROM {_DIVIDENDS}),
+            twins AS (
+                SELECT DISTINCT a.symbol, a.ex_date FROM d a JOIN d b
+                  ON a.symbol = b.symbol AND a.ex_date = b.ex_date AND a.id < b.id
+                 AND (abs(a.rate - b.rate) <= {DIVIDEND_TWIN_TOLERANCE} * greatest(a.rate, b.rate)
+                      OR abs(a.rate - b.rate) <= {DIVIDEND_TWIN_ABS})
+            )
+            SELECT d.symbol || ':' || {_day("d.ex_date")} AS key, {_liq_sym("d.symbol")} AS _liq,
+                   d.symbol, d.ex_date, list(d.rate ORDER BY d.rate) AS rates
+            FROM d JOIN twins USING (symbol, ex_date)
+            GROUP BY d.symbol, d.ex_date
+            """
+        )
+        return table, {}
 
     # -- N: name changes against the bars --------------------------------------------------------
 
