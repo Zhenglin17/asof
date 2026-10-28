@@ -1,0 +1,15 @@
+# B-Xtrender entry scan, long only. A security signals at a session's close when it is in that
+# night's liquid tier, its last completed state bar is above the one before it (mid: weekly,
+# long: monthly) and its daily histogram is above the previous session's. The two variants are
+# one strategy's two versions (variant=long as an override), two attempts in all.
+variant: mid
+universe:
+  min_adv_usd: 50000000
+  lookback_sessions: 20
+  classes: [common]
+# short-term histogram: rsi(ema(close, l1) - ema(close, l2), l3) - 50
+bx: {l1: 5, l2: 20, l3: 5}
+# bars of each period since the series start before it may signal. Measured on 1,100 liquid
+# common stocks, series started 2020-01 vs 2021-01, share of steps whose direction agrees:
+# daily 40 bars 99.6%; weekly 36 98.6%, 40 98.9%, 44 99.4%; monthly 36 99.4%, 40 98.9%, 48 99.7%
+warmup: {daily: 40, weekly: 40, monthly: 36}

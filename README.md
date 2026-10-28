@@ -162,6 +162,7 @@ count. It is still a search to anyone who picks its best cell, and is shown as s
 | Rescaling history with a price not yet known | A spin-off's factor needs the child's first close: it is used only from the day every price it rests on is visible, and sessions in between have no value | `tests/store/test_spinoffs.py`, `tests/features/test_bx.py` |
 | Moving a stop with a spin-off price not yet known | A position held into a spin-off's ex-date is frozen from that open (the record is on file by then) until the factor's close; its children are sold at their next open, and an event still unpriced after `spinoff_max_wait` sessions resumes on raw prices | `tests/execute/test_simulate_spinoffs.py`, `tests/replay/test_replay_spinoffs.py` |
 | A result that depends on later days | Replaying to day N gives the same decisions as replaying further | `tests/replay/test_replay.py` |
+| One pass over a window reading the window's end | The B-Xtrender scan computes each series once at the window's last close and is held equal to a scan run each night; a security whose symbol (or spin-off child) was recorded in the security master late is recomputed as known that night | `tests/scan/test_bx_trender.py` |
 | Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
 | Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
 
@@ -227,6 +228,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [ ] Minute bars, XBRL facts, FRED
 - [x] Gate report: random entries, walk-forward, thin edge, benchmarks, side by side
 - [x] First feature: B-Xtrender on split- and spin-off-adjusted daily, weekly and monthly bars, matched against the chart
+- [x] B-Xtrender entry scan: liquid common stocks whose weekly (or monthly) and daily histograms both rose, after a measured warm-up (`asof scan bx`)
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

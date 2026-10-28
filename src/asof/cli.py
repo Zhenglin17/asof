@@ -112,6 +112,7 @@ from asof.judge.client import OpenRouterClient
 from asof.judge.window import judge_window
 from asof.replay import build_report, close_of, run_replay
 from asof.replay.compare import Comparison, Section, compare_runs
+from asof.scan.bx_trender import load_scan_config, scan_and_pool
 from asof.store.audit import (
     CHECKS,
     load_exceptions,
@@ -1486,6 +1487,57 @@ def evidence_validate(
         typer.echo(f"rejected: {len(result.failures)} of {len(draft.citations)} citations fail")
         raise typer.Exit(code=2)
     typer.echo(f"ok: {len(draft.citations)} citations hold")
+
+
+scan_app = typer.Typer(help="Entry scans run at a session's close.", no_args_is_help=True)
+app.add_typer(scan_app, name="scan")
+
+
+@scan_app.command("bx")
+def scan_bx(
+    day: Annotated[datetime, typer.Option("--date", help="Session; read at its 20:00 close.")],
+    overrides: Annotated[
+        list[str] | None, typer.Option("--set", help="Override a scan setting, e.g. variant=long.")
+    ] = None,
+    top: Annotated[int, typer.Option(min=0, help="Candidates to print.")] = 30,
+    strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """B-Xtrender entry candidates of one session: liquid common stocks whose last completed
+    state bar (weekly, or monthly with variant=long) and daily histogram both rose."""
+    root = _market_root(data_dir)
+    try:
+        cfg = load_scan_config(strategies_dir / "bx_trender" / "scan.yaml", overrides or [])
+    except (FileNotFoundError, ValueError) as error:
+        _fail(str(error))
+    as_of = close_of(day.date())
+    started = time.monotonic()
+    con = duckdb.connect()
+    try:
+        session, found, eligible = scan_and_pool(con, root, as_of, cfg)
+    except (FileNotFoundError, ValueError) as error:
+        _fail(str(error))
+    finally:
+        con.close()
+    state = "weekly" if cfg.variant == "mid" else "monthly"
+    read = session or "no final session"
+    typer.echo(
+        f"{len(found)} {cfg.variant} candidates on {read} out of {len(eligible)} warm liquid "
+        f"common stocks ({time.monotonic() - started:,.1f}s); state = {state}"
+    )
+    typer.echo(
+        f"  {'#':>3} {'symbol':<8} {'security':<8} {'state':>7} {'prev':>7} {'daily':>7} "
+        f"{'prev':>7}  {'state bar':<10} {'bars':>4}  {'since':<10} {'ADV $M':>8}"
+    )
+    for c in found[:top]:
+        typer.echo(
+            f"  {c.rank:>3} {c.symbol:<8} {c.security_id:<8} {c.state_bx:>7.2f} "
+            f"{c.state_bx_prev:>7.2f} {c.daily_bx:>7.2f} {c.daily_bx_prev:>7.2f}  "
+            f"{c.state_complete_on!s:<10} {c.state_bars:>4}  {c.bx_since!s:<10} "
+            f"{c.adv_usd / 1e6:>8,.0f}"
+        )
 
 
 replay_app = typer.Typer(

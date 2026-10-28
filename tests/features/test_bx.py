@@ -1166,3 +1166,272 @@ def test_one_shot_equals_day_by_day_on_a_store(con: duckdb.DuckDBPyConnection, r
             ex, known_on = windows.get(sid, (None, None))
             if ex is None or not (ex <= day < known_on):
                 assert as_day(now[SINCE].iloc[0]) == as_day(then[SINCE].iloc[0]), (sid, day)
+
+
+# =============================================================================================
+# previous values and bar counts (2-c): bx_*_prev, daily_bars / weekly_bars / monthly_bars
+# =============================================================================================
+#
+# Target (added to bx_features, computed in the same per-series pass as the BX columns):
+#   bx_daily_prev    bx_daily of the previous row of the same series; NaN on a series' first
+#                    row and wherever that previous value is NaN.
+#   bx_weekly_prev   histogram of the completed week before the one bx_weekly reads (same
+#   bx_monthly_prev  complete_on as-of join); NaN when the series has no such period.
+#   daily_bars       rows of the series from bx_since through the session, inclusive.
+#   weekly_bars      completed periods of the series whose complete_on <= session.
+#   monthly_bars
+# In a spin-off blank stretch (E <= session < known_on, or pending) all six are NaN like the
+# BX columns. "Previous row of the same series" on the first session after a blank stretch is
+# read here as the previous row of the series that session's values come from (the restarted
+# or adjusted series), not the blanked output row before it.
+
+PREV_COLUMNS = ["bx_daily_prev", "bx_weekly_prev", "bx_monthly_prev"]
+COUNT_COLUMNS = ["daily_bars", "weekly_bars", "monthly_bars"]
+NEW_COLUMNS = PREV_COLUMNS + COUNT_COLUMNS
+
+
+def reference(daily: pd.DataFrame, l1: int = 5, l2: int = 20, l3: int = 5) -> pd.DataFrame:
+    """The BX columns, the six new columns and ``weekly_complete_on`` / ``monthly_complete_on``
+    (complete_on of the period the value comes from) of plain daily rows (no events), computed
+    per security straight from ``period_bars`` and ``bx_histogram``: the k-th completed period
+    is visible from its complete_on, its value is hist[k - 1] and the previous one hist[k - 2]."""
+    parts = []
+    ordered = daily.sort_values(["security_id", "session_date"])
+    for sid, g in ordered.groupby("security_id", sort=True):
+        g = g.reset_index(drop=True)
+        days = np.array([d.toordinal() for d in g["session_date"]])
+        out = pd.DataFrame({"security_id": sid, "session_date": g["session_date"]})
+        out["bx_daily"] = bx_histogram(pd.Series(g["close"], dtype=float), l1, l2, l3).to_numpy()
+        out["bx_daily_prev"] = out["bx_daily"].shift(1)
+        out["daily_bars"] = np.arange(1, len(g) + 1, dtype=float)
+        for p, name in (("W", "weekly"), ("M", "monthly")):
+            bars = period_bars(g, p)  # type: ignore[arg-type]
+            hist = bx_histogram(pd.Series(bars["close"], dtype=float), l1, l2, l3).to_numpy()
+            done = np.array([d.toordinal() for d in bars["complete_on"]])
+            assert (np.diff(done) > 0).all()  # fixture: one period completes per session at most
+            k = np.searchsorted(done, days, side="right")
+            out[f"bx_{name}"] = [hist[i - 1] if i >= 1 else NAN for i in k]
+            out[f"bx_{name}_prev"] = [hist[i - 2] if i >= 2 else NAN for i in k]
+            out[f"{name}_bars"] = k.astype(float)
+            out[f"{name}_complete_on"] = [bars["complete_on"].iloc[i - 1] if i else None for i in k]
+        parts.append(out)
+    return pd.concat(parts, ignore_index=True)
+
+
+def assert_columns_close(
+    got: pd.DataFrame, expected: pd.DataFrame, columns: list[str], tol: float = 1e-9
+) -> None:
+    """Row-aligned frames: same NaN pattern and values within ``tol`` per column."""
+    assert len(got) == len(expected) and len(got) > 0
+    for column in columns:
+        g = pd.Series(got[column]).astype(float).to_numpy(dtype=float)
+        e = pd.Series(expected[column]).astype(float).to_numpy(dtype=float)
+        assert (np.isnan(g) == np.isnan(e)).all(), (column, g[np.isnan(g) != np.isnan(e)][:5])
+        ok = ~np.isnan(e)
+        assert g[ok] == pytest.approx(e[ok], rel=tol, abs=tol), column
+
+
+def rows_of(df: pd.DataFrame, security_id: str, lo: date, hi: date | None = None) -> pd.DataFrame:
+    part = of(df, security_id)
+    mask = part["session_date"] >= lo
+    if hi is not None:
+        mask &= part["session_date"] < hi
+    return where(part, mask)
+
+
+def at(df: pd.DataFrame, security_id: str, day: date) -> dict[str, Any]:
+    [i] = np.flatnonzero((df["security_id"] == security_id) & (df["session_date"] == day))
+    return df.iloc[int(i)].to_dict()
+
+
+# -- normal path -------------------------------------------------------------------------------
+
+
+def test_new_columns_exist_and_match_the_reference() -> None:
+    out = bx_features(LEAK_DAILY)
+    expected = reference(LEAK_DAILY)
+
+    assert set(NEW_COLUMNS) <= set(out.columns)
+    assert_columns_close(out, expected, BX_COLUMNS + NEW_COLUMNS)
+
+
+def test_bx_daily_prev_and_daily_bars_by_hand() -> None:
+    # nine sessions; bx_daily is first defined on row 5 (l3 = 5), so its prev from row 6
+    days = sessions("2024-01-02", "2024-01-12")
+    closes = [10.0, 11.0, 10.5, 12.0, 11.0, 13.0, 12.5, 14.0, 13.0]
+    rows = [bar("A", d, c, c, c, c) for d, c in zip(days, closes, strict=True)]
+    out = bx_features(frame(rows))
+
+    hist = bx_histogram(s(closes)).tolist()
+    assert_series(col(out, "bx_daily_prev"), [NAN, *hist[:-1]])
+    assert col(out, "bx_daily_prev").iloc[:6].isna().all()
+    assert col(out, "bx_daily_prev").iloc[6] == pytest.approx(hist[5])
+    assert col(out, "daily_bars").tolist() == list(range(1, 10))
+
+
+def test_weekly_prev_is_the_week_before_the_one_in_bx_weekly() -> None:
+    out = of(bx_features(LEAK_DAILY), "A")
+    weeks = of(period_bars(LEAK_DAILY, "W"), "A")
+    hist = bx_histogram(col(weeks, "close")).tolist()
+    on = weeks["complete_on"].tolist()
+    by = dict(zip(out["session_date"], range(len(out)), strict=True))
+    for i in range(7, len(on)):
+        row = out.iloc[by[on[i]]]
+        assert row["bx_weekly"] == pytest.approx(hist[i])
+        assert row["bx_weekly_prev"] == pytest.approx(hist[i - 1])
+        assert row["weekly_bars"] == i + 1
+
+
+def test_counts_restart_for_a_security_that_starts_later() -> None:
+    out = bx_features(LEAK_DAILY)
+    b = of(out, "B")  # B's first bar is LEAK_DAYS[40]
+    assert b["daily_bars"].iloc[0] == 1
+    assert b["weekly_bars"].iloc[0] == 0 and b["monthly_bars"].iloc[0] == 0
+    assert math.isnan(b["bx_daily_prev"].iloc[0])
+
+
+# -- boundaries --------------------------------------------------------------------------------
+
+
+def test_an_open_week_neither_counts_nor_moves_prev() -> None:
+    # 2024-08-12 .. 08-16 (Mon .. Fri): the count and prev stand still until Friday's close
+    out = bx_features(LEAK_DAILY)
+    week = [date(2024, 8, d) for d in (12, 13, 14, 15)]
+    friday = date(2024, 8, 16)
+    for column in ("weekly_bars", "bx_weekly_prev", "bx_weekly"):
+        values_ = {at(out, "A", d)[column] for d in week}
+        assert len(values_) == 1, column
+    assert at(out, "A", friday)["weekly_bars"] == at(out, "A", week[-1])["weekly_bars"] + 1
+    assert at(out, "A", friday)["bx_weekly_prev"] == pytest.approx(
+        at(out, "A", week[-1])["bx_weekly"]
+    )
+
+
+def test_editing_the_running_wednesday_does_not_move_period_prev_or_counts() -> None:
+    cut = date(2024, 8, 14)  # Wednesday: the week and August are open
+    base = where(LEAK_DAILY, LEAK_DAILY["session_date"] <= cut)
+    edited = base.copy()
+    on_cut = edited["session_date"] == cut
+    edited.loc[on_cut, ["close", "high"]] = edited.loc[on_cut, ["close", "high"]] * 1.5
+
+    before, after = bx_features(base), bx_features(edited)
+    for column in ("bx_weekly_prev", "bx_monthly_prev", *COUNT_COLUMNS):
+        pd.testing.assert_series_equal(before[column], after[column])
+    assert not before["bx_daily"].equals(after["bx_daily"])
+    # the daily prev of the cut row reads the day before, which did not change either
+    pd.testing.assert_series_equal(before["bx_daily_prev"], after["bx_daily_prev"])
+
+
+def test_good_friday_week_and_march_count_on_the_next_session() -> None:
+    # from mid-2023 so that March 2024's monthly value and the one before it are defined
+    out = bx_features(frame(walk("A", sessions("2023-07-03", "2024-04-12"), seed=5)))
+    thursday, monday = date(2024, 3, 28), date(2024, 4, 1)
+    th, mo = at(out, "A", thursday), at(out, "A", monday)
+
+    assert mo["weekly_bars"] == th["weekly_bars"] + 1
+    assert mo["monthly_bars"] == th["monthly_bars"] + 1
+    assert mo["bx_weekly_prev"] == pytest.approx(th["bx_weekly"])
+    assert mo["bx_monthly_prev"] == pytest.approx(th["bx_monthly"])
+    assert not math.isnan(mo["bx_monthly_prev"])
+
+
+def test_a_restart_known_on_its_ex_date_starts_prev_and_counts_again() -> None:
+    # parent and child on one symbol: restart decided on the ex-date itself (no blank stretch)
+    spin = events_frame([event("A", E2, "restart", known_on=E2, reason="same_symbol")])
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    restarted = reference(from_day(SPIN_DAILY, "A", E2))
+    plain = reference(SPIN_DAILY)
+
+    first = at(out, "A", E2)
+    assert all(math.isnan(first[c]) for c in PREV_COLUMNS)
+    assert first["daily_bars"] == 1
+    assert_columns_close(rows_of(out, "A", E2), of(restarted, "A"), NEW_COLUMNS)
+    assert_columns_close(
+        rows_of(out, "A", SPIN_DAYS[0], E2),
+        rows_of(plain, "A", SPIN_DAYS[0], E2),
+        NEW_COLUMNS,
+    )
+
+
+def test_a_restart_decided_later_counts_from_its_ex_date() -> None:
+    spin = events_frame([event("A", E2, "restart", known_on=K2, reason="no_child_price")])
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    restarted = reference(from_day(SPIN_DAILY, "A", E2))
+
+    assert at(out, "A", K2)["daily_bars"] == SPIN_DAYS.index(K2) - SPIN_DAYS.index(E2) + 1
+    assert_columns_close(rows_of(out, "A", K2), rows_of(restarted, "A", K2), NEW_COLUMNS)
+
+
+def test_an_adjust_keeps_counting_from_the_first_bar() -> None:
+    spin = events_frame([event("A", E1, "adjust", factor=0.8, known_on=K1)])
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+    adjusted = reference(scaled_before(SPIN_DAILY, "A", E1, 0.8))
+
+    assert at(out, "A", K1)["daily_bars"] == SPIN_DAYS.index(K1) + 1
+    assert_columns_close(rows_of(out, "A", K1), rows_of(adjusted, "A", K1), NEW_COLUMNS)
+
+
+def test_blank_stretches_blank_every_new_column() -> None:
+    spin = events_frame(
+        [
+            event("A", E1, "adjust", factor=0.8, known_on=K1),
+            event("B", E2, "pending"),
+        ]
+    )
+    out = bx_features(SPIN_DAILY, spinoffs=spin)
+
+    window = rows_of(out, "A", E1, K1)
+    pending = rows_of(out, "B", E2)
+    for part in (window, pending):
+        assert len(part) > 0
+        assert pd.DataFrame(part[BX_COLUMNS + NEW_COLUMNS]).isna().to_numpy().all()
+    # outside the stretches every count is defined
+    assert pd.DataFrame(rows_of(out, "A", K1)[COUNT_COLUMNS]).notna().to_numpy().all()
+    assert pd.DataFrame(rows_of(out, "B", SPIN_DAYS[0], E2)[COUNT_COLUMNS]).notna().to_numpy().all()
+
+
+# -- leakage -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        date(2024, 3, 28),  # Thursday before Good Friday
+        date(2024, 4, 1),  # completes the Good Friday week and March
+        date(2024, 8, 14),  # Wednesday, week and month open
+        date(2024, 5, 31),  # Friday ending a month
+    ],
+)
+def test_later_rows_change_no_new_column_known_at_the_cut(cut: date) -> None:
+    full = bx_features(LEAK_DAILY)
+    part = bx_features(where(LEAK_DAILY, LEAK_DAILY["session_date"] <= cut))
+    assert_columns_close(part, where(full, full["session_date"] <= cut), NEW_COLUMNS, tol=0.0)
+
+
+def test_later_rows_change_no_new_column_with_a_decided_event() -> None:
+    spin = events_frame([event("A", E1, "adjust", factor=0.8, known_on=K1)])
+    cut = SPIN_DAYS[190]
+    full = bx_features(SPIN_DAILY, spinoffs=spin)
+    part = bx_features(where(SPIN_DAILY, SPIN_DAILY["session_date"] <= cut), spinoffs=spin)
+    assert_columns_close(part, where(full, full["session_date"] <= cut), NEW_COLUMNS)
+
+
+def test_a_series_with_no_completed_period_reads_nan_not_an_error() -> None:
+    # a listing in its first week: no completed week or month anywhere in the input
+    listing = frame(walk("N", sessions("2024-01-02", "2024-01-04"), seed=1))
+    out = bx_features(listing)
+
+    assert col(out, "bx_weekly").isna().all() and col(out, "bx_monthly").isna().all()
+    assert col(out, "weekly_bars").tolist() == [0, 0, 0]
+    assert col(out, "daily_bars").tolist() == [1, 2, 3]
+
+
+def test_a_restart_read_on_its_ex_date_evening() -> None:
+    # day by day, the evening of a restart decided on its ex-date sees one row of the new series
+    # and no completed period of it (real shape: CR -> CR 2023-04-04, same_symbol)
+    spin = events_frame([event("A", E2, "restart", known_on=E2, reason="same_symbol")])
+    for last in (E2, SPIN_DAYS[SPIN_DAYS.index(E2) + 3]):
+        out = bx_features(where(SPIN_DAILY, SPIN_DAILY["session_date"] <= last), spinoffs=spin)
+        row = at(out, "A", E2)
+        assert row["daily_bars"] == 1 and row["weekly_bars"] == 0 and row["monthly_bars"] == 0
+        assert math.isnan(row["bx_weekly"]) and math.isnan(row["bx_daily_prev"])

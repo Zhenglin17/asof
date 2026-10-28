@@ -62,6 +62,9 @@ The [README](../README.md) is the short tour.
       spin-off-adjusted daily, weekly and monthly bars, with Pine's EMA / RMA / RSI so the values match the chart; a
       weekly or monthly value is used only from the close that completes its period
       (`asof.features.bx`)
+- [x] B-Xtrender entry scan: each night's liquid common stocks whose last completed weekly
+      (or monthly) bar and daily histogram both rose, series warm by a measured count of bars;
+      one pass per replay window, held equal to the nightly scan (`asof scan bx`)
 - [x] Random-entry null: each replay leg against random picks from the scanner's pool on
       the same dates, max-statistic correction across runs (`asof gate null`)
 - [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
@@ -107,6 +110,7 @@ uv run asof docs sync                # SEC filings of the watchlist companies, a
 uv run asof docs audit               # filing integrity and coverage gaps
 uv run asof evidence index           # full-text index over the chunks
 uv run asof evidence search "..." --as-of 2025-01-31 --ticker NVDA   # what was public then
+uv run asof scan bx --date 2025-03-14  # B-Xtrender entry candidates of one session
 uv run asof replay run --strategy earnings_gap --start 2023-01-03 --end 2026-10-21
 uv run asof replay report --run 1    # markdown report of a replay
 uv run asof judge run --strategy earnings_gap --start 2026-07-01 --end 2026-10-21 --max-cost 12
@@ -683,6 +687,32 @@ On run 4 (take-all, 2023-01-03 to 2025-06-30 within dev): 383 legs, +0.69% a leg
 entries, p = 0.11, MDE +1.91%; walk-forward 3 positive of 4 evaluable windows (the first
 three have no equity to pick on); without the best three legs 0.00%; against SPY Sharpe
 +0.15, max drawdown -8.2 pts, total return -8.7 pts.
+
+### B-Xtrender scan
+
+```bash
+uv run asof scan bx --date 2025-03-14                  # mid: weekly state, daily trigger
+uv run asof scan bx --date 2025-03-14 --set variant=long   # long: monthly state
+```
+
+Settings live in `strategies/bx_trender/scan.yaml`. At a session's 20:00 close a security is a
+candidate when it is in that night's liquid tier (common stocks only), its last completed
+state bar is above the one before it, its daily histogram is above the previous traded
+session's, and its series is warm: at least `warmup` bars of the daily and the state period
+since the series start. Series start at a security's first bar, or at a spin-off's ex-date
+when the spin-off cannot be priced. Candidates are ranked by the state value.
+
+The warm-up is measured, not chosen: series started 2020-01 and 2021-01 agree on whether a
+step went up or down for 99.6% of 1,100 liquid stocks after 40 daily bars, 98.9% after 40
+weekly and 99.4% after 36 monthly bars. Data start in 2020, so the long variant has no
+candidate before 2023.
+
+On 2025-03-14 the mid variant returns 262 of 1,314 warm liquid stocks. A replay window is
+scanned in one pass (`asof.scan.bx_trender.scan_range`, `pool_range`), checked equal to the
+nightly scan on the real store over 2024-03-25 to 2024-04-12 (GE's spin-off of GEV) and over
+April 2022, when the security master recorded the DISCA and CFX changes four weeks late. A
+security carrying a symbol inside such a lag is recomputed as known that night; on these real
+windows that changed nothing, the synthetic tests show the case where it does.
 
 ## Layout
 

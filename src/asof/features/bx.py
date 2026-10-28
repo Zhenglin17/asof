@@ -154,6 +154,11 @@ def period_bars(daily: pd.DataFrame, period: Period) -> pd.DataFrame:
 
 
 BX_COLUMNS = ["bx_daily", "bx_weekly", "bx_monthly"]
+PREV_COLUMNS = ["bx_daily_prev", "bx_weekly_prev", "bx_monthly_prev"]
+COUNT_COLUMNS = ["daily_bars", "weekly_bars", "monthly_bars"]
+COMPLETE_COLUMNS = ["weekly_complete_on", "monthly_complete_on"]
+# Everything one series determines; while computed the complete_on dates are day ordinals.
+_SERIES_COLUMNS = BX_COLUMNS + PREV_COLUMNS + COUNT_COLUMNS + COMPLETE_COLUMNS
 
 
 def bx_features(
@@ -174,34 +179,49 @@ def bx_features(
     the series with the prices before E multiplied by ``factor`` ("adjust") or a series that
     starts at E ("restart"). Sessions before E keep their values: multiplying every earlier
     price by one constant leaves an RSI of EMA differences unchanged. ``bx_since`` is the first
-    session of the series a row's values come from."""
+    session of the series a row's values come from.
+
+    Per series, also: ``*_prev``, the value one step earlier (the previous row, i.e. the last
+    traded session, a halt skipped; the completed period before the one read), NaN where the
+    series has none; ``*_bars``, the rows or the
+    completed periods of the series up to the session; ``weekly_complete_on`` /
+    ``monthly_complete_on``, the session that completed the period read. A spin-off blank
+    stretch blanks them all."""
     out = daily.sort_values(["security_id", "session_date"]).reset_index(drop=True)
     _require_one_row_per_session(out)
-    out[BX_COLUMNS] = _bx_columns(out, l1, l2, l3)
+    out[_SERIES_COLUMNS] = _bx_columns(out, l1, l2, l3)
     out["bx_since"] = out.groupby("security_id", sort=False)["session_date"].transform("first")
-    if spinoffs is None or spinoffs.empty:
-        return out
-    rows = out.groupby("security_id", sort=False).indices
-    for sid, events in spinoffs.groupby("security_id", sort=False):
-        if sid in rows:
-            _apply_spinoffs(out, rows[sid], events, l1, l2, l3)
+    if spinoffs is not None and not spinoffs.empty:
+        rows = out.groupby("security_id", sort=False).indices
+        for sid, events in spinoffs.groupby("security_id", sort=False):
+            if sid in rows:
+                _apply_spinoffs(out, rows[sid], events, l1, l2, l3)
+    for name in COMPLETE_COLUMNS:
+        out[name] = [None if np.isnan(v) else date.fromordinal(int(v)) for v in out[name]]
     return out
 
 
 def _bx_columns(frame: pd.DataFrame, l1: int, l2: int, l3: int) -> np.ndarray:
-    """The three histograms for ``frame`` (sorted by security and session), row-aligned."""
+    """``_SERIES_COLUMNS`` for ``frame`` (sorted by security and session, one series per
+    security), row-aligned."""
     out = frame.copy()
-    out["bx_daily"] = out.groupby("security_id", sort=False)["close"].transform(
-        lambda c: bx_histogram(c, l1, l2, l3)
-    )
-    periods: tuple[tuple[Period, str], ...] = (("W", "bx_weekly"), ("M", "bx_monthly"))
+    by_security = out.groupby("security_id", sort=False)
+    out["bx_daily"] = by_security["close"].transform(lambda c: bx_histogram(c, l1, l2, l3))
+    out["bx_daily_prev"] = out.groupby("security_id", sort=False)["bx_daily"].shift(1)
+    out["daily_bars"] = by_security.cumcount() + 1.0
+    periods: tuple[tuple[Period, str], ...] = (("W", "weekly"), ("M", "monthly"))
     for period, name in periods:
         bars = period_bars(out, period)
-        bars[name] = bars.groupby("security_id", sort=False)["close"].transform(
-            lambda c: bx_histogram(c, l1, l2, l3)
-        )
-        out[name] = _as_of_join(out, bars, name)
-    return out[BX_COLUMNS].to_numpy(dtype=float)
+        by_bar = bars.groupby("security_id", sort=False)
+        bars["value"] = by_bar["close"].transform(lambda c: bx_histogram(c, l1, l2, l3))
+        bars["prev"] = bars.groupby("security_id", sort=False)["value"].shift(1)
+        bars["count"] = by_bar.cumcount() + 1.0
+        bars["done"] = [float(d.toordinal()) for d in bars["complete_on"]]
+        joined = _as_of_join(out, bars, ["value", "prev", "count", "done"])
+        out[f"bx_{name}"], out[f"bx_{name}_prev"] = joined[:, 0], joined[:, 1]
+        out[f"{name}_bars"] = np.nan_to_num(joined[:, 2], nan=0.0)  # none completed yet
+        out[f"{name}_complete_on"] = joined[:, 3]
+    return out[_SERIES_COLUMNS].to_numpy(dtype=float)
 
 
 def _apply_spinoffs(
@@ -241,7 +261,7 @@ def _apply_spinoffs(
 
     for state, members in states.items():
         if state == ("blank",):
-            out.loc[members, BX_COLUMNS] = np.nan
+            out.loc[members, _SERIES_COLUMNS] = np.nan
             continue
         start, factors = state
         part = out.loc[idx].copy()
@@ -251,9 +271,11 @@ def _apply_spinoffs(
             before = np.array([d < ex for d in part_days])
             for column in PRICES:
                 part.loc[before, column] = part.loc[before, column] * factor
-        values = pd.DataFrame(_bx_columns(part, l1, l2, l3), index=part.index, columns=BX_COLUMNS)
-        out.loc[members, BX_COLUMNS] = values.loc[members].to_numpy()
-        out.loc[members, "bx_since"] = start
+        values = pd.DataFrame(
+            _bx_columns(part, l1, l2, l3), index=part.index, columns=_SERIES_COLUMNS
+        )
+        out.loc[members, _SERIES_COLUMNS] = values.loc[members].to_numpy()
+        out.loc[members, "bx_since"] = part_days[0]  # the ex-date may not be a session
 
 
 def _require_one_row_per_session(daily: pd.DataFrame) -> None:
@@ -266,22 +288,24 @@ def _require_one_row_per_session(daily: pd.DataFrame) -> None:
         raise ValueError(f"{len(repeated)} rows share a security and session: {shown}")
 
 
-def _as_of_join(sessions: pd.DataFrame, bars: pd.DataFrame, name: str) -> np.ndarray:
-    """For each session row, ``bars[name]`` of the same security's latest ``complete_on`` on
-    or before the session."""
+def _as_of_join(sessions: pd.DataFrame, bars: pd.DataFrame, names: list[str]) -> np.ndarray:
+    """For each session row, ``bars[names]`` of the same security's latest ``complete_on`` on
+    or before the session; NaN where there is none (no completed period at all included)."""
+    if bars.empty:
+        return np.full((len(sessions), len(names)), np.nan)
     left = pd.DataFrame(
         {
-            "security_id": sessions["security_id"].to_numpy(),
+            "security_id": sessions["security_id"].astype(str).to_numpy(),
             "_t": pd.to_datetime(sessions["session_date"]),
             "_row": np.arange(len(sessions)),
         }
     ).sort_values("_t")
     right = pd.DataFrame(
         {
-            "security_id": bars["security_id"].to_numpy(),
+            "security_id": bars["security_id"].astype(str).to_numpy(),
             "_t": pd.to_datetime(bars["complete_on"]),
-            name: bars[name].to_numpy(dtype=float),
+            **{name: bars[name].to_numpy(dtype=float) for name in names},
         }
     ).sort_values("_t")
     joined = pd.merge_asof(left, right, on="_t", by="security_id", direction="backward")
-    return joined.sort_values("_row")[name].to_numpy(dtype=float)
+    return joined.sort_values("_row")[names].to_numpy(dtype=float)
