@@ -3,7 +3,9 @@
 Every real leg keeps its dates and its kind of exit; only the security is replaced by one drawn
 uniformly from the strategy's candidate pool of that day: what its scanner could have returned
 the evening before entry without the signal (for the earnings gap: one security per 8-K filer,
-over the price and dollar-volume thresholds of scan.yaml). A drawn leg buys the entry
+over the price and dollar-volume thresholds of scan.yaml; for the B-Xtrender: the liquid tier's
+common stocks whose BX values are defined and warm, on a night the market filter allows). A
+drawn leg buys the entry
 session's open and sells the exit session's open or close, with the replay's slippage on both
 sides and splits in between applied, so real and random legs are priced the same way. A
 spin-off in between pays its children as the replay does: sold at each child's first open after
@@ -40,16 +42,66 @@ from sqlmodel import Session, col, select
 
 from asof.replay.cache import BarCache
 from asof.scan import earnings_gap
+from asof.scan.bx_trender import pool_range
 from asof.scan.earnings_gap import lookback_sessions
 from asof.store.market import visible_bars, visible_master, visible_sessions, visible_splits
 from asof.store.models import Run, Trade
 from asof.store.spinoffs import spinoff_events
 from asof.store.universe import filer_securities
-from asof.strategy import StrategyConfig
+from asof.strategy import AnyStrategyConfig, BxStrategyConfig, StrategyConfig
 
 ET = ZoneInfo("America/New_York")
 _CANDIDATES = 16  # draws per permutation before falling back to its own stream
-POOLS = {"watchlist_with_documents": earnings_gap.pool}
+
+
+def _earnings_gap_pools(
+    session: Session,
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    cfg: AnyStrategyConfig,
+    calendar: Sequence[date],
+    evenings: Mapping[date, date],
+    as_of: datetime,
+) -> dict[date, frozenset[str]]:
+    """Each evening's pool reads its scan window; one cache serves them all, each read resolved
+    with the master as known that evening."""
+    assert isinstance(cfg, StrategyConfig)
+    index = {d: i for i, d in enumerate(calendar)}
+    window_start = calendar[max(0, index[min(evenings.values())] - 1 - lookback_sessions(cfg))]
+    filers = filer_securities(session, con, root, as_of)
+    cache = BarCache(
+        con,
+        root,
+        symbols=[r["symbol"] for r in visible_master(con, root, as_of).to_pylist()
+                 if r["security_id"] in filers],
+        start=datetime.combine(window_start, time(0), tzinfo=ET),
+        end=as_of,
+    )  # fmt: skip
+    return {
+        entry: earnings_gap.pool(
+            session, con, root, _close_of(evening), cfg, sessions=calendar, bars_at=cache.bars_at
+        )
+        for entry, evening in evenings.items()
+    }
+
+
+def _bx_pools(
+    session: Session,
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    cfg: AnyStrategyConfig,
+    calendar: Sequence[date],
+    evenings: Mapping[date, date],
+    as_of: datetime,
+) -> dict[date, frozenset[str]]:
+    """The scan's pool of each evening, read over the whole span of evenings at once as the BX
+    replay reads its window (``scan_nights``), so a draw comes from what that scan saw."""
+    assert isinstance(cfg, BxStrategyConfig)
+    nights = pool_range(con, root, min(evenings.values()), max(evenings.values()), cfg.scan)
+    return {entry: nights[evening] for entry, evening in evenings.items()}
+
+
+POOLS = {"watchlist_with_documents": _earnings_gap_pools, "liquid_common": _bx_pools}
 
 
 @dataclass(frozen=True)
@@ -263,7 +315,7 @@ def build_panel(
     root: Path,
     spans: Sequence[Span],
     *,
-    cfg: StrategyConfig,
+    cfg: AnyStrategyConfig,
     as_of: datetime,
 ) -> Panel:
     """Pools as the scanner saw them the evening before each entry; prices and splits as known
@@ -285,32 +337,8 @@ def build_panel(
             raise ValueError(f"entry session {entry} has no session before it to decide on")
     if not entries:
         return Panel(sessions=(), open={}, close={}, splits={}, pools={})
-
-    # Every evening's pool reads its scan window; one cache serves them all, each read resolved
-    # with the master as known that evening.
-    window_start = calendar[max(0, index[entries[0]] - 2 - lookback_sessions(cfg))]
-    filers = filer_securities(session, con, root, as_of)
-    cache = BarCache(
-        con,
-        root,
-        symbols=[r["symbol"] for r in visible_master(con, root, as_of).to_pylist()
-                 if r["security_id"] in filers],
-        start=datetime.combine(window_start, time(0), tzinfo=ET),
-        end=as_of,
-    )  # fmt: skip
-    pool_of = POOLS[cfg.strategy.universe]
-    pools = {
-        entry: pool_of(
-            session,
-            con,
-            root,
-            _close_of(calendar[index[entry] - 1]),
-            cfg,
-            sessions=calendar,
-            bars_at=cache.bars_at,
-        )
-        for entry in entries
-    }
+    evenings = {entry: calendar[index[entry] - 1] for entry in entries}
+    pools = POOLS[cfg.strategy.universe](session, con, root, cfg, calendar, evenings, as_of)
 
     first = min(pools)
     pooled = frozenset().union(*pools.values())
@@ -361,7 +389,7 @@ def _spinoff_panel(
     root: Path,
     as_of: datetime,
     pooled: frozenset[str],
-    cfg: StrategyConfig,
+    cfg: AnyStrategyConfig,
     calendar: Sequence[date],
 ) -> tuple[dict[str, list[SpinoffAdjust]], dict[str, list[date]]]:
     """The pooled securities' spin-offs decided at ``as_of``, under the replay's rules."""
@@ -433,7 +461,7 @@ def null_test(
     root: Path,
     run_ids: Sequence[int],
     *,
-    cfg: StrategyConfig,
+    cfg: AnyStrategyConfig,
     permutations: int,
     seed: int,
 ) -> dict[int, VariantResult]:

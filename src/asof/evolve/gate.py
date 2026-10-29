@@ -35,7 +35,7 @@ from asof.evolve.protocol import EvaluationProtocol, Window
 from asof.evolve.versus import Versus, compare_run, equity_slice
 from asof.store.models import EquityDaily, Run
 from asof.store.queries import runs_of_strategy, visible_equity, visible_trades
-from asof.strategy import StrategyConfig
+from asof.strategy import AnyStrategyConfig
 
 ET = ZoneInfo("America/New_York")
 
@@ -134,7 +134,7 @@ def check(
     root: Path,
     run_ids: Sequence[int],
     *,
-    cfg: StrategyConfig,
+    cfg: AnyStrategyConfig,
     protocol: EvaluationProtocol,
     permutations: int,
     seed: int,

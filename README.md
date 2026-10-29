@@ -233,6 +233,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] B-Xtrender entry scan: liquid common stocks whose weekly (or monthly) and daily histograms both rose, after a measured warm-up (`asof scan bx`)
 - [x] B-Xtrender execution rules: sell half when the daily histogram turns red and the rest when the weekly bar falls, sized by ATR; optional monthly and SPY trend filters (`strategies/bx_trender`)
 - [x] B-Xtrender in the replay: each night held positions sell on that night's flags and candidates enter in rank order, sized on the bars visible then (`asof replay run --strategy bx_trender`)
+- [x] Gate report on B-Xtrender replays: random entries drawn from the scan's pool, checked on a made-up market with a planted edge (found) and without it (not found)
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

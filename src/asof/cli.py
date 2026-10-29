@@ -134,7 +134,7 @@ from asof.store.universe import (
     tier_union,
 )
 from asof.strategy import (
-    StrategyConfig,
+    AnyStrategyConfig,
     apply_overrides,
     content_hash,
     load_any_strategy,
@@ -1861,7 +1861,7 @@ app.add_typer(gate_app, name="gate")
 
 def _family_config(
     session: Session, runs: list[int], strategies_dir: Path, current_strategy: bool
-) -> StrategyConfig:
+) -> AnyStrategyConfig:
     """The random-entry pool and slippage of a family of runs: their strategy files must still
     be the versions they replayed (or ``current_strategy``), and agree on pool and slippage."""
     cfgs = {}
@@ -1876,7 +1876,7 @@ def _family_config(
         )
         overrides = version.summary.split(", ") if version and version.summary else []
         path = strategies_dir / run.strategy_id
-        cfgs[run_id] = apply_overrides(load_strategy(path), overrides)
+        cfgs[run_id] = apply_overrides(load_any_strategy(path), overrides)
         if version is None or content_hash(path, overrides) != version.content_hash:
             if not current_strategy:
                 _fail(
@@ -1884,15 +1884,23 @@ def _family_config(
                     "--current-strategy uses today's files"
                 )
             typer.echo(f"run {run_id}: using today's {path}", err=True)
+    kinds = sorted({c.strategy.kind for c in cfgs.values()})
+    if len(kinds) > 1:
+        _fail(f"the runs mix strategy kinds: {', '.join(kinds)}")
     settings = {
         json.dumps(
-            [c.strategy.universe, c.scan.model_dump(), c.execute.fills.model_dump()],
+            [
+                c.strategy.universe,
+                c.scan.model_dump(),
+                c.execute.fills.model_dump(),
+                c.execute.data.model_dump(),
+            ],
             sort_keys=True,
         )
         for c in cfgs.values()
     }
     if len(settings) != 1:
-        _fail("the runs differ in universe, scan thresholds or slippage")
+        _fail("the runs differ in universe, scan thresholds, slippage or spin-off rules")
     return cfgs[runs[0]]
 
 

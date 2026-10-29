@@ -623,7 +623,11 @@ one drawn uniformly from what the scanner could have returned the evening before
 its signal: for the earnings gap, one security per company with an 8-K on file, a bar on the
 previous session, no split in the scan window, a close of at least `scan.min_price` and an
 average dollar volume of at least `scan.min_avg_dollar_volume` (the gap and volume tests are
-left out). The drawn leg buys the entry open and sells the exit open or close, with the same
+left out); for the B-Xtrender, the liquid tier's common stocks whose BX values are defined and
+warm, on a night the market filter allows (the two rises are left out), read over all the
+evenings at once as the replay reads its window. On the real store this pool held 970 to 1,137
+stocks a night over 2024-01 to 2024-04, every leg of S1 (run 7) was inside its own, and it
+equalled a scan run each night. The drawn leg buys the entry open and sells the exit open or close, with the same
 slippage and the splits in between. 1,000 draws (the protocol's `permutations`) give what luck
 earns per leg in the same market and pool. The pool is read as of each entry's previous
 evening; prices are outcomes and are read as of the last exit.
@@ -633,6 +637,15 @@ leg draw the same securities. With several runs, `p adj` is the share of draws i
 best run's standardized random mean reached this run's: trying more variants raises the bar,
 and near-duplicates raise it little. The run's strategy files must hash to the version it
 replayed; `--current-strategy` overrides that check.
+
+A test with a known answer (`tests/evolve/test_planted_edge.py`) runs the real B-Xtrender
+replay and the gate on a made-up market of 30 stocks where every entry signal is followed by
+ten sessions of +0.5% drift. The gate finds it: 351 legs, +2.73% a leg over random entries
+against +2.95% planted (the drift the real legs held minus what an average draw held: random
+picks often land on a drifting stock too), z 4.2, p 0.002 after the family correction, five of
+five walk-forward windows positive. The same market without the drift shows nothing: −0.41%,
+z −1.0, p 0.84. The market is easy on purpose; passing it says the gate can see an edge, not
+that the real strategy has one.
 
 Over 2023-01-03 to 2026-10-16 (run 1, take-all): 632 legs, +1.73% a leg, random picks +1.54%,
 excess +0.19%, p = 0.33. Known gaps: a hard stop fills at its stop price but a random leg exits
