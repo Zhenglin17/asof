@@ -114,6 +114,7 @@ uv run asof market import-bars       # registered second-source bars
 uv run asof market actions           # splits, renames, mergers
 uv run asof market identity          # security master: which security each symbol was, per day
 uv run asof market instruments       # instrument class per security-master segment
+uv run asof market shares            # SEC share counts of the liquid tier's companies
 uv run asof market audit             # data checks, with reviewed exceptions
 uv run asof market truncation        # rebuild identity as of past instants; gate on leak impact
 uv run asof docs sync                # SEC filings of the watchlist companies, as citable chunks
@@ -291,6 +292,22 @@ or a one-day SPAC spike cannot buy its way in. Recomputed at every month start, 
 scope the identity audit must settle and the universe the minute-bar backfill pulls; a symbol
 that qualifies while still `unknown` makes the command exit non-zero so the override file gets
 a line.
+
+`asof market shares` fetches, for every company the liquid tier's common stocks have belonged
+to since 2020, the share counts it tagged in its SEC filings (the companyconcept API, cached
+under `raw/sec/companyconcept`), into `fundamentals/shares_outstanding.parquet`. Four tags are
+read, in this order: the cover-page count, the basic weighted average (US GAAP, then IFRS), and
+the balance-sheet count; a company that tags counts per share class only (V, BRK.B) has none.
+A count is public from the day after its filing date. `store/shares.py` reads, for a night, the
+newest count of the first tag a company has, multiplied by the splits after it: after the
+count's date for the cover count, after the filing date for the others, which a later filing
+restates for every split before it. A market cap is that count times the night's close. A 20-F
+filer's count is of ordinary shares while what trades may be an ADR standing for several; its
+cap must clear ten times the bar. A cap below the stock's average daily dollar volume (VALE's
+IFRS count was tagged in thousands) or above $5 trillion is no count; a stock without a usable
+count still passes a cap bar when it trades that bar's worth a day, since a smaller company
+would have to turn over its whole value every day. Audit checks F1 and F2 list the tier stocks
+without a count, or with one of those impossible caps, per month.
 
 Tests on fake data only show that the code does what its author imagined; they stay green when
 the imagined vendor differs from the real one. `asof market audit` therefore reads the real

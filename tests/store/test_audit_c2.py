@@ -141,7 +141,8 @@ def test_c2_runs_as_part_of_the_default_check_list(
     con: duckdb.DuckDBPyConnection, world: World
 ) -> None:
     results = audit(con, world, checks=list(CHECKS))
-    assert list(results)[-2:] == ["C1", "C2"]
+    order = list(results)
+    assert order[order.index("C1") + 1] == "C2"
     assert rows(results["C2"]) == []
 
 

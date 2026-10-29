@@ -158,6 +158,8 @@ GATES: dict[str, str | None] = {
     "N3": None,
     "C1": None,
     "C2": "all",
+    "F1": None,  # liquid security without a visible share count: listed, not gated
+    "F2": None,  # implausible market cap: listed, not gated
 }
 HEAD = ["key", "in_liquid", "excepted"]
 
@@ -252,6 +254,8 @@ SAMPLE_KEYS = {
     "N3": "AAA/BBB",
     "C1": "2020",
     "C2": "NOBL",
+    "F1": "BBB",
+    "F2": "AAA:2019-12-31",
 }
 
 
@@ -277,6 +281,8 @@ def test_key_pattern_accepts_the_documented_key_shape(check_id: str) -> None:
         ("M7", "S000008:LBL"),
         ("M8", "PPP:cik_switch_discontinuous"),  # dates missing
         ("I10", "INBX"),  # the CIK is part of the key
+        ("F1", "BBB:2020-02-01"),  # one row per symbol, no date
+        ("F2", "AAA"),  # the end date is part of the key
     ],
 )
 def test_key_pattern_rejects_other_shapes(check_id: str, bad: str) -> None:

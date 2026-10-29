@@ -83,6 +83,7 @@ from asof.ingest.security_master import (
     load_store_inputs,
     write_master,
 )
+from asof.ingest.shares import SHARES_FILE, ShareFact, fetch_share_facts, write_share_facts
 from asof.ingest.tickers import is_valid_symbol, normalize_ticker
 from asof.ingest.truncation_gate import (
     ImpactCount,
@@ -125,7 +126,13 @@ from asof.store.db import default_data_dir, default_db_path, init_db, make_engin
 from asof.store.documents import audit_documents
 from asof.store.entities import EntityConflict, upsert_entities
 from asof.store.fts import chunk_index_integrity, chunk_index_mismatch, rebuild_chunk_index
-from asof.store.market import bars_status, market_root, visible_bars, visible_splits
+from asof.store.market import (
+    bars_status,
+    market_root,
+    visible_bars,
+    visible_master,
+    visible_splits,
+)
 from asof.store.models import Entity, EntityKind, Run, StrategyVersion
 from asof.store.universe import (
     LIQUID_CLASSES,
@@ -882,6 +889,64 @@ def _cores() -> int:
     """Cores this process may run on: the affinity mask, not the host (a container or CI runner
     gets fewer than the machine has)."""
     return len(os.sched_getaffinity(0)) or 1
+
+
+@market_app.command("shares")
+def market_shares(
+    start: Annotated[
+        datetime, typer.Option("--from", help="First month of the liquid-tier union.")
+    ] = datetime(2020, 1, 1),
+    end: Annotated[
+        datetime | None, typer.Option("--to", help="Last month of the union. Defaults to today.")
+    ] = None,
+    min_adv: Annotated[
+        float, typer.Option("--min-adv", min=0.0, help="Liquid-tier dollar volume threshold.")
+    ] = MIN_ADV_USD,
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+) -> None:
+    """Fetch SEC share counts for every CIK the liquid tier's common stocks have carried and
+    rewrite <market>/fundamentals/shares_outstanding.parquet. Replies are cached under
+    $ASOF_DATA_DIR/raw/sec/companyconcept; needs $ASOF_SEC_USER_AGENT for what is not cached."""
+    user_agent = os.environ.get(SEC_USER_AGENT_ENV)
+    if not user_agent:
+        _fail(f"Set {SEC_USER_AGENT_ENV} to a contact address; the SEC requires one.")
+    root = _market_root(data_dir)
+    now = datetime.now(ET)
+    last = end.date() if end is not None else now.date()
+    con = duckdb.connect()
+    try:
+        tier = tier_union(con, root, start.date(), last, min_adv_usd=min_adv, classes=("common",))
+        ids = set(tier.column("security_id").to_pylist())
+        ciks = sorted(
+            {
+                int(seg["cik"])
+                for seg in visible_master(con, root, now).to_pylist()
+                if seg["security_id"] in ids and seg["cik"] is not None
+            }
+        )
+    finally:
+        con.close()
+    typer.echo(f"{len(ids):,} securities, {len(ciks):,} CIKs ({start:%Y-%m}..{last:%Y-%m})")
+    fetch = retrying(rate_limited(make_fetch({"User-Agent": user_agent}), REQUESTS_PER_SECOND))
+    cache = (data_dir or default_data_dir()) / "raw" / "sec" / "companyconcept"
+    facts = fetch_share_facts(ciks, fetch, cache)
+    # a narrower range must not drop the facts of companies only an earlier range reached
+    asked = set(ciks)
+    stored = root / SHARES_FILE
+    rows = pq.read_table(stored).to_pylist() if stored.exists() else []
+    kept = [
+        ShareFact(**{f.name: row.get(f.name) for f in dataclasses.fields(ShareFact)})
+        for row in rows
+        if row["cik"] not in asked
+    ]
+    path = write_share_facts([*kept, *facts], root)
+    if kept:
+        typer.echo(f"kept {len(kept):,} facts of CIKs outside this range")
+    with_facts = {f.cik for f in facts}
+    typer.echo(f"{len(facts):,} facts of {len(with_facts):,} CIKs -> {path}")
+    typer.echo(f"{len(ciks) - len(with_facts):,} CIKs report none of the concepts")
 
 
 @market_app.command("truncation")

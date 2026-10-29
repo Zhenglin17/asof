@@ -187,9 +187,10 @@ sized on an ATR inflated by an extreme or bad high or low (NVDA 2024-06-10 store
 | One pass over a window reading the window's end | The B-Xtrender scan computes each series once at the window's last close and is held equal to a scan run each night; a security whose symbol (or spin-off child) was recorded in the security master late is recomputed as known that night | `tests/scan/test_bx_trender.py` |
 | Sizing on prices rescaled later | A B-Xtrender entry takes its close and ATR from the bars visible at the signal night, adjusted only by the splits on file then whose ex-date has come | `tests/replay/test_replay_bx.py` |
 | Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
+| A share count before its filing was public | A market cap uses the SEC share count from the day after its filing date, of the company the security belonged to that night, with the splits on file then | `tests/store/test_shares.py` |
 | Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
 
-On the real store, `asof market audit` runs 37 data checks with reviewed exceptions (the session
+On the real store, `asof market audit` runs 39 data checks with reviewed exceptions (the session
 calendar among them, against the NYSE schedule), and
 hand-checked reference histories (renames, ticker reuse, splits, spin-offs) are asserted as tests.
 
@@ -211,6 +212,10 @@ hand-checked reference histories (renames, ticker reuse, splits, spin-offs) are 
 - **One model, one prompt.** Answers are cached; another model or prompt may decide
   differently. A training cutoff hides outcomes, not what the model knew about each company
   before it.
+- **Rough market caps.** Share counts come from companies' SEC XBRL tags; an ADR's count is of
+  ordinary shares with no ratio on file, so it must clear ten times the bar. About 4% of
+  liquid-tier stock-nights in 2020-01..2025-06 have no usable count (BP, STZ, BRK.A among
+  them) and fall out of a cap filter on both sides of a comparison.
 - **Long only, gap-ups only.** Never tested in a falling or very volatile market.
 - **Not built yet:** minute bars, macro data, the evolution loop (proposals and approval).
 
@@ -233,6 +238,7 @@ export ALPACA_API_KEY=... ALPACA_SECRET_KEY=... ASOF_SEC_USER_AGENT="name you@ex
 uv run asof db init && uv run asof entities sync --download
 uv run asof market universe && uv run asof market backfill && uv run asof market import-bars
 uv run asof market actions && uv run asof market identity && uv run asof market instruments
+uv run asof market shares
 uv run asof market audit
 uv run asof docs sync && uv run asof docs audit && uv run asof evidence index
 uv run asof replay run --strategy earnings_gap --start 2023-01-03 --end 2026-10-21
@@ -248,7 +254,8 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] Evidence search and citation validator
 - [x] Fast loop: scanner, take-all and LLM judges, executor, ledger, attribution, replay report
 - [x] Demo page on GitHub Pages
-- [ ] Minute bars, XBRL facts, FRED
+- [x] Share counts from SEC XBRL, point in time, for a rough market cap (`asof market shares`)
+- [ ] Minute bars, other XBRL facts, FRED
 - [x] Gate report: random entries, walk-forward, thin edge, benchmarks, side by side
 - [x] First feature: B-Xtrender on split- and spin-off-adjusted daily, weekly and monthly bars, matched against the chart
 - [x] B-Xtrender entry scan: liquid common stocks whose weekly (or monthly) and daily histograms both rose, after a measured warm-up (`asof scan bx`)

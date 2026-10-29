@@ -142,6 +142,7 @@ class Seg:
     cls: str = "common"
     name_source: str = "alpaca_active"
     rule: str = "symbol_shape"
+    cik_available_at: datetime | None = None  # None: known with the segment (available_at)
 
 
 def class_row(seg: Seg) -> dict[str, Any]:
@@ -167,7 +168,8 @@ def write_master(root: Path, segs: Sequence[Seg]) -> Path:
             "valid_to": pa.array([s.valid_to for s in segs], pa.date32()),
             "cik": pa.array([s.cik for s in segs], pa.int64()),
             "cik_available_at": pa.array(
-                [None if s.cik is None else s.available_at for s in segs], TS_UTC
+                [None if s.cik is None else (s.cik_available_at or s.available_at) for s in segs],
+                TS_UTC,
             ),
             "cusip": pa.array([None for _ in segs], pa.string()),
             "evidence": pa.array(["bars" for _ in segs], pa.string()),
@@ -344,6 +346,7 @@ class World:
     conflicts: list[dict[str, Any]] | None = None  # None: no file
     sec: list[tuple[date, str, int]] | None = None  # None: agrees with the master
     misfiled: list[tuple[int, dict[str, Any]]] = field(default_factory=list)  # (hive year, bar)
+    shares: list[Any] = field(default_factory=list)  # ShareFact rows; none: no shares file
 
     def write(self) -> Path:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -378,6 +381,11 @@ class World:
                 self.root / "corporate_actions" / "dividends.parquet",
                 pa.Table.from_pylist(self.dividends, schema=DIVIDEND_SCHEMA),
             )
+        if self.shares:
+            # imported here so the audit tests that never write share counts do not depend on it
+            from asof.ingest.shares import write_share_facts
+
+            write_share_facts(self.shares, self.root)
         if self.conflicts is not None:
             _write(
                 self.root / CONFLICTS_FILE,

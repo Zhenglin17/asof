@@ -29,7 +29,7 @@ import re
 import statistics
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -71,8 +71,10 @@ from asof.store.market import (
     visible_bars,
     visible_dividends,
     visible_master,
+    visible_sessions,
     visible_splits,
 )
+from asof.store.shares import implausible, market_caps, visible_shares
 from asof.store.spinoffs import spinoff_events
 from asof.store.universe import LIQUID_CLASSES
 
@@ -117,6 +119,12 @@ REVIEWED_RESOLUTIONS = ("unresolved", "relabelled")  # M6: conflicts a human rea
 I10_MIN_SNAPSHOTS = 3  # I10: exchange snapshots that make a listing (fewer: stale or not started)
 # I10: the SEC exchange table's spellings of a listing; "OTC" and "" are none
 LISTING_EXCHANGES = ("NASDAQ", "NYSE", "CBOE", "CBOE US", "NAS")
+# F1: a count older than this is missing; a 20-F count is a year old when the next one is filed
+# (TSM: as of 2023-12-31, filed 2024-04-18), so two years leave room for a late filer
+SHARE_MAX_AGE_DAYS = 730
+SHARE_MAX_TURNOVER = 1.0  # F2: average dollar volume / cap above this is no real count
+SHARE_MAX_CAP = 5e12  # F2: a cap above this is no real count (the largest, 2025: ~4.5e12)
+SCAN_CLOSE = time(20)  # F2: a night's caps are read at its scan time
 
 
 @dataclass(frozen=True)
@@ -202,6 +210,10 @@ CHECKS: dict[str, CheckSpec] = dict(
         _spec("N3", "symbol pairs partly identical", None, f"{_SYM}/{_SYM}"),
         _spec("C1", "coverage per year", None, _YEAR),
         _spec("C2", "listed asset with stale bars", "all", _SYM),
+        # listed, not gated: a stock without a usable count (F1) or with an implausible one (F2)
+        # drops out of a cap filter, which reports how many it dropped
+        _spec("F1", "liquid security without a visible share count", None, _SYM),
+        _spec("F2", "liquid security with an implausible market cap", None, f"{_SYM}:{_DATE}"),
     ]
 )
 
@@ -458,6 +470,8 @@ class _Audit:
         con.register(_EXCHANGES, self._exchanges())
         # a tier row computed after as_of is not knowable yet
         self.dated_tier = liquid_tier is not None
+        self.liquid_tier = liquid_tier
+        self.liquid_ids = frozenset(liquid_ids)
         tier = [
             {"security_id": r["security_id"], "day": r["as_of"].astimezone(ET).date()}
             for r in (liquid_tier.to_pylist() if liquid_tier is not None else [])
@@ -1626,6 +1640,106 @@ class _Audit:
             "snapshot_date": self.snapshot_date.isoformat() if self.snapshot_date else None,
         }
         return table, notes
+
+    def f1(self) -> tuple[pa.Table, dict]:
+        """Tier common stocks without a count ``visible_shares`` would use on a tier night, read
+        with what was public that night: one row per symbol, with the nights it is missing.
+        Without the dated tier there are no nights to judge."""
+        schema = pa.schema(
+            [
+                ("key", pa.string()),
+                ("_liq", pa.bool_()),
+                ("nights", pa.int64()),
+                ("first_night", pa.date32()),
+                ("last_night", pa.date32()),
+            ]
+        )
+        if self.liquid_tier is None:
+            return schema.empty_table(), {"nights": 0}
+        by_night: dict[datetime, list[str]] = {}
+        for r in self.liquid_tier.to_pylist():
+            if r["class"] == "common" and r["as_of"] <= self.as_of:
+                by_night.setdefault(r["as_of"], []).append(r["security_id"])
+        missing: dict[str, list[date]] = {}
+        for at, ids in sorted(by_night.items()):
+            have = set(
+                visible_shares(self.con, self.root, at, ids, max_age_days=SHARE_MAX_AGE_DAYS)
+                .column("security_id")
+                .to_pylist()
+            )
+            night = at.astimezone(ET).date()
+            symbol = {
+                seg["security_id"]: seg["symbol"]
+                for seg in visible_master(self.con, self.root, at).to_pylist()
+                if seg["valid_from"] <= night
+                and (seg["valid_to"] is None or night < seg["valid_to"])
+            }
+            for sid in ids:
+                if sid not in have:
+                    missing.setdefault(symbol.get(sid, sid), []).append(night)
+        rows = [
+            {"key": k, "_liq": True, "nights": len(v), "first_night": min(v), "last_night": max(v)}
+            for k, v in missing.items()
+        ]
+        return pa.Table.from_pylist(rows, schema=schema), {"nights": len(by_night)}
+
+    def f2(self) -> tuple[pa.Table, dict]:
+        """Tier common stocks whose count gives a cap no count could (``implausible``), on the
+        last session before each tier night: one row per stock and count. A cap filter reads
+        such a stock as having no count, so the rows are listed, not gated."""
+        schema = pa.schema(
+            [
+                ("key", pa.string()),
+                ("_liq", pa.bool_()),
+                ("nights", pa.int64()),
+                ("first_night", pa.date32()),
+                ("last_night", pa.date32()),
+                ("concept", pa.string()),
+                ("shares", pa.float64()),
+                ("raw_cap", pa.float64()),
+                ("adv_usd", pa.float64()),
+            ]
+        )
+        if self.liquid_tier is None:
+            return schema.empty_table(), {"nights": 0}
+        by_night: dict[datetime, dict[str, float]] = {}
+        for r in self.liquid_tier.to_pylist():
+            if r["class"] == "common" and r["as_of"] <= self.as_of:
+                by_night.setdefault(r["as_of"], {})[r["security_id"]] = r["adv_usd"]
+        sessions = visible_sessions(self.con, self.root, "1Day", self.as_of)
+        found: dict[str, dict[str, Any]] = {}
+        for at, adv in sorted(by_night.items()):
+            day = at.astimezone(ET).date()
+            before = [d for d in sessions if d < day]
+            if not before:
+                continue
+            evening = datetime.combine(before[-1], SCAN_CLOSE, tzinfo=ET)
+            caps = market_caps(
+                self.con, self.root, evening, list(adv), max_age_days=SHARE_MAX_AGE_DAYS
+            )
+            bad = implausible(
+                caps, adv_usd=adv, max_turnover=SHARE_MAX_TURNOVER, max_cap=SHARE_MAX_CAP
+            )
+            for r in caps.to_pylist():
+                if r["security_id"] not in bad:
+                    continue
+                key = f"{r['symbol']}:{r['end'].isoformat()}"
+                row = found.setdefault(
+                    key,
+                    {
+                        "key": key,
+                        "_liq": True,
+                        "nights": 0,
+                        "first_night": before[-1],
+                        "concept": r["concept"],
+                        "shares": r["shares"],
+                        "raw_cap": r["raw_cap"],
+                        "adv_usd": adv[r["security_id"]],
+                    },
+                )
+                row["nights"] += 1
+                row["last_night"] = before[-1]
+        return pa.Table.from_pylist(list(found.values()), schema=schema), {"nights": len(by_night)}
 
 
 def _finish(spec: CheckSpec, table: pa.Table, excepted_keys: set[str]) -> pa.Table:

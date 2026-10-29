@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pyarrow as pa
 import pytest
 
 from asof.ingest import security_master as sm
@@ -35,6 +36,7 @@ from asof.ingest.alpaca import Asset
 from asof.ingest.universe import save_assets_snapshot
 from asof.store.audit import CHECKS, CheckResult, run_audit
 from asof.store.market import market_root
+from asof.store.universe import LIQUID_SCHEMA
 from tests.ingest.test_security_master import cm_good_rows, cm_violation, master_table
 from tests.store.audit_world import (
     DAYS,
@@ -83,6 +85,7 @@ class MetaWorld(World):
 
     assets: list[tuple[date, list[Asset]]] = field(default_factory=lambda: [(SNAP_1, LISTED)])
     exchange: list[Listing] = field(default_factory=list)
+    tier: pa.Table | None = None  # the dated liquid tier (F1 judges its nights); None: not passed
 
     def write(self) -> Path:
         root = super().write()
@@ -307,6 +310,31 @@ def _s6(w: MetaWorld) -> None:
     w.others = [spin_off("AAA", "KID", ex, 1.0)]
 
 
+def _f1(w: MetaWorld) -> None:
+    # a tier common stock on a tier night with no share count at all (no shares file)
+    w.tier = pa.Table.from_pylist(
+        [
+            {
+                "as_of": known(date(2020, 2, 1)),
+                "security_id": SID_AAA,
+                "symbol": "AAA",
+                "class": "common",
+                "adv_usd": 1e8,
+                "sessions_traded": 20,
+            }
+        ],
+        schema=LIQUID_SCHEMA,
+    )
+
+
+def _f2(w: MetaWorld) -> None:
+    # a tier common stock whose count (1e3 shares at 100) gives a cap below a day's volume
+    from tests.store.test_audit_shares import fact
+
+    _f1(w)
+    w.shares = [fact("AAA", date(2019, 12, 27), 1e3)]
+
+
 BROKEN: dict[str, Callable[[MetaWorld], None]] = {
     "P1": _p1,
     "P2": _p2,
@@ -345,6 +373,8 @@ BROKEN: dict[str, Callable[[MetaWorld], None]] = {
     "N3": _n3,
     "C1": _c1,
     "C2": _c2,
+    "F1": _f1,
+    "F2": _f2,
 }
 
 # the clean world's per-year rows (pinned in tests/store/test_audit.py as well)
@@ -374,7 +404,12 @@ def world(tmp_path: Path) -> MetaWorld:
 def run_one(con: duckdb.DuckDBPyConnection, world: MetaWorld, check_id: str) -> CheckResult:
     world.write()
     [result] = run_audit(
-        con, world.root, as_of=LATE, liquid_ids=world.liquid_ids, checks=[check_id]
+        con,
+        world.root,
+        as_of=LATE,
+        liquid_ids=world.liquid_ids,
+        checks=[check_id],
+        liquid_tier=world.tier,
     )
     return result
 
