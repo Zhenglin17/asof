@@ -240,9 +240,19 @@ def market_ok(
     ``sma_sessions`` final closes (that close included), on prices adjusted for the splits
     visible then. Too short a history, or no bars at all, reads as False: no new entries."""
     bars = visible_bars(con, root, "1Day", as_of, symbols=[flt.symbol]).to_pandas()
+    splits = visible_splits(con, root, as_of, [flt.symbol]).to_pandas()
+    return _index_ok(bars, splits, as_of, flt)
+
+
+def _index_ok(bars: pd.DataFrame, splits: pd.DataFrame, as_of: datetime, flt: MarketFilter) -> bool:
+    """``market_ok`` on the filter symbol's bars and split records as read at ``as_of`` or
+    later: rows that became available after ``as_of`` are dropped first."""
+    bars = pd.DataFrame(bars[bars["available_at"] <= as_of]) if not bars.empty else bars
     if bars.empty:
         return False
-    bars = adjust_for_splits(bars, visible_splits(con, root, as_of, [flt.symbol]).to_pandas())
+    if not splits.empty:
+        splits = pd.DataFrame(splits[splits["available_at"] <= as_of])
+    bars = adjust_for_splits(bars, splits)
     # the security carrying the symbol tonight; an earlier holder of the label is another one
     bars = bars.sort_values("session_date")
     bars = pd.DataFrame(bars[bars["security_id"] == bars["security_id"].iloc[-1]])
@@ -254,10 +264,39 @@ def market_ok(
     return bool(closes[-1] > closes[-n:].mean())
 
 
+def market_ok_nights(
+    con: duckdb.DuckDBPyConnection, root: Path, nights: Sequence[date], flt: MarketFilter
+) -> dict[date, bool]:
+    """``market_ok`` at the close of each night, reading the index once at the last night's
+    close and dropping, per night, the rows not yet available then. Bars are attributed with
+    the master as known at that last close, so when a segment of the symbol was published after
+    the first night (a label reused or recorded late) each night is read on its own instead.
+    A bar row's availability follows from its session alone, imported rows' too
+    (``asof.ingest.bars._to_table``), so no row visible on an earlier night is replaced by the
+    time of the last one."""
+    if not nights:
+        return {}
+    first, last = _close(min(nights)), _close(max(nights))
+    segments = [r for r in visible_master(con, root, last).to_pylist() if r["symbol"] == flt.symbol]
+    if any(r["available_at"] > first or (r["end_available_at"] or first) > first for r in segments):
+        return {d: market_ok(con, root, _close(d), flt) for d in nights}
+    bars = visible_bars(con, root, "1Day", last, symbols=[flt.symbol]).to_pandas()
+    splits = visible_splits(con, root, last, [flt.symbol]).to_pandas()
+    return {d: _index_ok(bars, splits, _close(d), flt) for d in nights}
+
+
 def _market_open(
     con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime, cfg: BxScanConfig
 ) -> bool:
     return cfg.market_filter is None or market_ok(con, root, as_of, cfg.market_filter)
+
+
+def _open_nights(
+    con: duckdb.DuckDBPyConnection, root: Path, nights: Sequence[date], cfg: BxScanConfig
+) -> dict[date, bool]:
+    if cfg.market_filter is None:
+        return dict.fromkeys(nights, True)
+    return market_ok_nights(con, root, nights, cfg.market_filter)
 
 
 def _sessions(con: duckdb.DuckDBPyConnection, root: Path, as_of: datetime) -> list[date]:
@@ -369,10 +408,9 @@ def scan_nights(
     the market filter fails) and that night's panel rows, which hold every security in the tier
     on any night of the window: a position held after its security left the tier still reads
     its exit flags from them."""
-    return [
-        (d, signals(rows, tier, cfg) if _market_open(con, root, _close(d), cfg) else [], rows)
-        for d, rows, tier in _nights(con, root, start, end, cfg)
-    ]
+    nights = _nights(con, root, start, end, cfg)
+    open_ = _open_nights(con, root, [d for d, _, _ in nights], cfg)
+    return [(d, signals(rows, tier, cfg) if open_[d] else [], rows) for d, rows, tier in nights]
 
 
 def scan_range(
@@ -387,9 +425,11 @@ def pool_range(
     con: duckdb.DuckDBPyConnection, root: Path, start: date, end: date, cfg: BxScanConfig
 ) -> dict[date, frozenset[str]]:
     """``pool`` of every session from ``start`` through ``end``."""
+    nights = _nights(con, root, start, end, cfg)
+    open_ = _open_nights(con, root, [d for d, _, _ in nights], cfg)
     return {
         d: frozenset(_eligible(rows, tier, cfg)["security_id"].astype(str))
-        if _market_open(con, root, _close(d), cfg)
+        if open_[d]
         else frozenset()
-        for d, rows, tier in _nights(con, root, start, end, cfg)
+        for d, rows, tier in nights
     }

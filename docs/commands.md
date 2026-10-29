@@ -678,7 +678,15 @@ the strategy fell further) and the Sharpe ratio's difference.
 ```bash
 uv run asof gate report --run 4                 # one run over development dates
 uv run asof gate report --run 5 --run 6 --run 7  # a family: the best variant is measured
+uv run asof gate report --run 8 --run 9 --run 10 --from 2023-01-01  # from a later dev date
 ```
+
+`--from` narrows development dates to start there (the end, and so the holdout, never moves),
+for variants that cannot trade before it: S2's monthly warm-up of 36 bars keeps it in cash until
+2023-01, so the three B-Xtrender variants are also compared over 2023-01 .. 2025-06. Legs
+entering before the start drop out of every per-leg number; positions carried across it move
+the equity curve from then on, and the report counts them. The report is written to
+`gate-<runs>-from-<YYYYMMDD>.md`, beside the full one.
 
 The report reads development dates only (`dev` in `configs/evaluation.yaml`): a leg counts
 when it enters and exits within them, equity is cut at their end, and prices are read as known

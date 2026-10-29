@@ -68,6 +68,9 @@ class GateResult:
     thin_cost_excess: float
     versions_on_dev: int
     left_out: int  # the candidate's legs entering in dev but exiting after it
+    # the candidate's legs entering before dev and exiting in or after it: their moves after
+    # dev starts are in the equity rows (Sharpe, the pick, benchmarks), in no per-leg number
+    carried_in: int
     seen_before_protocol: bool  # replayed over these dates before the protocol: not clean
 
 
@@ -145,8 +148,11 @@ def check(
     spans: dict[int, list[Span]] = {}
     marks: dict[int, list[EquityDaily]] = {}
     late: dict[int, int] = {}
+    carried: dict[int, int] = {}
     for r in run_ids:
-        legs = [s for s in spans_of_run(session, r) if s.entry_session >= dev.start]
+        every_leg = spans_of_run(session, r)
+        carried[r] = sum(s.entry_session < dev.start <= s.exit_session for s in every_leg)
+        legs = [s for s in every_leg if s.entry_session >= dev.start]
         spans[r] = [s for s in legs if s.exit_session <= dev.end]
         late[r] = sum(s.entry_session <= dev.end < s.exit_session for s in legs)
         if not spans[r]:
@@ -234,6 +240,7 @@ def check(
         thin_cost_excess=thin_cost,
         versions_on_dev=_versions_on_dev(session, run.strategy_id if run else None, dev),
         left_out=late[candidate],
+        carried_in=carried[candidate],
         seen_before_protocol=seen,
     )
 
@@ -342,6 +349,9 @@ def render_report(session: Session, result: GateResult, protocol: EvaluationProt
         f"- Versions of this strategy replayed on dev dates: {result.versions_on_dev} "
         f"(reference budget {protocol.attempt_budget}).",
         f"- Legs entering in dev but exiting after it, left out: {result.left_out}.",
+        f"- Legs entering before {result.dev.start} and exiting after it: {result.carried_in}; "
+        "their moves from then on are in the equity curve (Sharpe, the pick, the benchmarks) "
+        "but in no per-leg number.",
         "",
         f"## Benchmarks over {against.start} .. {against.end}",
         "",

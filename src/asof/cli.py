@@ -1980,6 +1980,14 @@ def gate_report(
     db: Annotated[
         Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
     ] = None,
+    from_: Annotated[
+        datetime | None,
+        typer.Option(
+            "--from",
+            formats=["%Y-%m-%d"],
+            help="Measure from this development date on (a variant that cannot trade before it).",
+        ),
+    ] = None,
     report: Annotated[
         Path | None,
         typer.Option("--report", help="Defaults to <data-dir>/reports/gate-<runs>.md."),
@@ -1996,6 +2004,11 @@ def gate_report(
         protocol = load_protocol()
     except ValueError as error:  # a pydantic ValidationError is a ValueError
         _fail(f"configs/evaluation.yaml: {error}")
+    if from_ is not None:
+        try:
+            protocol = protocol.from_date(from_.date())
+        except ValueError as error:
+            _fail(str(error))
     con = duckdb.connect()
     try:
         with Session(engine) as session:
@@ -2011,7 +2024,8 @@ def gate_report(
     finally:
         con.close()
         engine.dispose()
-    path = report or base / "reports" / f"gate-{'-'.join(str(r) for r in runs)}.md"
+    suffix = f"-from-{from_:%Y%m%d}" if from_ is not None else ""
+    path = report or base / "reports" / f"gate-{'-'.join(str(r) for r in runs)}{suffix}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     best = result.variants[result.candidate]

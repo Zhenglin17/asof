@@ -77,6 +77,14 @@ class EvaluationProtocol(_Strict):
             raise ValueError(f"clean_after {self.clean_after} is not after the holdout")
         return self
 
+    def from_date(self, start: date) -> "EvaluationProtocol":
+        """The same protocol with development dates from ``start`` on: for comparing variants
+        that cannot trade before it. The end of dev, and so the holdout, never moves."""
+        if not self.dev.start <= start <= self.dev.end:
+            raise ValueError(f"{start} is outside the development dates {self.dev.start} .. "
+                             f"{self.dev.end}")  # fmt: skip
+        return self.model_copy(update={"dev": Window(start=start, end=self.dev.end)})
+
 
 def load_protocol(path: Path = DEFAULT_PROTOCOL_PATH) -> EvaluationProtocol:
     return EvaluationProtocol.model_validate(yaml.safe_load(path.read_text()))
