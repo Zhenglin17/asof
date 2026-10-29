@@ -24,18 +24,17 @@ from sqlmodel import Session
 
 from asof.evolve.metrics import TRADING_DAYS, CurveMetrics, curve_metrics
 from asof.evolve.null import (
+    Configs,
     Span,
     VariantResult,
-    build_panel,
+    family_nulls,
     max_statistic,
-    null_returns,
     spans_of_run,
 )
 from asof.evolve.protocol import EvaluationProtocol, Window
 from asof.evolve.versus import Versus, compare_run, equity_slice
 from asof.store.models import EquityDaily, Run
 from asof.store.queries import runs_of_strategy, visible_equity, visible_trades
-from asof.strategy import AnyStrategyConfig
 
 ET = ZoneInfo("America/New_York")
 
@@ -137,12 +136,13 @@ def check(
     root: Path,
     run_ids: Sequence[int],
     *,
-    cfg: AnyStrategyConfig,
+    cfg: Configs,
     protocol: EvaluationProtocol,
     permutations: int,
     seed: int,
 ) -> GateResult:
-    """``run_ids`` are the family; ``cfg`` gives the random-entry pool and the slippage."""
+    """``run_ids`` are the family; ``cfg`` gives the random-entry pool and the slippage, one for
+    the family or each run's own."""
     dev = protocol.dev
     rf = protocol.comparison.risk_free_rate
     spans: dict[int, list[Span]] = {}
@@ -167,17 +167,11 @@ def check(
         marks[r] = rows
 
     every = [s for legs in spans.values() for s in legs]
-    panel = build_panel(
-        session, con, root, every, cfg=cfg, as_of=_close_of(max(s.exit_session for s in every))
-    )
     real = {r: np.array([s.ret for s in legs]) for r, legs in spans.items()}
-    null = {
-        r: null_returns(
-            legs, panel, permutations=permutations, seed=seed,
-            slippage_bps=cfg.execute.fills.slippage_bps,
-        )
-        for r, legs in spans.items()
-    }  # fmt: skip
+    null = family_nulls(
+        session, con, root, spans, cfg=cfg, as_of=_close_of(max(s.exit_session for s in every)),
+        permutations=permutations, seed=seed,
+    )  # fmt: skip
     family = max_statistic(
         {str(r): v for r, v in real.items()}, {str(r): v for r, v in null.items()}
     )

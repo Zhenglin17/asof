@@ -139,6 +139,7 @@ from asof.strategy import (
     content_hash,
     load_any_strategy,
     load_strategy,
+    overrides_of_summary,
 )
 
 SEC_USER_AGENT_ENV = "ASOF_SEC_USER_AGENT"
@@ -1861,9 +1862,9 @@ app.add_typer(gate_app, name="gate")
 
 def _family_config(
     session: Session, runs: list[int], strategies_dir: Path, current_strategy: bool
-) -> AnyStrategyConfig:
-    """The random-entry pool and slippage of a family of runs: their strategy files must still
-    be the versions they replayed (or ``current_strategy``), and agree on pool and slippage."""
+) -> dict[int, AnyStrategyConfig]:
+    """Each run's config, which gives its random-entry pool and slippage: the strategy files
+    must still be the versions the runs replayed (or ``current_strategy``), all of one kind."""
     cfgs = {}
     for run_id in runs:
         run = session.get(Run, run_id)
@@ -1874,9 +1875,13 @@ def _family_config(
             if run.strategy_version_id is not None
             else None
         )
-        overrides = version.summary.split(", ") if version and version.summary else []
+        overrides = overrides_of_summary(version.summary if version else None)
         path = strategies_dir / run.strategy_id
-        cfgs[run_id] = apply_overrides(load_any_strategy(path), overrides)
+        try:
+            cfgs[run_id] = apply_overrides(load_any_strategy(path), overrides)
+        except ValueError as error:  # pydantic's ValidationError and a YAML error too
+            _fail(f"run {run_id}: its overrides {version.summary if version else ''!r} do not "
+                  f"apply to {path}: {error}")  # fmt: skip
         if version is None or content_hash(path, overrides) != version.content_hash:
             if not current_strategy:
                 _fail(
@@ -1887,21 +1892,7 @@ def _family_config(
     kinds = sorted({c.strategy.kind for c in cfgs.values()})
     if len(kinds) > 1:
         _fail(f"the runs mix strategy kinds: {', '.join(kinds)}")
-    settings = {
-        json.dumps(
-            [
-                c.strategy.universe,
-                c.scan.model_dump(),
-                c.execute.fills.model_dump(),
-                c.execute.data.model_dump(),
-            ],
-            sort_keys=True,
-        )
-        for c in cfgs.values()
-    }
-    if len(settings) != 1:
-        _fail("the runs differ in universe, scan thresholds, slippage or spin-off rules")
-    return cfgs[runs[0]]
+    return cfgs
 
 
 @gate_app.command("null")

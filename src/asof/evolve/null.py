@@ -19,15 +19,18 @@ A family of variants (strategy versions) is corrected with the max statistic: ea
 mean is standardized against its own null, and its adjusted p-value counts the permutations in
 which the best of all variants' null z-scores reached it. Draws are keyed by the leg's identity
 (security, entry session, leg), not by its position, and run over the whole pool, redrawing past
-a member without prices: two variants holding the same leg draw the same security whenever it
-is priced for both exits, so similar variants move together under the null and the correction
-stays narrow; an exact duplicate costs nothing.
+a member without prices: two variants holding the same leg in the same pool draw the same
+security whenever it is priced for both exits, so similar variants move together under the null
+and the correction stays narrow; an exact duplicate costs nothing. Each variant draws from its
+own pool (``family_nulls``); variants whose pools differ draw apart, which only makes the
+correction stricter.
 
 Prices are results, not decisions: they are read as known at the window's last close, the same
 reading as the benchmarks. Dividends are left out on both sides (the replay books none).
 """
 
 import hashlib
+import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -455,20 +458,64 @@ def _child_sale(
     return None
 
 
+Configs = AnyStrategyConfig | Mapping[int, AnyStrategyConfig]
+
+
+def config_of(cfg: Configs, run_id: int) -> AnyStrategyConfig:
+    """One config for the whole family, or each run's own."""
+    return cfg[run_id] if isinstance(cfg, Mapping) else cfg
+
+
+def family_nulls(
+    session: Session,
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    spans: Mapping[int, Sequence[Span]],
+    *,
+    cfg: Configs,
+    as_of: datetime,
+    permutations: int,
+    seed: int,
+) -> dict[int, np.ndarray]:
+    """``null_returns`` of each run, drawn from its own variant's pool with its own slippage:
+    variants scanning differently could buy from different sets (S2's pool lacks every stock
+    without 36 monthly bars). Runs whose pool settings agree share one panel."""
+    groups: dict[str, list[int]] = {}
+    for r in spans:
+        c = config_of(cfg, r)
+        key = json.dumps(
+            [c.strategy.universe, c.scan.model_dump(mode="json"), c.execute.data.model_dump()],
+            sort_keys=True,
+        )
+        groups.setdefault(key, []).append(r)
+    out: dict[int, np.ndarray] = {}
+    for members in groups.values():
+        every = [s for r in members for s in spans[r]]
+        panel = build_panel(session, con, root, every, cfg=config_of(cfg, members[0]), as_of=as_of)
+        for r in members:
+            out[r] = null_returns(
+                spans[r], panel, permutations=permutations, seed=seed,
+                slippage_bps=config_of(cfg, r).execute.fills.slippage_bps,
+            )  # fmt: skip
+    return out
+
+
 def null_test(
     session: Session,
     con: duckdb.DuckDBPyConnection,
     root: Path,
     run_ids: Sequence[int],
     *,
-    cfg: AnyStrategyConfig,
+    cfg: Configs,
     permutations: int,
     seed: int,
 ) -> dict[int, VariantResult]:
-    """Each run is one variant of the family; the panel is read once, as known at the last exit
-    of any of them. ``cfg`` gives the pool's thresholds and the slippage."""
-    if cfg.strategy.universe not in POOLS:
-        raise ValueError(f"unknown universe {cfg.strategy.universe!r}")
+    """Each run is one variant of the family; prices are read once per pool, as known at the
+    last exit of any of them. ``cfg`` gives the pool's thresholds and the slippage: one for the
+    family, or each run's own."""
+    for r in run_ids:
+        if config_of(cfg, r).strategy.universe not in POOLS:
+            raise ValueError(f"unknown universe {config_of(cfg, r).strategy.universe!r}")
     spans = {r: spans_of_run(session, r) for r in run_ids}
     for r, legs in spans.items():
         if not legs:
@@ -479,17 +526,10 @@ def null_test(
         select(Trade.available_at).where(col(Trade.run_id).in_(list(run_ids)))
     ).all()
     as_of = max([_close_of(max(s.exit_session for s in every)), *known])
-    panel = build_panel(session, con, root, every, cfg=cfg, as_of=as_of)
     real = {str(r): np.array([s.ret for s in legs]) for r, legs in spans.items()}
-    null = {
-        str(r): null_returns(
-            legs,
-            panel,
-            permutations=permutations,
-            seed=seed,
-            slippage_bps=cfg.execute.fills.slippage_bps,
-        )
-        for r, legs in spans.items()
-    }
+    drawn = family_nulls(
+        session, con, root, spans, cfg=cfg, as_of=as_of, permutations=permutations, seed=seed
+    )
+    null = {str(r): drawn[r] for r in spans}
     results = max_statistic(real, null)
     return {r: results[str(r)] for r in spans}

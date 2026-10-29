@@ -148,6 +148,25 @@ these dates before the protocol existed, so none of it is clean evidence.
 The grid ran on throwaway copies of the database, so it adds nothing to the recorded attempt
 count. It is still a search to anyone who picks its best cell, and is shown as such.
 
+**B-Xtrender, development dates (2020-01 to 2025-06), three pre-registered variants.** None
+beats SPY, so the holdout stays sealed:
+
+| Variant | Window | Account | SPY | Max drawdown | SPY's |
+|---|---|--:|--:|--:|--:|
+| S1: weekly and daily histograms turn up | 2020-01 .. 2025-06 | -4.5% | +107.3% | 36.0% | 33.8% |
+| S3: S1, new entries only while SPY is above its 200-day mean | 2020-01 .. 2025-06 | -10.1% | +107.3% | 35.8% | 33.8% |
+| S2: S1, and the monthly bar rose (in cash until 2023-01) | 2023-01 .. 2025-06 | -5.3% | +66.3% | 25.9% | 18.8% |
+
+S2 needs 36 completed monthly bars, so it can trade only from 2023-01 and is compared over that
+window. The three variants count as three attempts. S1's 3,392 half-position legs averaged
+-0.56% where random picks from the same pool on the same dates averaged +0.35%, p = 1.00 after
+the family correction; positive in 2 of 7 walk-forward windows. The random legs keep the real
+legs' exit dates, and those come from each stock's own path (a sale the morning after the
+daily histogram turns red), so this comparison does not tell a bad entry from a bad exit. The
+replay books no dividends (about a point a year at 63% invested), and about 3% of entries were
+sized on an ATR inflated by an extreme or bad high or low (NVDA 2024-06-10 stores a high of
+195.95 against a close of 121.79); neither is near the gap. [Details](docs/commands.md#b-xtrender-on-development-dates)
+
 ## Leakage guards and the tests behind them
 
 | Way to see the future | Guard | Tests |
@@ -234,6 +253,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] B-Xtrender execution rules: sell half when the daily histogram turns red and the rest when the weekly bar falls, sized by ATR; optional monthly and SPY trend filters (`strategies/bx_trender`)
 - [x] B-Xtrender in the replay: each night held positions sell on that night's flags and candidates enter in rank order, sized on the bars visible then (`asof replay run --strategy bx_trender`)
 - [x] Gate report on B-Xtrender replays: random entries drawn from the scan's pool, checked on a made-up market with a planted edge (found) and without it (not found)
+- [x] B-Xtrender on development dates: three pre-registered variants replayed and measured; none beats SPY, the holdout stays sealed
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

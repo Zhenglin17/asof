@@ -790,6 +790,41 @@ the mechanics, not a result: the development replay and the gate report come nex
 and NVR were candidates on 39 night-slots, but the book was full before their rank each
 time (on 2024-01-10 it filled at rank 5; BRK.A was 11th).
 
+### B-Xtrender on development dates
+
+```bash
+uv run asof replay run --strategy bx_trender --start 2020-01-02 --end 2025-06-30            # S1, run 8
+uv run asof replay run --strategy bx_trender --start 2020-01-02 --end 2025-06-30 \
+    --set scan.require_monthly_up=true                                                       # S2, run 9
+uv run asof replay run --strategy bx_trender --start 2020-01-02 --end 2025-06-30 \
+    --set 'scan.market_filter={symbol: SPY, sma_sessions: 200}'                              # S3, run 10
+uv run asof gate report --run 8 --run 9 --run 10
+uv run asof gate report --run 8 --run 9 --run 10 --from 2023-01-01
+```
+
+Each replay took 11 to 15 minutes with an 8.8 GB peak; run them one at a time (two replays
+writing one SQLite database at once fail with `database is locked`). Each variant's random
+legs are drawn from its own pool: S2's lacks every stock without 36 monthly bars. The gate
+report over all of dev took 18 minutes.
+
+| Variant | Window | Account | SPY | Max drawdown | SPY's | Sharpe | SPY's | Invested |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| S1 | 2020-01-02 .. 2025-06-30 | -4.5% | +107.3% | 36.0% | 33.8% | 0.01 | 0.74 | 63% |
+| S3 | 2020-01-02 .. 2025-06-30 | -10.1% | +107.3% | 35.8% | 33.8% | -0.11 | 0.74 | 51% |
+| S2 | 2023-01-03 .. 2025-06-30 | -5.3% | +66.3% | 25.9% | 18.8% | -0.10 | 1.35 | 74% |
+| S1 | 2023-01-03 .. 2025-06-30 | +7.1% | +66.3% | 23.1% | 18.8% | 0.28 | 1.35 | 75% |
+| S3 | 2023-01-03 .. 2025-06-30 | +0.9% | +66.3% | 16.5% | 18.8% | 0.09 | 1.35 | 70% |
+
+The rule set before the runs: a candidate for the holdout must beat SPY (dividends reinvested)
+in total return over its window with a max drawdown no worse; none does. S1 and S3 also wait
+for their weekly warm-up (first entries around 2020-11), while SPY's 33.8% drawdown is March
+2020's. Random entries: S1 -0.56% a leg against +0.35% (3,392 legs), S2 -0.51% against +0.41%,
+S3 -0.78% against +0.19%; walk-forward 2 of 7 windows positive. The random legs inherit the real
+legs' exit dates, which depend on each stock's own path, so the excess mixes entry and exit.
+About 3% of entries (57 of 1,804 for S1) were sized on an ATR window holding a bar whose high or
+low lies over 30% beyond its open and close (median size 0.79 of the size on a clipped ATR);
+some are real (GME 2021-01), some bad prints (NVDA 2024-06-10).
+
 ## Layout
 
 Directories marked *(planned)* do not exist yet.

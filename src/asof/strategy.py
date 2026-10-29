@@ -13,6 +13,7 @@ silently replaced by a default would run a strategy nobody wrote down.
 
 import hashlib
 import json
+import re
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -319,7 +320,10 @@ def _parse_override(override: str) -> tuple[list[str], Any]:
     keys = dotted.split(".")
     if not sep or not dotted or any(not key for key in keys):
         raise ValueError(f"{override!r}: expected section.key=value")
-    return keys, yaml.safe_load(value)
+    try:
+        return keys, yaml.safe_load(value)
+    except yaml.YAMLError as error:
+        raise ValueError(f"{override!r}: the value is not YAML: {error}") from error
 
 
 @overload
@@ -363,6 +367,23 @@ def _canonical_overrides(path: Path, overrides: Sequence[str]) -> list[tuple[str
             node = node[key]
         found[".".join(keys)] = node
     return sorted(found.items())
+
+
+# ", " starts a new override only where a dotted setting path and "=" follow
+_NEXT_OVERRIDE = re.compile(r", (?=[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+=)")
+
+
+def overrides_of_summary(summary: str | None) -> list[str]:
+    """The overrides ``register_version`` joined into a version's summary, readable again by
+    ``apply_overrides``: values were printed by Python, so one may hold ", " (a mapping, a list)
+    and None stands for YAML null."""
+    if not summary:
+        return []
+    out = []
+    for part in _NEXT_OVERRIDE.split(summary):
+        key, _, value = part.partition("=")
+        out.append(f"{key}={'null' if value == 'None' else value}")
+    return out
 
 
 def content_hash(path: Path, overrides: Sequence[str] = ()) -> str:

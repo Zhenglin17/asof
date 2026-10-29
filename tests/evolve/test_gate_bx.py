@@ -540,3 +540,103 @@ def test_holdout_prices_and_late_records_change_no_gate_number(
 
     # run ids agree (one run per database); repr compares NaN-safe
     assert clean == wild
+
+
+# =============================================================================================
+# a family whose variants scan differently: each draws from its own pool
+# =============================================================================================
+# The pre-registered BX variants differ in scan settings (S2 requires the monthly bar, S3 the
+# SPY trend), and so in what their scanners could buy: S2's pool lacks every stock without 36
+# monthly bars. Measured 2026-10-28: the family check refused runs 8 / 9 / 10 for differing in
+# scan. Here the variant only lengthens the daily warm-up: NEW (listed on LIST_DAY) is outside its
+# pool until it has 120 daily bars, inside the plain variant's from the start.
+
+LONG_WARMUP = "scan.warmup.daily=120"
+
+
+@pytest.fixture(scope="module")
+def long_run(world: BxWorld) -> int:
+    con = duckdb.connect()
+    with Session(world.engine) as s:
+        run_id = run_replay(
+            s, con, world.root, world.strategy_dir, START, END, (LONG_WARMUP,), protocol=BX_GATE
+        )
+    con.close()
+    return run_id
+
+
+def long_cfg(w: BxWorld) -> BxStrategyConfig:
+    from asof.strategy import apply_overrides
+
+    return apply_overrides(w.cfg, [LONG_WARMUP])
+
+
+def own_null(
+    session: Session, con: duckdb.DuckDBPyConnection, w: BxWorld, run_id: int,
+    cfg: BxStrategyConfig, as_of: datetime,
+) -> np.ndarray:  # fmt: skip
+    spans = spans_of_run(session, run_id)
+    panel = build_panel(session, con, w.root, spans, cfg=cfg, as_of=as_of)
+    return null_returns(spans, panel, permutations=PERMUTATIONS, seed=0, slippage_bps=BPS)
+
+
+def test_fixture_the_two_variants_have_different_pools_on_an_entry(
+    session: Session, con: duckdb.DuckDBPyConnection, world: BxWorld, long_run: int
+) -> None:
+    spans = spans_of_run(session, long_run)
+    assert spans
+    plain = build_panel(session, con, world.root, spans, cfg=world.cfg, as_of=last_close(spans))
+    longer = build_panel(
+        session, con, world.root, spans, cfg=long_cfg(world), as_of=last_close(spans)
+    )
+    differ = [e for e in longer.pools if longer.pools[e] != plain.pools[e]]
+    assert differ
+    assert all("S_NEW" in plain.pools[e] - longer.pools[e] for e in differ)
+
+
+def test_null_test_draws_each_variant_from_its_own_pool(
+    session: Session, con: duckdb.DuckDBPyConnection, world: BxWorld, long_run: int
+) -> None:
+    cfgs = {world.run_id: world.cfg, long_run: long_cfg(world)}
+    results = null_test(
+        session, con, world.root, [world.run_id, long_run], cfg=cfgs,
+        permutations=PERMUTATIONS, seed=0,
+    )  # fmt: skip
+
+    every = [*spans_of_run(session, world.run_id), *spans_of_run(session, long_run)]
+    as_of = max([last_close(every), *(t.available_at for r in cfgs for t in trades(session, r))])
+    null = {str(r): own_null(session, con, world, r, c, as_of) for r, c in cfgs.items()}
+    real = {str(r): np.array([s.ret for s in spans_of_run(session, r)]) for r in cfgs}
+    expected = max_statistic(real, null)
+    assert results == {r: expected[str(r)] for r in cfgs}
+
+
+def test_gate_check_draws_each_variant_from_its_own_pool(
+    session: Session, con: duckdb.DuckDBPyConnection, world: BxWorld, long_run: int
+) -> None:
+    cfgs = {world.run_id: world.cfg, long_run: long_cfg(world)}
+    mapped = check(
+        session, con, world.root, [world.run_id, long_run], cfg=cfgs, protocol=BX_GATE,
+        permutations=PERMUTATIONS, seed=0,
+    )  # fmt: skip
+    shared = check(
+        session, con, world.root, [world.run_id, long_run], cfg=world.cfg, protocol=BX_GATE,
+        permutations=PERMUTATIONS, seed=0,
+    )  # fmt: skip
+    # the plain variant is measured alike either way; the long one only on its own pool
+    assert mapped.variants[world.run_id].null_mean == shared.variants[world.run_id].null_mean
+    assert mapped.variants[long_run].null_mean != shared.variants[long_run].null_mean
+
+
+def test_gate_report_cli_accepts_variants_that_scan_differently(
+    world: BxWorld, long_run: int, gate_protocol: EvaluationProtocol, tmp_path: Path
+) -> None:
+    report = tmp_path / "family.md"
+    result = runner.invoke(
+        app,
+        cli_args(world, "report", world.run_id, long_run, db=world.data_dir / "meta.db",
+                 extra=("--report", str(report))),
+    )  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    assert report.exists()
