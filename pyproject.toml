@@ -26,6 +26,7 @@ dev = [
     "pytest>=8.2",
     "ruff>=0.5",
     "pyright>=1.1.370",
+    "pytest-xdist>=3.8.0",
 ]
 
 [build-system]
@@ -37,7 +38,7 @@ packages = ["src/asof"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -n 8"  # eight worker processes (pytest-xdist); -n 0 runs in one
 markers = [
     "realdata: runs against the real store under /data/asof; skipped when it is absent",
 ]

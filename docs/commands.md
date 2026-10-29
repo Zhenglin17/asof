@@ -93,7 +93,8 @@ Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned via
 ```bash
 uv sync                 # create .venv and install all dependencies
 uv run asof --help      # CLI entry point
-uv run pytest           # tests (the real-data cases skip when /data/asof is absent)
+uv run pytest           # tests in 8 worker processes; the real-data cases skip when /data/asof is absent
+uv run pytest -n 0 -x   # one process, stop at the first failure (for debugging)
 uv run pytest -m realdata   # only the hand-checked cases against the real store
 uv run ruff check .     # lint
 uv run ruff format --check .
