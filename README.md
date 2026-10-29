@@ -83,7 +83,9 @@ flowchart TB
   dollar volume, equal weight. [Details](docs/commands.md#benchmarks) Each trade is also
   tested against random entries: the same dates and exits with a security drawn from what the
   scanner could have bought that evening without its signal, corrected for every variant
-  tried. [Details](docs/commands.md#random-entry-null) Every replay records its account marked
+  tried. [Details](docs/commands.md#random-entry-null) A second test holds each entry and its
+  random picks the same fixed number of sessions, so the entry is measured without the exit.
+  [Details](docs/commands.md#entry-alone) Every replay records its account marked
   to market at each close, set against the same benchmarks on return, drawdown and Sharpe.
   [Details](docs/commands.md#strategy-versus-benchmarks) The gate report puts these side by
   side over development dates only: the random-entry test, walk-forward (does a pick made on
@@ -254,6 +256,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] B-Xtrender in the replay: each night held positions sell on that night's flags and candidates enter in rank order, sized on the bars visible then (`asof replay run --strategy bx_trender`)
 - [x] Gate report on B-Xtrender replays: random entries drawn from the scan's pool, checked on a made-up market with a planted edge (found) and without it (not found)
 - [x] B-Xtrender on development dates: three pre-registered variants replayed and measured; none beats SPY, the holdout stays sealed
+- [x] Entry alone (`asof gate entry`): held 7 to 60 sessions, B-Xtrender's picks earn no more than random stocks from the same pool
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

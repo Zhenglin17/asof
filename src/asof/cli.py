@@ -20,6 +20,7 @@ from asof.demo.build import build
 from asof.evidence.retrieve import search
 from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
 from asof.evolve.benchmark import benchmarks
+from asof.evolve.entry import entry_test
 from asof.evolve.gate import check as gate_measure
 from asof.evolve.gate import render_report
 from asof.evolve.holdout import HoldoutError
@@ -1946,6 +1947,69 @@ def gate_null(
             f"{run_id:>5} {r.trades:>5} {r.mean:>+8.2%} {r.null_mean:>+8.2%} {r.excess:>+8.2%} "
             f"{r.z:>6.2f} {r.p_raw:>7.4f} {r.p_adjusted:>7.4f}"
         )
+
+
+@gate_app.command("entry")
+def gate_entry(
+    runs: Annotated[
+        list[int], typer.Option("--run", help="A replay run; several runs form one family.")
+    ],
+    holds: Annotated[
+        list[int], typer.Option("--hold", help="Sessions each entry is held; give several.")
+    ],
+    permutations: Annotated[
+        int | None, typer.Option("--permutations", help="Defaults to the protocol's.")
+    ] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 0,
+    current_strategy: Annotated[
+        bool,
+        typer.Option(
+            "--current-strategy",
+            help="Use today's strategy files for runs replayed under another version.",
+        ),
+    ] = False,
+    strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """Each run's entries in the protocol's development dates against random entries, both held
+    a fixed number of sessions: the exit no longer follows the real security's path, so what
+    is left is the entry. p adjusted is corrected for every (run, hold) row of this call only;
+    the interval resamples blocks of hold sessions. Dropped: fixed exit after dev (beyond),
+    real security without an exit price (unpriced)."""
+    protocol = load_protocol()
+    root = _market_root(data_dir)
+    engine = make_engine(db or default_db_path())
+    con = duckdb.connect()
+    try:
+        with Session(engine) as session:
+            cfg = _family_config(session, runs, strategies_dir, current_strategy)
+            try:
+                results = entry_test(
+                    session, con, root, runs, cfg=cfg, holds=holds, dev=protocol.dev,
+                    permutations=permutations or protocol.permutations, seed=seed,
+                )  # fmt: skip
+            except (LookupError, ValueError) as error:
+                _fail(str(error))
+    finally:
+        con.close()
+        engine.dispose()
+    typer.echo(f"{'run':>5} {'hold':>5} {'entries':>7} {'mean':>8} {'random':>8} {'excess':>8} "
+               f"{'ci low':>8} {'ci high':>8} {'sd ratio':>8} {'p':>7} {'p adj':>7} "
+               f"{'beyond':>6} {'unpriced':>8}")  # fmt: skip
+    for h in results:
+        r = h.result
+        typer.echo(
+            f"{h.run_id:>5} {h.hold:>5} {r.trades:>7} {r.mean:>+8.2%} {r.null_mean:>+8.2%} "
+            f"{r.excess:>+8.2%} {h.ci[0]:>+8.2%} {h.ci[1]:>+8.2%} {h.sd_ratio:>8.2f} "
+            f"{r.p_raw:>7.4f} {r.p_adjusted:>7.4f} {h.beyond_window:>6} {h.unpriced:>8}"
+        )
+    # the correction covers this call's cells only: another call is another family
+    typer.echo("family: " + " ".join(f"{h.run_id}:{h.hold}" for h in results))
 
 
 @gate_app.command("report")

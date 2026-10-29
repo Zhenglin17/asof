@@ -75,6 +75,8 @@ The [README](../README.md) is the short tour.
       the security it trades (`asof replay run --strategy bx_trender`)
 - [x] Random-entry null: each replay leg against random picks from the scanner's pool on
       the same dates, max-statistic correction across runs (`asof gate null`)
+- [x] Entry alone: each entry and its random picks held the same fixed number of sessions,
+      so the exit no longer follows the real stock's path (`asof gate entry`)
 - [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
       is compared with the benchmarks on return, drawdown, Sharpe and exposure
       (`asof gate compare`)
@@ -653,6 +655,37 @@ at the close (repricing the real legs the null's way moves them +0.10% a leg, ag
 strategy); random legs have no guard against an unrecorded split (48 of 109,743 pool legs on
 run 1 cross one).
 
+### Entry alone
+
+```bash
+uv run asof gate entry --run 8 --hold 7 --hold 11 --hold 19          # one run, three holds
+uv run asof gate entry --run 8 --run 9 --run 10 --hold 7 --hold 19   # every (run, hold) is one family
+```
+
+`gate null` keeps each leg's real exit date. A B-Xtrender exit follows the real stock's own path
+(its daily histogram turning red, its weekly bar falling), so a random leg inherits an exit
+timed to another stock and the excess mixes entry and exit. Here every real entry (the two
+halves of one position are one entry) buys the entry session's open and sells the open `hold`
+sessions later, and so does each random pick from the same evening's pool: what is left is
+which stock was bought. Prices, splits, spin-offs, slippage and the pool are the null's; an
+entry draws the same stocks for every hold, so holds compare entry by entry.
+
+Entries are the run's filled long decisions, not its closed trades: a position still open at
+the replay's end has no trade row, and leaving it out would pick entries by how they went on.
+B-Xtrender buys the open after its decision; every trade visible at the window's end must
+agree, or the command stops. Only B-Xtrender runs are accepted. An entry and its fixed exit
+must both lie in the development dates (`beyond` counts those whose exit does not); a real
+stock without an open on its exit session drops the entry from both sides (`unpriced`).
+`p adj` corrects over every (run, hold) row of one call; a second call with other holds is
+another family, which the last line (`family: ...`) names. `ci low` and `ci high` are a 90%
+bootstrap of the excess that resamples blocks of `hold` consecutive sessions, since entries of
+neighbouring sessions hold through mostly the same days. `sd ratio` is the spread of the real
+returns over the spread of the random ones.
+
+Known answer (`tests/evolve/test_entry_planted.py`): on a made-up market where every entry is
+followed by a drift, holds of 5 and 9 sessions find +1.7% and +2.1% an entry (p 0.005, interval
+above zero); without the drift, +0.4% and +0.2% with intervals across zero.
+
 ### Strategy versus benchmarks
 
 ```bash
@@ -824,6 +857,30 @@ legs' exit dates, which depend on each stock's own path, so the excess mixes ent
 About 3% of entries (57 of 1,804 for S1) were sized on an ATR window holding a bar whose high or
 low lies over 30% beyond its open and close (median size 0.79 of the size on a clipped ATR);
 some are real (GME 2021-01), some bad prints (NVDA 2024-06-10).
+
+```bash
+uv run asof gate entry --run 8 --run 9 --run 10 --hold 7 --hold 11 --hold 19 --hold 29 --hold 60
+```
+
+Entry alone, held a fixed number of sessions (S1's real holds: quartiles 6, 10 and 19 sessions,
+90th percentile 29; 29 and 60 were added after 7 to 19 were seen, and all 15 cells are one
+family). The run took about 25 minutes.
+
+| S1 hold | Entries | BX pick | Random | Excess | 90% interval | p adj |
+|--:|--:|--:|--:|--:|---|--:|
+| 7 | 1,801 | -0.01% | +0.33% | -0.34% | -0.85% .. +0.22% | 1.000 |
+| 11 | 1,792 | -0.15% | +0.45% | -0.60% | -1.24% .. +0.06% | 1.000 |
+| 19 | 1,780 | -0.14% | +0.73% | -0.87% | -1.69% .. +0.01% | 1.000 |
+| 29 | 1,756 | +0.25% | +1.05% | -0.80% | -1.83% .. +0.26% | 1.000 |
+| 60 | 1,677 | -0.61% | +1.37% | -1.99% | -3.46% .. -0.39% | 1.000 |
+
+S2 and S3 point the same way at every hold (S2 -0.38% to -1.80%, S3 -0.54% to -2.69%). At no
+hold does the B-Xtrender entry earn more than a random stock from its pool; an edge above about
++0.27% an entry is ruled out at 90% (uncorrected), a smaller one is not. That it does worse is
+not claimed: the test is one-sided and most intervals cross zero. The real exits do not help
+either: -0.91% a leg over random with the real exits against -0.60% at a fixed hold of 11
+sessions (S1's median hold is 10). The picks are 1.2 to 1.7 times as volatile as the pool's
+average stock. All of this is over 2020-01 to 2025-06; the holdout stays sealed.
 
 ## Layout
 
