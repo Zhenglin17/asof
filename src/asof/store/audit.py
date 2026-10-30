@@ -42,7 +42,7 @@ import yaml
 
 from asof.ingest.bars import BAR_SCHEMA
 from asof.ingest.corporate_actions import NAME_CHANGE_SCHEMA
-from asof.ingest.instrument_class import CLASS_FILE
+from asof.ingest.instrument_class import CLASS_FILE, SHELF_MIN_TICKERS
 from asof.ingest.sec_ticker_history import (
     EXCHANGE_HISTORY_PATH,
     EXCHANGE_HISTORY_SCHEMA,
@@ -74,7 +74,7 @@ from asof.store.market import (
     visible_sessions,
     visible_splits,
 )
-from asof.store.shares import implausible, market_caps, visible_shares
+from asof.store.shares import implausible, market_caps, share_facts, visible_shares
 from asof.store.spinoffs import spinoff_events
 from asof.store.universe import LIQUID_CLASSES
 
@@ -180,6 +180,7 @@ CHECKS: dict[str, CheckSpec] = dict(
             None,
             f"{_SYM}(/{_SYM})*:{_KIND}:{_DATE}(,{_DATE})*",
         ),  # fmt: skip
+        _spec("M9", "fund-class segment of a company filer", "liquid", f"{_SYM}:{_DATE}"),
         _spec("I1", "traded bars no segment owns (loss)", None, _SYM),
         _spec("I2", "two securities share an identical bar", "liquid", f"{_SYM}/{_SYM}"),
         _spec("I3", "one security traded under two symbols on one day", "liquid", _SID),
@@ -230,6 +231,8 @@ class AuditException:
     by: str
 
 
+# share counts from these forms mark an operating company (M9); funds file N-CSR / 485BPOS
+COMPANY_FORMS = frozenset({"10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "20-F/A", "40-F", "40-F/A"})
 _EXCEPTION_FIELDS = ("check", "key", "reason", "added", "by")
 
 
@@ -904,6 +907,72 @@ class _Audit:
 
     def m8(self) -> tuple[pa.Table, dict]:
         return self._conflict_rows(unresolved=False), {}
+
+    def m9(self) -> tuple[pa.Table, dict]:
+        """Fund-class segments whose CIK files company reports: a segment tagged ``etf`` or
+        ``leveraged_etf`` whose CIK, known by ``as_of``, has a share count from a 10-K, 10-Q,
+        20-F or 40-F public by then. Facebook (CIK 1326801) was tagged etf because today's SEC
+        fund table gives FB to a ProShares fund; PRTO's 2020 segment (Proteon, a 10-K filer)
+        carries a later ETF's name. A bank's ETN shelf (a CIK listing ``SHELF_MIN_TICKERS``
+        or more tickers in the SEC history up to ``as_of``) and a human override are exempt.
+
+        Blind spots: a segment without a CIK, and a company whose CIKs the shares ingest never
+        fetched (it reads the CIKs of the liquid common tier), give no row."""
+        schema = pa.schema(
+            [
+                ("key", pa.string()),
+                ("_liq", pa.bool_()),
+                ("security_id", pa.string()),
+                ("symbol", pa.string()),
+                ("valid_from", pa.date32()),
+                ("name", pa.string()),
+                ("rule", pa.string()),
+                ("cik", pa.int64()),
+            ]
+        )
+        filers = {
+            cik
+            for cik, facts in share_facts(self.root).items()
+            if any(f["form"] in COMPANY_FORMS and f["available_at"] <= self.as_of for f in facts)
+        }
+        day = self.as_of.astimezone(ET).date()
+        sec = self.con.execute(
+            f"SELECT cik, count(DISTINCT ticker) AS n FROM {_SEC} "
+            "WHERE snapshot_date >= $start AND snapshot_date <= $day GROUP BY cik",
+            {"start": SEC_HISTORY_START, "day": day},
+        )
+        shelves = {int(cik) for cik, n in sec.fetchall() if n >= SHELF_MIN_TICKERS}
+        cik_of = {
+            (seg["security_id"], seg["symbol"], seg["valid_from"]): int(seg["cik"])
+            for seg in visible_master(self.con, self.root, self.as_of).to_pylist()
+            if seg["cik"] is not None
+            and (seg["cik_available_at"] is None or seg["cik_available_at"] <= self.as_of)
+        }
+        qualified = {
+            r[0] for r in self.con.execute(f"SELECT security_id FROM {_QUAL_IDS}").fetchall()
+        }
+        rows = []
+        for r in self._q(f"SELECT * FROM {_CLASS}").to_pylist():
+            cik = cik_of.get((r["security_id"], r["symbol"], r["valid_from"]))
+            if (
+                r["class"] in ("etf", "leveraged_etf")
+                and r["rule"] != "override"
+                and cik in filers
+                and cik not in shelves
+            ):
+                rows.append(
+                    {
+                        "key": f"{r['symbol']}:{r['valid_from'].isoformat()}",
+                        "_liq": r["security_id"] in qualified,
+                        "security_id": r["security_id"],
+                        "symbol": r["symbol"],
+                        "valid_from": r["valid_from"],
+                        "name": r["name"],
+                        "rule": r["rule"],
+                        "cik": cik,
+                    }
+                )
+        return pa.Table.from_pylist(rows, schema=schema), {"shelf_ciks": len(shelves)}
 
     # -- I: identity across bars and master ------------------------------------------------------
 
@@ -1770,9 +1839,9 @@ def run_audit(
     ``CHECKS`` order. ``liquid_ids`` is the liquid-tier union (``tier_union``).
 
     ``qualified_ids`` is the same union taken over every instrument class (``classes=None``)
-    and scopes M5 only: a security whose class is unknown can never be in the liquid tier, so
-    judged against ``liquid_ids`` an unknown class would never fail the liquid gate. Defaults
-    to ``liquid_ids``.
+    and scopes M5 and M9: a security whose class is unknown (or a leveraged ETF) can never be
+    in the liquid tier, so judged against ``liquid_ids`` it would never fail the liquid gate.
+    Defaults to ``liquid_ids``.
 
     ``liquid_tier`` is the monthly tier itself (``tier_union`` rows); when given, split records
     are scoped by date (``SPLIT_LIQUID_DAYS``) rather than by the union."""

@@ -135,6 +135,7 @@ GATES: dict[str, str | None] = {
     "M6": "liquid",
     "M7": "liquid",  # old-holder segment partly copies of the label's latest holder (6-b-2)
     "M8": None,  # identity decisions the build settled: informational
+    "M9": "liquid",  # fund-class segment of a company filer
     "I1": None,
     "I2": "liquid",
     "I3": "liquid",
@@ -231,6 +232,7 @@ SAMPLE_KEYS = {
     "M6": "AAA/QQQ:dup_unlinked:2020-01-02,2020-01-03",
     "M7": "S000008:LBL:2020-01-02",
     "M8": "PPP:cik_switch_discontinuous:2020-01-07,2020-01-08,2020-01-08",
+    "M9": "FB:2020-01-02",
     "I1": "ORPH",
     "I2": "AAA/BBB",
     "I3": "S000001",

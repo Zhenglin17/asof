@@ -50,6 +50,13 @@
   reason: MAX S&P 500 4X Leveraged ETN (Bank of Montreal); in the tier 2024-04 and 2024-05.
 # Shelf ETNs that qualified for the liquid tier while unknown (audit M5, 2026-10-16). Their
 # only name is the issuing bank's SEC name, so no name rule can place them.
+- symbol: USLV
+  class: leveraged_etf
+  valid_from: 2020-01-02
+  reason: >-
+    VelocityShares 3x Long Silver ETN (Credit Suisse AG); delisted 2020-07. Was tagged etf by a
+    later fund reusing the ticker in today's SEC fund table, until the fund lookup required the
+    fund's CIK (2026-10-30); left unknown by the shelf rule since. In the tier 2 months.
 - symbol: DWT
   class: leveraged_etf
   reason: VelocityShares 3x Inverse Crude Oil ETN (Citigroup Global Markets); delisted 2020-04.

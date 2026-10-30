@@ -187,10 +187,11 @@ sized on an ATR inflated by an extreme or bad high or low (NVDA 2024-06-10 store
 | One pass over a window reading the window's end | The B-Xtrender scan computes each series once at the window's last close and is held equal to a scan run each night; a security whose symbol (or spin-off child) was recorded in the security master late is recomputed as known that night | `tests/scan/test_bx_trender.py` |
 | Sizing on prices rescaled later | A B-Xtrender entry takes its close and ATR from the bars visible at the signal night, adjusted only by the splits on file then whose ex-date has come | `tests/replay/test_replay_bx.py` |
 | Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
+| Classing an old listing by today's fund table | The SEC fund table is today's and tickers are reused (FB is a fund today, Facebook until 2022): a ticker counts as a fund only for a segment with no CIK or the fund's own; the audit lists fund-class segments of company filers | `tests/ingest/test_instrument_class.py`, `tests/store/test_audit_m9.py` |
 | A share count before its filing was public | A market cap uses the SEC share count from the day after its filing date, of the company the security belonged to that night, with the splits on file then | `tests/store/test_shares.py` |
 | Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
 
-On the real store, `asof market audit` runs 39 data checks with reviewed exceptions (the session
+On the real store, `asof market audit` runs 40 data checks with reviewed exceptions (the session
 calendar among them, against the NYSE schedule), and
 hand-checked reference histories (renames, ticker reuse, splits, spin-offs) are asserted as tests.
 

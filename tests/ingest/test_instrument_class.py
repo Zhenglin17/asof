@@ -1,25 +1,31 @@
 """Guards against a segment of the security master wearing the wrong instrument class: an ADR
 tagged preferred, a Treasury-bond ETF tagged note, a buffer ETF tagged leveraged, a SPAC unit
 tagged common, a warrant known only by its issuer's SEC name tagged common, and a segment
-named after the wrong era of a reused ticker.
+named after the wrong era of a reused ticker, and an old registrant tagged by today's fund table
+because a fund took over its ticker later.
 
 Target API (asof.ingest.instrument_class, new module):
 
     CLASSES, LOOKUPS, NASDAQ_SUFFIX, CLASS_FILE, CLASS_SCHEMA
     Rule(id, cls, symbol=None, name=None, lookup=None)        frozen dataclass
     load_rules(path) -> list[Rule]
-    Lookups(fund_symbols, ciks_by_ticker, tickers_by_cik)     frozen dataclass
+    Lookups(fund_ciks, ciks_by_ticker, tickers_by_cik)        frozen; fund_ciks: ticker -> CIK
     classify(symbol, name, cik, lookups, rules) -> (class, rule_id)
     segment_names(master, assets, sec_history) -> [(name, name_source), ...]  (master row order)
-    build_instrument_class(master, assets, sec_history, fund_symbols, rules, overrides=())
+    build_instrument_class(master, assets, sec_history, fund_ciks, rules, overrides=())
+        fund_ciks: Mapping[str, int] or an iterable of (ticker, cik) pairs
     write_instrument_class(table, market_root) -> Path
     ClassOverride(symbol, cls, reason, valid_from=None)       frozen dataclass
     load_class_overrides(path) -> list[ClassOverride]
     apply_overrides(table, overrides) -> pa.Table              class + rule="override" on matches
 
 No ``as_of`` here: the class of a segment is a property of its name and symbol, not of when it
-was observed, so there is no leakage case in this file. The read path filters segments on the
-security master's ``available_at``; this table only decorates them.
+was observed. The read path filters segments on the security master's ``available_at``; this
+table only decorates them. One input is nevertheless dated "today": ``company_tickers_mf.json``
+(the SEC fund table) is a current snapshot, and tickers get reused. The leakage-style cases at
+the end of the file guard that today's fund owner of a ticker never decides the class of an
+older segment held by a different registrant (real: FB was Facebook, CIK 1326801, 2020-01-02 to
+2022-06-09; today's fund table maps FB to fund CIK 1174610).
 
 Fake data provenance -- every name below was read off the 2026-10-05 Alpaca asset table or the
 SEC ticker history on 2026-10-08 ("real") unless marked ASSUMPTION. Assumptions must be checked
@@ -47,6 +53,12 @@ on real data by audit A6 (count of ``unknown`` segments, expected 3: RALS, RFUN,
   leveraged_etf (Bank of Montreal ETNs), NYMT -> common (New York Mortgage Trust; its preferreds
   made it a shelf). An override that matches no segment is an error: a human decision that has
   gone stale must be noticed, not silently skipped.
+- Fund-table CIKs (``fund_ciks``), read off the local ``company_tickers_mf.json`` on
+  2026-10-30: FB 1174610, TQQQ 1174610, IEI 1100663, SPCX 1719812, PALT 1924868, LMNX 1924868.
+  GGN is not in today's fund table; its CIK below is a placeholder that no test depends on.
+  Segment CIKs of the old registrants (FB 1326801, PALT 1355839, LMNX 1033905) come from the
+  security master. Real-data check: after the fix, no segment with a non-null CIK different from
+  the fund-table CIK may carry rule ``lookup_sec_funds`` (about 56 such segments before the fix).
 - FPE "First Trust Preferred Securities and Income ETF" (real name) was tagged preferred on
   2026-10-08 and qualifies for the liquid tier in 4 months: ``name_preferred`` must not fire on
   a name that contains the word ETF. PFF "iShares Preferred and Income Securities ETF" and PGX
@@ -56,7 +68,7 @@ on real data by audit A6 (count of ``unknown`` segments, expected 3: RALS, RFUN,
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -179,15 +191,19 @@ def sec_table(rows: Sequence[Snap]) -> pa.Table:
     )
 
 
-def lookups_from(pairs: Sequence[tuple[str, int]], funds: Sequence[str] = ()) -> Lookups:
-    """(ticker, cik) pairs as they would come out of the SEC history."""
+def lookups_from(
+    pairs: Sequence[tuple[str, int]],
+    funds: Mapping[str, int] | Iterable[tuple[str, int]] = (),
+) -> Lookups:
+    """(ticker, cik) pairs as they would come out of the SEC history; ``funds`` maps a ticker to
+    the fund registrant's CIK, as in today's SEC fund table."""
     by_ticker: dict[str, set[int]] = {}
     by_cik: dict[int, set[str]] = {}
     for ticker, cik in pairs:
         by_ticker.setdefault(ticker, set()).add(cik)
         by_cik.setdefault(cik, set()).add(ticker)
     return Lookups(
-        fund_symbols=frozenset(funds),
+        fund_ciks=dict(funds),
         ciks_by_ticker={t: frozenset(c) for t, c in by_ticker.items()},
         tickers_by_cik={c: frozenset(t) for c, t in by_cik.items()},
     )
@@ -232,7 +248,9 @@ def real_lookups() -> Lookups:
             ("QQ", 4242),  # ASSUMPTION: a 2-letter prefix must not count
             ("QQQQW", 4242),
         ],
-        funds=["TQQQ", "GGN", "IEI", "SPCX"],  # real: TQQQ, and a stale SPCX fund row (4a)
+        # real fund-table CIKs (2026-10-30): TQQQ, IEI, and a stale SPCX fund row (4a);
+        # GGN is not in today's fund table, its CIK is a placeholder
+        funds={"TQQQ": 1174610, "GGN": 1, "IEI": 1100663, "SPCX": 1719812},
     )
 
 
@@ -449,7 +467,7 @@ def test_classify_real_examples(
 def test_classify_first_match_wins_leveraged_before_fund_lookup(
     rules: list[Rule], real_lookups: Lookups
 ) -> None:
-    assert "TQQQ" in real_lookups.fund_symbols
+    assert "TQQQ" in real_lookups.fund_ciks
     assert classify("TQQQ", "ProShares UltraPro QQQ", None, real_lookups, rules) == (
         "leveraged_etf",
         "name_leveraged",
@@ -463,7 +481,7 @@ def test_classify_common_stock_in_name_beats_fund_table(
 ) -> None:
     # real: SPCX sits on a stale SEC fund-table row (found in 4a), but Alpaca names it
     # "Space Exploration Technologies Corp. Class A Common Stock"
-    assert "SPCX" in real_lookups.fund_symbols
+    assert "SPCX" in real_lookups.fund_ciks
     name = "Space Exploration Technologies Corp. Class A Common Stock"
     assert classify("SPCX", name, None, real_lookups, rules) == (
         "common",
@@ -660,7 +678,7 @@ def test_nasdaq_suffix_shape_is_exactly_four_letters_plus_wrup(symbol: str) -> N
 
 def test_sec_funds_lookup_is_exact_symbol_membership() -> None:
     only = [Rule(id="f", cls="etf", lookup="sec_funds")]
-    lookups = lookups_from([], funds=["IEI"])
+    lookups = lookups_from([], funds={"IEI": 1100663})
     assert classify("IEI", "", None, lookups, only) == ("etf", "f")
     assert classify("IEIX", "", None, lookups, only) == ("unknown", "none")
     assert classify("iei", "", None, lookups, only) == ("unknown", "none")
@@ -903,7 +921,9 @@ def world() -> dict[str, Any]:
             (D(2020, 1, 1), "AAPL", 320193, "Apple Inc."),
         ]
     )
-    return {"master": master, "assets": assets, "sec": sec, "funds": ["TQQQ", "FUNDONLY"]}
+    # FUNDONLY: ASSUMPTION, a fund-table-only ticker; its master row has no CIK
+    funds = {"TQQQ": 1174610, "FUNDONLY": 9}
+    return {"master": master, "assets": assets, "sec": sec, "funds": funds}
 
 
 def build(world: dict[str, Any], rules: list[Rule]) -> pa.Table:
@@ -987,11 +1007,14 @@ def test_build_empty_master(rules: list[Rule]) -> None:
     assert out.num_rows == 0
 
 
-def test_build_accepts_any_iterable_of_fund_symbols(rules: list[Rule]) -> None:
+def test_build_accepts_any_iterable_of_fund_ticker_cik_pairs(rules: list[Rule]) -> None:
     master = master_table([("f", "FUNDONLY", D(2020, 1, 1), None, None)])
     out = build_instrument_class(
-        master, assets_table([]), sec_table([]), (s for s in ["FUNDONLY"]), rules
+        master, assets_table([]), sec_table([]), (p for p in [("FUNDONLY", 9)]), rules
     )
+    assert out.column("class").to_pylist() == ["etf"]
+    # a mapping works the same way
+    out = build_instrument_class(master, assets_table([]), sec_table([]), {"FUNDONLY": 9}, rules)
     assert out.column("class").to_pylist() == ["etf"]
 
 
@@ -1430,3 +1453,115 @@ def test_build_with_a_stale_override_fails(world: dict[str, Any], rules: list[Ru
             rules,
             overrides=[ClassOverride("DGAZ", "leveraged_etf", "delisted 2020-07")],
         )
+
+
+# =============================================================================================
+# sec_funds is today's table: a reused ticker must not tag an older, different registrant
+# =============================================================================================
+
+FUND_ONLY = [Rule(id="f", cls="etf", lookup="sec_funds")]
+# real (2026-10-30 fund table / security master): FB today belongs to fund CIK 1174610; the
+# 2020-01-02..2022-06-09 FB segment is Facebook Inc under CIK 1326801
+FB_FUND_CIK = 1174610
+FACEBOOK_CIK = 1326801
+
+
+def test_lookups_carry_fund_ciks_as_a_dict() -> None:
+    lookups = ic.build_lookups(sec_table([]), [("FB", FB_FUND_CIK), ("TQQQ", 1174610)])
+    assert lookups.fund_ciks == {"FB": FB_FUND_CIK, "TQQQ": 1174610}
+    assert ic.build_lookups(sec_table([]), {"IEI": 1100663}).fund_ciks == {"IEI": 1100663}
+    assert ic.build_lookups(sec_table([]), []).fund_ciks == {}
+    assert not hasattr(lookups, "fund_symbols")
+
+
+def test_sec_funds_reused_ticker_with_another_cik_is_not_a_fund(rules: list[Rule]) -> None:
+    lookups = lookups_from([], funds={"FB": FB_FUND_CIK})
+    got = classify("FB", "Facebook Inc", FACEBOOK_CIK, lookups, rules, name_source="sec")
+    assert got != ("etf", "lookup_sec_funds")
+    # falls through to the next rules: "inc" in the issuer name
+    assert got == ("common", "name_common")
+    # the fund rule alone does not fire either
+    assert classify("FB", "", FACEBOOK_CIK, lookups, FUND_ONLY) == ("unknown", "none")
+
+
+@pytest.mark.parametrize(
+    ("symbol", "name", "segment_cik", "fund_cik"),
+    [
+        # real CIKs; names ASSUMPTION spellings of the SEC issuer names
+        ("PALT", "PALTALK, INC.", 1355839, 1924868),
+        ("LMNX", "LUMINEX CORP", 1033905, 1924868),
+    ],
+    ids=["PALT", "LMNX"],
+)
+def test_sec_funds_other_real_reused_tickers_fall_through(
+    rules: list[Rule], symbol: str, name: str, segment_cik: int, fund_cik: int
+) -> None:
+    lookups = lookups_from([], funds={symbol: fund_cik})
+    cls, rule_id = classify(symbol, name, segment_cik, lookups, rules, name_source="sec")
+    assert rule_id != "lookup_sec_funds"
+    assert cls == "common"
+
+
+def test_sec_funds_matching_cik_or_no_cik_is_a_fund(rules: list[Rule]) -> None:
+    lookups = lookups_from([], funds={"FB": FB_FUND_CIK})
+    assert classify("FB", "", FB_FUND_CIK, lookups, FUND_ONLY) == ("etf", "f")
+    assert classify("FB", "", None, lookups, FUND_ONLY) == ("etf", "f")
+    # the same through the real rule file, with no usable name
+    assert classify("FB", "", FB_FUND_CIK, lookups, rules, name_source="none") == (
+        "etf",
+        "lookup_sec_funds",
+    )
+    assert classify("FB", "", None, lookups, rules, name_source="none") == (
+        "etf",
+        "lookup_sec_funds",
+    )
+
+
+def test_sec_funds_ticker_absent_from_the_table_never_matches() -> None:
+    lookups = lookups_from([], funds={"FB": FB_FUND_CIK})
+    # the segment carries the fund registrant's CIK, but the ticker is not in the fund table
+    assert classify("QQQX", "", FB_FUND_CIK, lookups, FUND_ONLY) == ("unknown", "none")
+    assert classify("QQQX", "", None, lookups, FUND_ONLY) == ("unknown", "none")
+    assert classify("FB", "", None, EMPTY_LOOKUPS, FUND_ONLY) == ("unknown", "none")
+
+
+def fb_world() -> tuple[pa.Table, pa.Table, pa.Table]:
+    """Two securities under FB: Facebook (closed, SEC-named) and today's fund (open, no Alpaca
+    row, so it falls back to the only SEC name anywhere and must still be the fund)."""
+    master = master_table(
+        [
+            ("fb-facebook", "FB", D(2020, 1, 2), D(2022, 6, 9), FACEBOOK_CIK),
+            ("fb-fund", "FB", D(2025, 3, 3), None, FB_FUND_CIK),  # ASSUMPTION: listing date
+        ]
+    )
+    sec = sec_table(
+        [
+            (D(2020, 6, 1), "FB", FACEBOOK_CIK, "Facebook Inc"),
+            (D(2021, 6, 1), "FB", FACEBOOK_CIK, "Facebook Inc"),
+        ]
+    )
+    return master, assets_table([]), sec
+
+
+def test_build_old_registrant_of_a_reused_fund_ticker_is_not_etf(rules: list[Rule]) -> None:
+    master, assets, sec = fb_world()
+    out = build_instrument_class(master, assets, sec, {"FB": FB_FUND_CIK}, rules)
+    rows = {r["security_id"]: r for r in out.to_pylist()}
+    old, new = rows["fb-facebook"], rows["fb-fund"]
+    assert (old["name"], old["name_source"]) == ("Facebook Inc", "sec")
+    assert old["class"] == "common"
+    assert old["rule"] != "lookup_sec_funds"
+    # the fund segment, whose CIK matches the fund table, stays a fund
+    assert (new["class"], new["rule"]) == ("etf", "lookup_sec_funds")
+
+
+def test_build_old_segment_class_does_not_depend_on_todays_fund_table(rules: list[Rule]) -> None:
+    """Leakage-style: today's fund table knows FB only because a fund took the ticker after
+    Facebook left it. The Facebook segment must classify the same with or without that row."""
+    master, assets, sec = fb_world()
+    without = build_instrument_class(master, assets, sec, [], rules).to_pylist()
+    with_fund = build_instrument_class(master, assets, sec, [("FB", FB_FUND_CIK)], rules)
+    assert with_fund.to_pylist()[0] == without[0]
+    # a generator of pairs gives the same table as a mapping
+    gen = build_instrument_class(master, assets, sec, (p for p in [("FB", FB_FUND_CIK)]), rules)
+    assert gen.to_pylist() == with_fund.to_pylist()

@@ -172,6 +172,17 @@ def _m5(w: MetaWorld) -> None:
     ]
 
 
+def _m9(w: MetaWorld) -> None:
+    # tests/store/test_audit_m9.py shape: BBB tagged etf while its CIK files 10-Qs
+    from tests.store.test_audit_shares import fact
+
+    w.segs = [
+        with_fields(s, cls="etf", rule="lookup_sec_funds") if s.symbol == "BBB" else s
+        for s in w.segs
+    ]
+    w.shares = [fact("BBB", date(2019, 12, 27), 2e8)]
+
+
 def _m6(w: MetaWorld) -> None:
     w.conflicts = [conflict("dup_unlinked", ["AAA", "QQQ"], [DAYS[0], DAYS[1]], "2 identical days")]
 
@@ -350,6 +361,7 @@ BROKEN: dict[str, Callable[[MetaWorld], None]] = {
     "M6": _m6,
     "M7": _m7,
     "M8": _m8,
+    "M9": _m9,
     "I1": _i1,
     "I2": _i2,
     "I3": _i3,

@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
@@ -187,9 +187,14 @@ class Rule:
 
 @dataclass(frozen=True)
 class Lookups:
-    """What the SEC tables know: fund tickers, and which tickers share a CIK."""
+    """What the SEC tables know: each fund ticker's registrant, and which tickers share a CIK.
 
-    fund_symbols: frozenset[str]
+    The fund table is today's snapshot and tickers are reused: FB is a ProShares fund (CIK
+    1174610) today, Facebook (CIK 1326801) until 2022-06-09. ``fund_ciks`` keeps the registrant
+    so an older segment under another CIK is not read as today's fund.
+    """
+
+    fund_ciks: dict[str, int]
     ciks_by_ticker: dict[str, frozenset[int]]
     tickers_by_cik: dict[int, frozenset[str]]
 
@@ -285,7 +290,8 @@ def classify(
             if lowered and _compiled(rule.name).search(lowered):
                 return rule.cls, rule.id
         elif rule.lookup == "sec_funds":
-            if symbol in lookups.fund_symbols:
+            fund_cik = lookups.fund_ciks.get(symbol)
+            if fund_cik is not None and (cik is None or cik == fund_cik):
                 return rule.cls, rule.id
         elif rule.lookup == "nasdaq_suffix":
             cls = _nasdaq_suffix_class(symbol, lookups)
@@ -300,7 +306,9 @@ def classify(
     return NO_MATCH
 
 
-def build_lookups(sec_history: pa.Table, fund_symbols: Iterable[str]) -> Lookups:
+def build_lookups(
+    sec_history: pa.Table, fund_ciks: Mapping[str, int] | Iterable[tuple[str, int]]
+) -> Lookups:
     by_ticker: dict[str, set[int]] = defaultdict(set)
     by_cik: dict[int, set[str]] = defaultdict(set)
     for ticker, cik in zip(
@@ -311,7 +319,7 @@ def build_lookups(sec_history: pa.Table, fund_symbols: Iterable[str]) -> Lookups
         by_ticker[ticker].add(cik)
         by_cik[cik].add(ticker)
     return Lookups(
-        fund_symbols=frozenset(fund_symbols),
+        fund_ciks=dict(fund_ciks),
         ciks_by_ticker={t: frozenset(c) for t, c in by_ticker.items()},
         tickers_by_cik={c: frozenset(t) for c, t in by_cik.items()},
     )
@@ -409,12 +417,12 @@ def build_instrument_class(
     master: pa.Table,
     assets: pa.Table,
     sec_history: pa.Table,
-    fund_symbols: Iterable[str],
+    fund_ciks: Mapping[str, int] | Iterable[tuple[str, int]],
     rules: Sequence[Rule],
     overrides: Sequence[ClassOverride] = (),
 ) -> pa.Table:
     """One row per master segment, in master order; ``overrides`` are applied last."""
-    lookups = build_lookups(sec_history, fund_symbols)
+    lookups = build_lookups(sec_history, fund_ciks)
     names = segment_names(master, assets, sec_history)
     classes: list[str] = []
     hits: list[str] = []
@@ -497,7 +505,7 @@ def build_from_store(
             "status": pa.array([a.status for a in loaded], pa.string()),
         }
     )
-    funds = load_sec_listings(sec_dir).funds
+    funds = {ticker: listing.cik for ticker, listing in load_sec_listings(sec_dir).funds.items()}
     return build_instrument_class(master, assets, history, funds, rules, overrides)
 
 

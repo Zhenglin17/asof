@@ -3,7 +3,10 @@
 # Each rule has an `id`, a `class`, and exactly one matcher:
 #   symbol: regular expression matched against the whole symbol (Alpaca spelling, e.g. BAC.PRB)
 #   name:   regular expression searched in the lower-cased segment name
-#   lookup: sec_funds      -> symbol listed in the SEC fund table (company_tickers_mf.json)
+#   lookup: sec_funds      -> symbol listed in the SEC fund table (company_tickers_mf.json) and
+#                             the segment has no CIK or the fund row's CIK: the table is today's and
+#                             tickers are reused (FB was Facebook, CIK 1326801, until 2022-06-09;
+#                             today it is a ProShares fund, CIK 1174610)
 #           nasdaq_suffix  -> 5-letter symbol ending in W/R/U/P whose issuer (same CIK in SEC
 #                             history) also lists a sibling ticker: a prefix of at least 3 letters
 #                             (ADILW <- ADIL, EXEEW <- EXE) or a 5-letter share class on the same

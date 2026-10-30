@@ -118,3 +118,22 @@
   reason: "INBX 05-29 / 05-30 bars equal INXBV's / INXB's (Inhibrx Biosciences when-issued, 13.92 / 15.86; the old Inhibrx traded near 31 as INBXV); old Inhibrx's 2020-2024 history is not in the store"
   added: 2026-10-19
   by: greyson
+
+# M9: fund-class segments whose CIK files company reports. The fund-table cause (FB, LAZR, ...)
+# is fixed in the class build (2026-10-30); these three are a different accident: a segment's
+# CIK or name belongs to another era of a reused ticker. Small, recorded rather than fixed.
+- check: M9
+  key: "CRCG:2025-08-11"
+  reason: "2X Long CRCL ETF, etf is correct; the segment carries CIK 1862935 (InFinT / Currenc, which trades as CURR)"
+  added: 2026-10-30
+  by: greyson
+- check: M9
+  key: "MIC:2021-10-01"
+  reason: "one open segment holds Macquarie Infrastructure (CIK 1845290, delisted 2022-07) and today's Corgi MU 2x ETF; an identity split, not a class fix"
+  added: 2026-10-30
+  by: greyson
+- check: M9
+  key: "PRTO:2020-01-02"
+  reason: "Proteon Therapeutics' last week (CIK 1359931) named after the later RCN Pareto ETF on the ticker"
+  added: 2026-10-30
+  by: greyson
