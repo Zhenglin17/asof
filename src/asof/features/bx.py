@@ -159,6 +159,7 @@ COUNT_COLUMNS = ["daily_bars", "weekly_bars", "monthly_bars"]
 COMPLETE_COLUMNS = ["weekly_complete_on", "monthly_complete_on"]
 # Everything one series determines; while computed the complete_on dates are day ordinals.
 _SERIES_COLUMNS = BX_COLUMNS + PREV_COLUMNS + COUNT_COLUMNS + COMPLETE_COLUMNS
+BLANK = ("blank",)  # a spin-off state: undecided at the session, every value NaN
 
 
 def bx_features(
@@ -227,11 +228,29 @@ def _bx_columns(frame: pd.DataFrame, l1: int, l2: int, l3: int) -> np.ndarray:
 def _apply_spinoffs(
     out: pd.DataFrame, idx: np.ndarray, events: pd.DataFrame, l1: int, l2: int, l3: int
 ) -> None:
-    """Rewrite one security's rows ``idx`` of ``out`` in place for its spin-off events.
+    """Rewrite one security's rows ``idx`` of ``out`` in place for its spin-off events."""
+    for state, members in spinoff_states(out, idx, events).items():
+        if state == BLANK:
+            out.loc[members, _SERIES_COLUMNS] = np.nan
+            continue
+        part = state_series(out, idx, state)
+        values = pd.DataFrame(
+            _bx_columns(part, l1, l2, l3), index=part.index, columns=_SERIES_COLUMNS
+        )
+        out.loc[members, _SERIES_COLUMNS] = values.loc[members].to_numpy()
+        # the ex-date may not be a session
+        out.loc[members, "bx_since"] = _as_dates(pd.Series(part["session_date"]))[0]
 
-    Each session gets a state from the events with E <= session: blank while one of them is
+
+def spinoff_states(
+    out: pd.DataFrame, idx: np.ndarray, events: pd.DataFrame
+) -> dict[tuple, list[int]]:
+    """One security's rows ``idx`` of ``out`` grouped by the series their values come from.
+
+    Each session gets a state from the events with E <= session: ``BLANK`` while one of them is
     undecided at that session, else (series start, the adjust factors in force). Sessions
-    sharing a state are computed together on that state's series."""
+    before every ex-date are left out: the plain values stand. Sessions sharing a state are
+    computed together on that state's series (``state_series``)."""
     statuses = events["status"].tolist()
     known_on = [
         None if status == "pending" or pd.isna(k) else _as_dates(pd.Series([k]))[0]
@@ -251,31 +270,28 @@ def _apply_spinoffs(
         if not live:
             continue  # before every ex-date: the plain values stand
         if any(known is None or day < known for _, _, _, known in live):
-            states.setdefault(("blank",), []).append(int(i))
+            states.setdefault(BLANK, []).append(int(i))
             continue
         start = max([ex for ex, status, _, _ in live if status == "restart"], default=first)
-        factors = tuple(
+        in_force = tuple(
             (ex, f) for ex, status, f, _ in live if status == "adjust" and ex > start and f
         )
-        states.setdefault((start, factors), []).append(int(i))
+        states.setdefault((start, in_force), []).append(int(i))
+    return states
 
-    for state, members in states.items():
-        if state == ("blank",):
-            out.loc[members, _SERIES_COLUMNS] = np.nan
-            continue
-        start, factors = state
-        part = out.loc[idx].copy()
-        part = part[[d >= start for d in _as_dates(part["session_date"])]]
-        part_days = _as_dates(part["session_date"])
-        for ex, factor in factors:
-            before = np.array([d < ex for d in part_days])
-            for column in PRICES:
-                part.loc[before, column] = part.loc[before, column] * factor
-        values = pd.DataFrame(
-            _bx_columns(part, l1, l2, l3), index=part.index, columns=_SERIES_COLUMNS
-        )
-        out.loc[members, _SERIES_COLUMNS] = values.loc[members].to_numpy()
-        out.loc[members, "bx_since"] = part_days[0]  # the ex-date may not be a session
+
+def state_series(out: pd.DataFrame, idx: np.ndarray, state: tuple) -> pd.DataFrame:
+    """The rows ``idx`` of ``out`` from the state's series start on (the ex-date may not be a
+    session), with the prices before each adjust ex-date multiplied by its factor."""
+    start, factors = state
+    part = out.loc[idx].copy()
+    part = part[[d >= start for d in _as_dates(part["session_date"])]]
+    part_days = _as_dates(part["session_date"])
+    for ex, factor in factors:
+        before = np.array([d < ex for d in part_days])
+        for column in PRICES:
+            part.loc[before, column] = part.loc[before, column] * factor
+    return part
 
 
 def _require_one_row_per_session(daily: pd.DataFrame) -> None:
