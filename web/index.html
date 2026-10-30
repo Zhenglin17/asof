@@ -138,6 +138,25 @@ h2 { font-size: 28px; letter-spacing: -0.02em; margin: 0 0 6px; font-weight: 650
 /* lab controls */
 .controls { display: flex; flex-wrap: wrap; gap: 14px 26px; align-items: flex-end; margin-bottom: 16px; }
 .control label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; letter-spacing: 0.02em; }
+.funnel { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+@media (max-width: 900px) { .funnel { grid-template-columns: 1fr; } }
+.funnel button {
+  text-align: left; font: inherit; color: inherit; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--ring); border-radius: 14px; padding: 12px 14px;
+}
+.funnel button[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--llm); }
+.funnel .step { font-size: 12.5px; color: var(--muted); }
+.funnel .name { font-weight: 620; margin: 2px 0 6px; }
+.funnel .nums { display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.funnel .nums b { font-size: 21px; font-weight: 650; }
+.funnel .nums small { color: var(--muted); font-size: 12px; }
+.funnel .gap { margin-top: 6px; font-size: 13px; color: var(--ink-2); }
+.funnel .tag { display: inline-block; font-size: 11.5px; padding: 1px 7px; border-radius: 999px; background: var(--mark); color: var(--ink); margin-left: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chips span { font-size: 13px; padding: 4px 9px; border-radius: 8px; background: var(--surface-2); font-variant-numeric: tabular-nums; }
+.chips span small { color: var(--muted); margin-left: 4px; }
+.chips span.hit { background: var(--mark); box-shadow: 0 0 0 1px var(--base); font-weight: 620; }
+.era { margin-top: 72px; padding-top: 28px; border-top: 1px solid var(--ring); }
 .seg { display: inline-flex; background: var(--surface-2); border-radius: 10px; padding: 3px; border: 1px solid var(--ring); }
 .seg button {
   border: 0; background: transparent; color: var(--ink-2); font: inherit; font-size: 13.5px;
@@ -272,8 +291,10 @@ footer a { color: var(--ink-2); }
   <div class="wrap">
     <a class="brand" href="#top">asof <span>· point-in-time market agent</span></a>
     <div class="links">
+      <a href="#findings">Findings</a>
+      <a class="opt" href="#bx">Rules</a>
       <a href="#lab">Lab</a>
-      <a href="#decisions">Decisions</a>
+      <a class="opt" href="#decisions">Decisions</a>
       <a class="opt" href="#time">Time machine</a>
       <a class="opt" href="#leakage">Leakage</a>
       <a href="https://github.com/Zhenglin17/asof">GitHub</a>
@@ -286,7 +307,7 @@ footer a { color: var(--ink-2); }
   <div class="wrap">
     <div class="eyebrow">Evidence-grounded · replayable · no look-ahead</div>
     <h1>A point-in-time market agent, with receipts.</h1>
-    <p class="lede">Replayed evening by evening, it scans for post-earnings gaps, a language model reads the filing behind each one and answers take or pass, and code checks that every claim quotes, word for word, a passage that was public at that instant. Below: real replays, every cited judgement, and the guards against seeing the future.</p>
+    <p class="lede">A research rig that may only read what was public at each moment. Trading ideas are replayed evening by evening and compared with fair baselines; a language model that reads filings must quote, word for word, a passage public at that instant. Below: what the tests found (so far, no timing edge), every cited judgement, and the guards against seeing the future.</p>
     <div class="counters">
       <div class="counter"><b data-count="judgements">–</b><span id="judged-label">candidates judged in the demo window</span></div>
       <div class="counter"><b data-count="quotes">–</b><span>quotes checked verbatim against the filing</span></div>
@@ -302,6 +323,51 @@ footer a { color: var(--ink-2); }
 </header>
 
 <main class="wrap">
+  <section class="block" id="findings">
+    <h2>Does the timing rule add anything?</h2>
+    <p class="sub">One rule, frozen on 2026-10-29 after at least 18 exploratory versions on the seven biggest tech stocks: buy when the weekly and daily B-Xtrender histograms turn up, the daily one at or above zero, and the weekly THT trend is green; sell on its exit signals. Shown is the best of its eight frozen variants on every list. Each line below is set against the same list held throughout and re-weighted on the same days the rule trades: the only difference is when the rule is in or out. Equal weights, 5 bps a trade, 2020-02-03 to 2025-06-30 (development dates only).</p>
+    <div class="funnel" id="funnel-steps"></div>
+    <div class="card">
+      <div class="legend" id="fn-legend"></div>
+      <div class="chart" id="fn-chart"></div>
+      <p class="note" id="fn-note"></p>
+    </div>
+  </section>
+
+  <section class="block" id="defence">
+    <h2>The one place it looked like it helped</h2>
+    <p class="sub">Deepest fall inside each sell-off, on the top-20 list as known each January. In 2022 the rule fell 21% against holding's 29%, but its trend filter needs weekly history, and until 2022-04-18 it could not hold Microsoft while the held list did. From that date, with every name tradable, it fell about as far as holding. In the 2020 crash it fell about as much; in the 2025 tariff drop it fell more, on all three lists.</p>
+    <div class="card">
+      <div class="chart short" id="dd-chart"></div>
+    </div>
+  </section>
+
+  <section class="block" id="pit">
+    <h2>A point-in-time trap, caught on the way</h2>
+    <p class="sub">The SEC publishes its fund ticker table as of today, without dates, and tickers are reused. Today FB is a ProShares fund; until 2022 it was Facebook. Classed by today's table, Facebook was an ETF from 2020-01 to 2022-06, so no stock scan ever saw it and the top-20 list had a hole at number 5. The fix: a ticker counts as a fund only when the listing has no company id (CIK) or the fund's own; an audit now lists fund-class listings of companies that file 10-Ks.</p>
+    <div class="card">
+      <div class="eyebrow" id="pit-head"></div>
+      <div class="chips" id="pit-list"></div>
+      <p class="note">Market cap = SEC share count public by that night × that night's close. Visa and Berkshire Hathaway report no all-class share count and are left out, so the 19th and 20th names here would rank lower in a full list.</p>
+    </div>
+  </section>
+
+  <section class="block" id="bx">
+    <h2>The first rule set, over the whole market</h2>
+    <p class="sub">Three pre-registered B-Xtrender variants traded every liquid US common stock, sized by risk, marked to market each close, against buying and holding SPY and QQQ with dividends reinvested. None beat SPY, so none was run on the sealed holdout year (2025-07 to 2026-06).</p>
+    <div class="card">
+      <div class="legend" id="bx-legend"></div>
+      <div class="chart" id="bx-chart"></div>
+      <p class="note" id="bx-note"></p>
+    </div>
+  </section>
+
+  <div class="era">
+    <div class="eyebrow">Earlier</div>
+    <h2>Earnings gaps and an LLM judge</h2>
+    <p class="sub">The first strategy: after an earnings gap, a model reads the filing and answers take or pass, quoting its sources. Kept here because every judgement can be traced to the passage it rests on.</p>
+  </div>
+
   <section class="block" id="lab">
     <h2>Strategy lab</h2>
     <p class="sub">Change how positions are managed and how sure the model must be. Every combination below was replayed beforehand, evening by evening, by the real pipeline; nothing on this page is simulated in the browser.</p>
@@ -435,7 +501,7 @@ function el(tag, attrs = {}, ...kids) {
 }
 
 async function load() {
-  const names = ["meta", "runs", "decisions", "chunks", "timeline", "entities"];
+  const names = ["meta", "runs", "decisions", "chunks", "timeline", "entities", "funnel", "bx_dev"];
   const got = await Promise.all(names.map(n => fetch(`data/${n}.json`).then(r => {
     if (!r.ok) throw new Error(`data/${n}.json: ${r.status}`);
     return r.json();
@@ -454,7 +520,7 @@ document.getElementById("theme").addEventListener("click", () => {
   root.setAttribute("data-theme", root.getAttribute("data-theme") === "dark" ? "light" : "dark");
   try { localStorage.setItem("asof-theme", root.getAttribute("data-theme")); } catch (e) { /* storage blocked */ }
   applyThemeLabel();
-  if (D) { renderLab(true); renderLong(); renderScatter(); drawSweep(); }
+  if (D) { renderFunnel(); renderDefence(); renderBx(); renderLab(true); renderLong(); renderScatter(); drawSweep(); }
 });
 applyThemeLabel();
 
@@ -511,6 +577,103 @@ function drawSweep() {
   sweepRaf = requestAnimationFrame(tick);
 }
 let sweepRaf = 0;
+
+/* ---------- findings ---------- */
+const STEPS = [
+  ["mag7", "Step 1", "The seven big tech stocks", "picked today, in sample"],
+  ["all", "Step 2", "Top 20 by market cap, as known each January", ""],
+  ["ex7", "Step 3", "The same top 20 without the seven", ""],
+];
+let fnStep = "mag7";
+const maxDD = v => { let peak = -Infinity, dd = 0; for (const x of v) { peak = Math.max(peak, x); dd = Math.min(dd, x / peak - 1); } return dd; };
+const pts = (dates, v) => dates.map((d, i) => [d, v[i]]);
+function legend(id, items) {
+  document.getElementById(id).replaceChildren(...items.map(([c, label, dash]) =>
+    el("span", {}, el("i", { class: "line", style: `background:${dash ? `repeating-linear-gradient(90deg,${c} 0 4px,transparent 4px 7px)` : c}` }), label)));
+}
+// the gap between the two totals as printed, so the cards add up for a reader
+const fnGap = F => Math.round((F.strategy.at(-1) - 1) * 100) - Math.round((F.hold_same.at(-1) - 1) * 100);
+function renderFunnel() {
+  const box = document.getElementById("funnel-steps");
+  box.replaceChildren(...STEPS.map(([k, step, name, tag]) => {
+    const F = D.funnel[k], s = F.strategy.at(-1) - 1, h = F.hold_same.at(-1) - 1, gap = fnGap(F);
+    const b = el("button", { type: "button", "aria-pressed": String(k === fnStep) },
+      el("div", { class: "step" }, step),
+      el("div", { class: "name" }, name, ...(tag ? [el("span", { class: "tag" }, tag)] : [])),
+      el("div", { class: "nums" }, el("span", {}, el("b", {}, fmtPct(s, 0)), el("small", {}, " rule")), el("span", {}, el("b", {}, fmtPct(h, 0)), el("small", {}, " held"))),
+      el("div", { class: "gap" }, gap === 0 ? "Even with holding" : `${Math.abs(gap)} point${Math.abs(gap) === 1 ? "" : "s"} ${gap > 0 ? "ahead of" : "behind"} holding`));
+    b.addEventListener("click", () => { fnStep = k; renderFunnel(); });
+    return b;
+  }));
+  const F = D.funnel[fnStep], axis = axisStyle();
+  const lines = [["Rule", F.strategy, css("--llm"), 2], ["Same list held, re-weighted on the rule's days", F.hold_same, css("--base"), 1.5], ["SPY, price only", F.spy, css("--spy"), 1.5]];
+  legend("fn-legend", lines.map(([n, , c]) => [c, n]));
+  charts.fn.setOption({
+    grid: { left: 52, right: 18, top: 10, bottom: 26 },
+    tooltip: tooltip(v => fmtPct(v - 1, 0)),
+    xAxis: { type: "time", ...axis, splitLine: { show: false } },
+    yAxis: { type: "log", logBase: 2, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v - 1, 0) } },
+    series: lines.map(([name, v, c, w]) => ({ name, type: "line", showSymbol: false, lineStyle: { width: w, color: c }, itemStyle: { color: c }, data: pts(F.dates, v) })),
+  }, true);
+  const n = {
+    mag7: "On the seven, where the rule was shaped, it matched holding on return and fell less (",
+    all: "On a list knowable at the time, a third of it the seven, it matched holding (",
+    ex7: `On the names it was not shaped on, it trailed holding by ${-fnGap(F)} points (`,
+  }[fnStep];
+  document.getElementById("fn-note").textContent = n +
+    `largest fall ${fmtPct(maxDD(F.strategy), 0)} vs ${fmtPct(maxDD(F.hold_same), 0)}). Bought each January and left alone, the list made ${fmtPct(F.hold_yearly.at(-1) - 1, 0)}. ` +
+    `The total depends on the start: an earlier run on the seven begun on 2020-01-02 shows +687%, being up 28% by the close of 2020-02-03 and carrying those positions on. ` +
+    `These are exploratory runs outside the replay pipeline, with no pass mark set in advance; the rule's exploration also looked at 2025-07 to 2025-12, inside the sealed holdout year.`;
+}
+const EPISODES = [["2020 crash", "2020-02-01", "2020-04-30"], ["2022 bear", "2022-01-01", "2022-12-31"], ["2025 tariffs", "2025-03-01", "2025-06-30"], ["From 2022-04-18, all names tradable", "2022-04-18", "2025-06-30"]];
+function renderDefence() {
+  const F = D.funnel.all, axis = axisStyle();
+  const dd = v => EPISODES.map(([, a, b]) => maxDD(v.filter((_, i) => F.dates[i] >= a && F.dates[i] <= b)));
+  const series = [["Rule", F.strategy, css("--llm")], ["Held, same days", F.hold_same, css("--base")], ["SPY, price only", F.spy, css("--spy")]];
+  charts.dd.setOption({
+    grid: { left: 52, right: 18, top: 28, bottom: 26 },
+    legend: { top: 0, right: 0, textStyle: { color: css("--ink-2"), fontSize: 12 }, itemWidth: 12, itemHeight: 8 },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, backgroundColor: css("--surface"), borderColor: css("--ring"), textStyle: { color: css("--ink"), fontSize: 12 }, valueFormatter: v => fmtPct(v, 0) },
+    xAxis: { type: "category", data: EPISODES.map(e => e[0]), ...axis, splitLine: { show: false } },
+    yAxis: { type: "value", ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v, 0) } },
+    series: series.map(([name, v, c]) => ({ name, type: "bar", barGap: "10%", itemStyle: { color: c, borderRadius: [0, 0, 3, 3] },
+      label: { show: true, position: "bottom", color: css("--ink-2"), fontSize: 11, formatter: p => fmtPct(p.value, 0) }, data: dd(v) })),
+  }, true);
+}
+function renderPit() {
+  const L = D.funnel.list_2020;
+  document.getElementById("pit-head").textContent = `Top 20 US common stocks by market cap, as known on ${D.funnel.pick_night_2020}, in $ billions`;
+  document.getElementById("pit-list").replaceChildren(...L.map(r =>
+    el("span", { class: r.symbol === "FB" ? "hit" : "", title: r.symbol === "FB" ? "Missing before the fix" : "" }, `${r.rank}. ${r.symbol}`, el("small", {}, fmtInt(r.cap_bn)))));
+}
+function renderBx() {
+  const B = D.bx_dev, axis = axisStyle(), dates = B.runs.S1.dates;
+  const spyKey = Object.keys(B).find(k => k.startsWith("SPY")), qqqKey = Object.keys(B).find(k => k.startsWith("QQQ"));
+  const lines = [
+    ["S1: weekly and daily histograms turn up", B.runs.S1.equity, css("--llm"), 2, false],
+    ["S2: and the monthly bar rose (cash until 2023)", B.runs.S2.equity, css("--nocall"), 1.5, false],
+    ["S3: new entries only while SPY is above its 200-day mean", B.runs.S3.equity, css("--base"), 1.5, false],
+    ["SPY, dividends reinvested", B[spyKey], css("--spy"), 1.5, false],
+    ["QQQ, dividends reinvested", B[qqqKey], css("--ink-2"), 1.2, true],
+  ];
+  legend("bx-legend", lines.map(([n, , c, , d]) => [c, n, d]));
+  charts.bx.setOption({
+    grid: { left: 52, right: 18, top: 10, bottom: 26 },
+    tooltip: tooltip(v => fmtPct(v - 1, 0)),
+    xAxis: { type: "time", ...axis, splitLine: { show: false } },
+    yAxis: { type: "value", scale: true, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v - 1, 0) } },
+    // S1 on top: it runs on the same path as S3 until SPY first closes below its 200-day mean
+    series: lines.map(([name, v, c, w, dash], i) => ({ name, type: "line", z: i === 0 ? 3 : 2, showSymbol: false, lineStyle: { width: w, color: c, type: dash ? "dashed" : "solid" }, itemStyle: { color: c }, data: pts(dates, v) })),
+  }, true);
+  const f = k => fmtPct(B.runs[k].equity.at(-1) - 1);
+  // S2 is in cash until it has 36 completed monthly bars; its own window's figures are the gate
+  // report's (SPY bought at that window's first open, which this file does not carry)
+  document.getElementById("bx-note").textContent =
+    `${dates[0]} to ${dates.at(-1)}: S1 ${f("S1")}, S3 ${f("S3")}; SPY ${fmtPct(B[spyKey].at(-1) - 1)}. ` +
+    `S2 can first trade in 2023-01; over 2023-01 to 2025-06 it made −5.3% against SPY's +66.3%. About 63% invested on average. ` +
+    `Three variants, three attempts on record. Against random stocks bought from the same pool on the same nights, S1's entries earned no more. ` +
+    `These replays ran before the fund-table fix above, so they never saw Facebook; they book no dividends.`;
+}
 
 /* ---------- lab ---------- */
 function setupSliders() {
@@ -851,19 +1014,24 @@ const GUARDS = [
   ["A model that already knows the outcome", "Results are split at the model's training cutoff; the demo window starts after it. The prompt gives the ticker, not today's company name, which could reveal a later merger or rename; the filing itself names the company as it was then.", `judge.training_cutoff`],
   ["Claims the filing does not make", "Each claim must quote, word for word, a passage of the right company that was public at that instant. A claim that fails is sent back once; failing again is a no-call.", "evidence/validate.py · Citation Validator"],
   ["Results visible before they happened", "A closed trade becomes visible at the close of its exit day, and a decision's outcome only after its re-entry window has closed.", "Trade.available_at · Attribution.outcome_available_at"],
+  ["Classing an old listing by today's table", "The SEC fund table is today's and tickers are reused: a ticker counts as a fund only for a listing with no CIK or the fund's own, and an audit lists fund-class listings of companies that file reports.", "ingest/instrument_class.py · audit M9"],
+  ["A market cap from a filing not yet public", "Share counts come from SEC XBRL filings, used from the day after the filing date, for the company the listing belonged to that night, with the splits on file then.", "store/shares.py"],
   ["Trying settings until one works", "Every parameter set a research replay runs under is registered; the count is reported next to every result and will set the bar for promoting a change. This page's grid ran on a copy and is not counted.", "StrategyVersion · attempt_count"],
 ];
 function renderGuards() {
   document.getElementById("guards").replaceChildren(...GUARDS.map(([q, a, t]) =>
     el("div", { class: "guard" }, el("div", { class: "q" }, q), el("div", { class: "a" }, a), el("div", { class: "t" }, t))));
   const L = [
-    ["One window, one market regime.", ` ${decisionRows().length} decisions between ${D.meta.window.start} and ${D.meta.window.end}. That cannot tell whether the judge helps; the pipeline running end to end is the result.`],
-    ["The grid is a search.", ` ${D.meta.grid_points} settings are offered here; the best-looking one is the luckiest one. A high minimum conviction leaves only a handful of trades.`],
-    ["The universe was chosen with hindsight.", " About 300 instruments picked today, so companies that disappeared are under-represented."],
-    ["Daily bars.", " Within a day the worst order of high and low is assumed; drawdown counts closed trades only."],
-    ["The benchmark is price only.", " SPY's dividends, roughly 1 to 1.5% a year, are not included, which flatters the strategy over the long run; interest on the strategy's idle cash is not included either, which works the other way."],
-    ["Results are closed trades only.", " Return and drawdown move when a trade closes; open positions are not marked to market, and those still open when the data ends are left out."],
-    ["The prompt describes the default rules.", " It tells the model the stop trails by 1.5 ATR; settings with another trail reuse the same answers."],
+    ["The timing rule was shaped on the seven.", " The B-Xtrender + THT rule was explored on the biggest tech stocks before it was frozen, so step 1 of the funnel is in sample by construction."],
+    ["One slow bear market.", " The timing rule's smaller fall in 2022 comes mostly from months it could not yet hold Microsoft; there is no other slow bear in the window."],
+    ["Exploratory scripts.", " The funnel ran outside the replay pipeline, with no pass mark set in advance; it is a measurement, not a test."],
+    ["The LLM judge saw one short window.", ` ${decisionRows().length} decisions between ${D.meta.window.start} and ${D.meta.window.end}. That cannot tell whether the judge helps; the pipeline running end to end is the result.`],
+    ["Earnings-gap demo: the grid is a search.", ` ${D.meta.grid_points} settings are offered here; the best-looking one is the luckiest one. A high minimum conviction leaves only a handful of trades.`],
+    ["Earnings-gap demo: the universe was chosen with hindsight.", " About 300 instruments picked today, so companies that disappeared are under-represented."],
+    ["Earnings-gap demo: daily bars.", " Within a day the worst order of high and low is assumed; drawdown counts closed trades only."],
+    ["Earnings-gap demo: the benchmark is price only.", " SPY's dividends, roughly 1 to 1.5% a year, are not included, which flatters the strategy over the long run; interest on the strategy's idle cash is not included either, which works the other way."],
+    ["Earnings-gap demo: closed trades only.", " Return and drawdown move when a trade closes; open positions are not marked to market, and those still open when the data ends are left out."],
+    ["Earnings-gap demo: the prompt describes the default rules.", " It tells the model the stop trails by 1.5 ATR; settings with another trail reuse the same answers."],
   ];
   document.getElementById("limits-list").replaceChildren(...L.map(([b, t]) => el("li", {}, el("b", {}, b), t)));
   document.getElementById("foot").append(el("br"), `Data built from commit ${D.meta.code_version.slice(0, 12)} on ${D.meta.generated_at.slice(0, 10)} · model ${D.meta.model}`);
@@ -876,6 +1044,8 @@ async function main() {
     return;
   }
   for (const id of ["equity", "drawdown", "long", "scatter"]) charts[id] = echarts.init(document.getElementById(id), null, { renderer: "canvas" });
+  for (const [k, id] of [["fn", "fn-chart"], ["dd", "dd-chart"], ["bx", "bx-chart"]]) charts[k] = echarts.init(document.getElementById(id), null, { renderer: "canvas" });
+  renderFunnel(); renderDefence(); renderPit(); renderBx();
   heroCounts(); drawSweep(); setupSliders(); renderLab(true); renderLong(); renderScatter(); setupTime(); renderGuards();
   requestAnimationFrame(() => Object.values(charts).forEach(c => c.resize()));
   // #UNH-2026-07-16 opens that evening's decision, so one judgement can be linked to.

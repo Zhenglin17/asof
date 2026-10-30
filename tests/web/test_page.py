@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from asof.demo.build import CONVICTIONS, RISKS, TRAILS, grid, run_key
+from asof.evolve.protocol import load_protocol
 
 WEB = Path(__file__).resolve().parents[2] / "web"
 PAGE = (WEB / "index.html").read_text()
@@ -16,7 +17,17 @@ def test_every_fetched_data_file_exists() -> None:
     listed = re.search(r"const names = \[([^\]]+)\]", PAGE)
     assert listed is not None
     files = [n.strip().strip('"') for n in listed.group(1).split(",")]
-    assert files == ["meta", "runs", "decisions", "chunks", "timeline", "entities"]
+    # the first six come from `asof demo build`; funnel and bx_dev are exported by hand
+    assert files == [
+        "meta",
+        "runs",
+        "decisions",
+        "chunks",
+        "timeline",
+        "entities",
+        "funnel",
+        "bx_dev",
+    ]
     for name in files:
         assert (WEB / "data" / f"{name}.json").is_file(), name
 
@@ -52,3 +63,23 @@ def test_meta_window_ends_on_the_last_session_with_data() -> None:
     assert meta["window"]["end"] == runs["benchmark"][-1]["date"]
     assert meta["long_window"]["end"] == runs["long_benchmark"][-1]["date"]
     assert meta["initial_equity"] > 0
+
+
+def test_findings_curves_line_up() -> None:
+    # The charts pair each value with a date by position: a curve of another length would shift.
+    funnel = json.loads((WEB / "data" / "funnel.json").read_text())
+    dates = funnel["all"]["dates"]
+    for mode in ("mag7", "all", "ex7"):
+        f = funnel[mode]
+        assert f["dates"] == dates, mode
+        assert all(len(f[k]) == len(dates) for k in ("strategy", "hold_same", "spy")), mode
+    assert [r["rank"] for r in funnel["list_2020"]] == list(range(1, 21))
+    bx = json.loads((WEB / "data" / "bx_dev.json").read_text())
+    days = bx["runs"]["S1"]["dates"]
+    # exported by hand: a later re-export must not draw the sealed holdout onto the page
+    sealed = load_protocol().holdout.start.isoformat()
+    assert max(dates) < sealed and max(days) < sealed
+    assert all(r["dates"] == days and len(r["equity"]) == len(days) for r in bx["runs"].values())
+    assert {k for k in bx if k.startswith(("SPY", "QQQ"))} and all(
+        len(v) == len(days) for k, v in bx.items() if k != "runs"
+    )

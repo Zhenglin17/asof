@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 212" width="960" height="212" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+  <style>
+    .box { fill: #f8f7f3; stroke: #c3c2b7; stroke-width: 1; }
+    .loop { fill: none; stroke: #2a78d6; stroke-width: 1.3; }
+    .t { fill: #0b0b0b; font-size: 15px; font-weight: 600; }
+    .s { fill: #52514e; font-size: 13px; }
+    .k { fill: #2a78d6; font-size: 13px; font-weight: 600; }
+    .a { stroke: #67655f; stroke-width: 1.4; fill: none; marker-end: url(#h); }
+    .d { stroke: #898781; stroke-width: 1.3; fill: none; stroke-dasharray: 5 4; marker-end: url(#h); }
+    .hd { fill: #67655f; }
+    @media (prefers-color-scheme: dark) {
+      .box { fill: #1a1a19; stroke: #383835; }
+      .t { fill: #f0efec; } .s { fill: #c3c2b7; }
+      .loop { stroke: #3987e5; } .k { fill: #3987e5; }
+      .a { stroke: #a8a69f; } .hd { fill: #a8a69f; }
+    }
+  </style>
+  <defs><marker id="h" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="hd" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+
+  <rect class="box" x="2" y="42" width="130" height="92" rx="10"/>
+  <text class="t" x="14" y="68">Sources</text>
+  <text class="s" x="14" y="90">SEC filings,</text>
+  <text class="s" x="14" y="107">share counts,</text>
+  <text class="s" x="14" y="124">daily bars</text>
+
+  <path class="a" d="M132 88 H156"/>
+
+  <rect class="box" x="158" y="42" width="172" height="92" rx="10"/>
+  <text class="t" x="170" y="68">Point-in-time store</text>
+  <text class="s" x="170" y="90">rows stamped with</text>
+  <text class="s" x="170" y="107">when they went public</text>
+  <text class="k" x="170" y="124">visible_*(as_of)</text>
+
+  <path class="a" d="M330 88 H352"/>
+
+  <rect class="loop" x="354" y="10" width="458" height="140" rx="12"/>
+  <text class="k" x="368" y="31">Each evening at 20:00 New York, deterministic</text>
+  <rect class="box" x="364" y="46" width="94" height="88" rx="8"/>
+  <text class="t" x="375" y="70">Scanner</text>
+  <text class="s" x="375" y="92">code picks</text>
+  <text class="s" x="375" y="109">candidates</text>
+  <path class="a" d="M458 90 H468"/>
+  <rect class="box" x="470" y="46" width="110" height="88" rx="8"/>
+  <text class="t" x="481" y="70">Judge</text>
+  <text class="s" x="481" y="92">rules or LLM;</text>
+  <text class="s" x="481" y="109">quotes checked</text>
+  <path class="a" d="M580 90 H590"/>
+  <rect class="box" x="592" y="46" width="102" height="88" rx="8"/>
+  <text class="t" x="603" y="70">Executor</text>
+  <text class="s" x="603" y="92">next-open</text>
+  <text class="s" x="603" y="109">fills, sized</text>
+  <text class="s" x="603" y="126">by risk</text>
+  <path class="a" d="M694 90 H704"/>
+  <rect class="box" x="706" y="46" width="96" height="88" rx="8"/>
+  <text class="t" x="717" y="70">Ledger</text>
+  <text class="s" x="717" y="92">every leg,</text>
+  <text class="s" x="717" y="109">daily equity</text>
+
+  <path class="a" d="M812 88 H834"/>
+
+  <rect class="box" x="836" y="42" width="122" height="92" rx="10"/>
+  <text class="t" x="848" y="68">Report</text>
+  <text class="s" x="848" y="90">vs random,</text>
+  <text class="s" x="848" y="107">vs SPY, QQQ,</text>
+  <text class="s" x="848" y="124">vs a basket</text>
+
+  <path class="d" d="M897 134 V186 H583 V154"/>
+  <text class="s" x="600" y="204">evolution, planned: proposal, replay, gate, approval</text>
+</svg>

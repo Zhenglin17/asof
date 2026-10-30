@@ -1,223 +1,78 @@
 # asof
 
-A point-in-time correct market research agent: it may only read what was public at the
-time, and every conclusion must quote it.
+A point-in-time correct market research rig: every read of data is bound to an `as_of` instant
+and may only see what was public then, and every claim a language model makes must quote a
+passage that was public at that instant.
 
-**[Live demo](https://zhenglin17.github.io/asof/)**: replays you can tune, every cited
+**[Live demo](https://zhenglin17.github.io/asof/)**: what the tests found, every cited
 judgement, and the guards against seeing the future.
-
-[![The demo page](docs/demo.png)](https://zhenglin17.github.io/asof/)
-
-Replayed evening by evening, it scans for post-earnings gaps, a language model reads the
-filing behind each one and answers take or pass, and code checks that every claim quotes,
-word for word, a passage that was public at that instant. A simulated executor trades the
-takes, a ledger records every leg, and a report compares the result with a judge that takes
-everything and with SPY.
-
-The core invariant: **every read of data is bound to an `as_of` instant and may only see what
-was available then.** Filings are filtered on when EDGAR made them public (`available_at`),
-not on the period they describe; revisions are appended, never overwritten. Any violation is
-look-ahead leakage and is treated as a bug.
-
-The full manual (every command, what each stage stores, the source layout) is
-[docs/commands.md](docs/commands.md).
 
 ## How it works
 
-```mermaid
-flowchart TB
-    subgraph sources["Sources"]
-        EDGAR[SEC EDGAR<br/>8-K, 10-Q, 10-K]
-        ALP[Alpaca<br/>daily bars, corporate actions]
-    end
-    subgraph store["Point-in-time store"]
-        DOCS[(filings and chunks<br/>stamped available_at)]
-        BARS[(bars + security master<br/>stamped available_at)]
-        VIS{{"visible_*(as_of)"}}
-    end
-    subgraph loop["Fast loop, deterministic, at 20:00 New York"]
-        direction LR
-        SCAN[Scanner<br/>pure code]
-        JUDGE[Judge<br/>LLM fills a fixed schema]
-        CV[Citation validator]
-        EXE[Executor<br/>pure code]
-        LED[(ledger, attribution)]
-    end
-    REP[Replay report<br/>vs take-all, vs SPY]
-    EVO[Evolution, planned<br/>proposal, replay, gate, approval]
+![Sources feed a point-in-time store; each evening a deterministic loop scans, judges, executes and books; a report sets the result against random entries, holding and SPY](docs/architecture.svg)
 
-    EDGAR --> DOCS
-    ALP --> BARS
-    DOCS --> VIS
-    BARS --> VIS
-    SCAN --> JUDGE --> CV
-    CV -- "fails: sent back once, then no-call" --> JUDGE
-    CV -- "every claim quotes a visible passage" --> EXE --> LED
-    VIS --> loop --> REP
-    REP -.-> EVO -.-> loop
-```
+- **Store.** Daily bars for every listed US symbol since 2020 (delisted ones included), a
+  security master that maps each symbol-day to a permanent security across renames and ticker
+  reuse, SEC share counts, and 11,522 filings in 703,614 citable chunks. Every row carries the
+  instant it became knowable; filings are filtered on when EDGAR made them public, not on the
+  period they describe.
+- **Fast loop.** Scanner and executor are plain code; a judge is either rules or an LLM that
+  fills a fixed schema, and code checks that each of its claims quotes a visible chunk word for
+  word. Replays run evening by evening and repeat exactly.
+- **Report and gate.** Each replay is set against random entries from the same pool on the same
+  nights, against SPY and QQQ with dividends and a mechanical top-10 basket; every parameter set a
+  replay runs under is registered, and a sealed holdout year may be opened once per strategy.
 
-- **Store.** About 300 watchlist instruments, daily bars for every listed US symbol since 2020
-  (delisted ones included), and 11,522 filings of 218 companies in 703,614 citable chunks. A
-  security master maps each symbol-day to a permanent security across renames and ticker
-  reuse. Every row carries the instant it became knowable; all reads go through
-  `visible_*(session, as_of)`. [Details](docs/commands.md#commands-at-a-glance)
-- **Scanner.** `earnings_gap`: the first session after an earnings release gapped up at least
-  4% on at least twice its 20-day volume. [Details](docs/commands.md#replay)
-- **Judge.** Either take-all (the baseline) or an LLM that sees the reaction-day numbers and
-  the triggering filing as public that evening, and answers take or pass with a conviction
-  and one to eight claims, each quoting a chunk. Code, not the model, decides what happens
-  next. Answers are cached by request, so a replay runs offline and repeats exactly (the cache
-  holds the filings and is not part of the repository).
-  [Details](docs/commands.md#llm-judge)
-- **Citation validator.** A claim must quote, word for word, a chunk of the right company
-  that was public at that instant. [Details](docs/commands.md#evidence)
-- **Executor.** Next-open entry, ATR zone stops with a trailing key and one re-entry, sizing
-  from a fixed risk budget with position and exposure caps. Each closed leg is a ledger row.
-- **Evolution** (in progress). Every parameter set a replay runs under is registered, so the
-  number of attempts is on record for the significance gate a change will have to pass. The
-  evaluation protocol is pre-registered in [`configs/evaluation.yaml`](configs/evaluation.yaml):
-  development dates, a sealed one-year holdout that code refuses to replay unless a strategy
-  opens it (once), and the gate's settings. Results are compared with SPY and QQQ (dividends
-  reinvested) and with a mechanical basket: each month, the 10 largest stocks by recent
-  dollar volume, equal weight. [Details](docs/commands.md#benchmarks) Each trade is also
-  tested against random entries: the same dates and exits with a security drawn from what the
-  scanner could have bought that evening without its signal, corrected for every variant
-  tried. [Details](docs/commands.md#random-entry-null) A second test holds each entry and its
-  random picks the same fixed number of sessions, so the entry is measured without the exit.
-  [Details](docs/commands.md#entry-alone) Every replay records its account marked
-  to market at each close, set against the same benchmarks on return, drawdown and Sharpe.
-  [Details](docs/commands.md#strategy-versus-benchmarks) The gate report puts these side by
-  side over development dates only: the random-entry test, walk-forward (does a pick made on
-  two years beat random entries on the next six months), the edge without the best three legs
-  and with an extra cost, and the benchmarks. While strategies are explored it measures and
-  does not score; a pass mark is set when a strategy is about to be run.
-  [Details](docs/commands.md#gate-report)
+Commands, stages and the source layout: [docs/commands.md](docs/commands.md).
 
 ## Results so far
 
-One replay of the LLM judge, 2026-07-01 to 2026-10-16 (where the data ended), after the
-model's training cutoff (2026-06-30), default settings, next to take-all over the same
-candidates. No significance test has been run, and none of the differences below is
-distinguishable from noise.
+| What was tested | Window | Result | Baseline |
+|---|---|---|---|
+| B-Xtrender S1 and S3, liquid US stocks | 2020-01 .. 2025-06 | −4.5%, −10.1% | SPY +107% |
+| B-Xtrender S2 (needs three years of monthly bars) | 2023-01 .. 2025-06 | −5.3% | SPY +66% |
+| B-Xtrender entries alone, held 7 to 60 sessions | 2020-01 .. 2025-06 | no better than random stocks from the same pool | |
+| Timing rule, top 20 by market cap as known each January | 2020-02 .. 2025-06 | +117% | held +118%, SPY +91% |
+| The same top 20 without the seven big tech stocks | 2020-02 .. 2025-06 | +37% | held +56% |
+| The seven (in sample: the rule was shaped here) | 2020-02 .. 2025-06 | +436% | held +433% |
+| LLM judge on earnings gaps | 2026-07 .. 2026-10 | 51 candidates, no detectable difference | take-all |
 
-|                         | LLM judge | Take-all | SPY (price only) |
-|-------------------------|----------:|---------:|-----------------:|
-| Candidates              | 51: 32 take, 15 pass, 4 no-call | 51 | |
-| Traded decisions        | 31        | 40       |                  |
-| Winners                 | 12 of 31  | 13 of 40 |                  |
-| Return, closed trades   | -1.04%    | -0.73%   | +2.45%           |
-| Max drawdown, closed    | 3.0%      | 4.9%     |                  |
-| Mean R per traded decision | -0.07  | -0.10    |                  |
+So far nothing tested beats its own baseline. The B-Xtrender replays were about 63% invested and
+book no dividends, against SPY with dividends; they ran before a fix that restored Facebook to
+the stock universe. "Held" is the same list held throughout and re-weighted on the days the
+timing rule trades, so the only difference is when the rule is in or out; SPY on those rows is
+price only. The timing rule shown is the best of its eight frozen variants. Its smaller fall in
+2022 (21% against 29%) comes from months when it could not yet hold Microsoft; from 2022-04-18 it
+fell 23% against 22%.
 
-- The LLM's lower drawdown mostly reflects fewer trades and less money at risk, not better
-  selection; the win rates differ by one winning trade, and the mean R gap comes from four
-  trades take-all had no capital left for.
-- Take-all did not trade every candidate either: the exposure caps skipped some, and a pass
-  frees room for another trade, so the comparison mixes judgement with capacity.
-- The 11 passes that take-all traded earned it +0.23R on average, but -0.24R without the
-  single best one (NOW, +4.95R).
-- On the demo page's grid of 36 settings, LLM minus take-all changes sign with the stop and
-  risk settings. The minimum-conviction 0.6 cells look best, but they are the same 5 trades.
+No B-Xtrender or timing-rule figure uses a date after 2025-06, and none of these strategies has
+been run on the sealed holdout year (2025-07 .. 2026-06). But the timing rule was explored on
+2025-07 .. 12 before it was frozen, and take-all on earnings gaps was replayed over the holdout
+before the protocol existed. Full numbers and caveats: [docs/results.md](docs/results.md).
 
-**51 candidates in one market regime cannot tell whether the judge helps**; what this shows is
-the pipeline running end to end with every decision traceable to the passage it rests on.
+## Leakage guards
 
-Take-all over 2023-01-03 to 2026-10-16: 643 candidates, 547 traded, and the ten best trades
-made 77% of the profit. Marked to market at every close:
+| Way to see the future | Guard |
+|---|---|
+| Reading a filing before it was public | Filter on `available_at`; revisions are new rows |
+| Knowing today what a ticker meant then | Security master as known at each instant, checked by a truncation test |
+| Classing an old listing by today's fund table | A ticker is a fund only for a listing with no CIK or the fund's own (FB was Facebook until 2022) |
+| Citing a passage that was not public yet | The validator checks the instant; the prompt holds only visible chunks |
+| Trying settings until one works | Every parameter set a replay runs under is registered and counted |
 
-|                       | Take-all | SPY     | QQQ     | Top-10 basket |
-|-----------------------|---------:|--------:|--------:|--------------:|
-| Total return          | +63.2%   | +107.7% | +169.6% | +417.7%       |
-| Max drawdown          | 11.0%    | 18.8%   | 22.8%   | 29.5%         |
-| Sharpe (daily, rf 0)  | 1.08     | 1.38    | 1.41    | 1.59          |
-
-Benchmarks reinvest dividends. The strategy had 40% of its equity invested on average, so its
-smaller drawdown is the cash, not an edge; a Sharpe ratio does not change with leverage, and on
-it the strategy trails too, though with under four years of daily returns its standard error
-is about 0.5 and the gap to SPY is within it. By period the Sharpe ratio was 1.50 on development
-dates (SPY 1.35), 0.37 on the holdout's dates (SPY 1.68) and -0.07 after the model's cutoff
-(SPY 0.80). This strategy was replayed over the holdout before the protocol existed, so none of
-this is out of sample, and the watchlist was picked with hindsight. Against random
-entries from the same candidate pool on the same days, its 632 closed legs averaged +1.73%
-where random picks averaged +1.54%: an edge of +0.19% a leg, p = 0.33. Most of the per-trade
-return came from the market and the watchlist, not from the gap. On development dates (where
-filings start in 2023) the gate report shows +0.69% a leg over random entries, p = 0.11: no
-evidence of an edge, from 383 legs that could only detect one above +1.9%. All of it comes
-from three trades (QBTS, SMCI, DUOL); without them it is 0.00%. This strategy was replayed over
-these dates before the protocol existed, so none of it is clean evidence.
-
-The grid ran on throwaway copies of the database, so it adds nothing to the recorded attempt
-count. It is still a search to anyone who picks its best cell, and is shown as such.
-
-**B-Xtrender, development dates (2020-01 to 2025-06), three pre-registered variants.** None
-beats SPY, so the holdout stays sealed:
-
-| Variant | Window | Account | SPY | Max drawdown | SPY's |
-|---|---|--:|--:|--:|--:|
-| S1: weekly and daily histograms turn up | 2020-01 .. 2025-06 | -4.5% | +107.3% | 36.0% | 33.8% |
-| S3: S1, new entries only while SPY is above its 200-day mean | 2020-01 .. 2025-06 | -10.1% | +107.3% | 35.8% | 33.8% |
-| S2: S1, and the monthly bar rose (in cash until 2023-01) | 2023-01 .. 2025-06 | -5.3% | +66.3% | 25.9% | 18.8% |
-
-S2 needs 36 completed monthly bars, so it can trade only from 2023-01 and is compared over that
-window. The three variants count as three attempts. S1's 3,392 half-position legs averaged
--0.56% where random picks from the same pool on the same dates averaged +0.35%, p = 1.00 after
-the family correction; positive in 2 of 7 walk-forward windows. The random legs keep the real
-legs' exit dates, and those come from each stock's own path (a sale the morning after the
-daily histogram turns red), so this comparison does not tell a bad entry from a bad exit. The
-replay books no dividends (about a point a year at 63% invested), and about 3% of entries were
-sized on an ATR inflated by an extreme or bad high or low (NVDA 2024-06-10 stores a high of
-195.95 against a close of 121.79); neither is near the gap. [Details](docs/commands.md#b-xtrender-on-development-dates)
-
-## Leakage guards and the tests behind them
-
-| Way to see the future | Guard | Tests |
-|---|---|---|
-| Reading a filing before it was public | Filter on `available_at`; revisions are new rows | `tests/store/test_queries.py`, `test_documents.py` |
-| Using today's bar during today | A daily bar is visible only after the post-market close | `tests/store/test_market.py`, `tests/replay/test_replay.py` |
-| Knowing today what a ticker meant then | Security master as known at each instant; a truncation test rebuilds it from only the inputs knowable then and compares | `tests/ingest/test_master_truncation.py`, `test_truncation_gate.py` |
-| Future statistics in search | Ranking uses term statistics of the visible documents only | `tests/evidence/test_retrieve.py`, `tests/store/test_chunk_search.py` |
-| Citing a passage that was not public yet | The validator checks the instant; the prompt holds only visible chunks | `tests/judge/test_llm.py`, `tests/judge/test_window.py` |
-| A model that already knows the outcome | Results split at the training cutoff; the prompt names the ticker, not today's company name | `tests/replay/test_compare.py`, `tests/judge/test_llm.py` |
-| Outcomes visible before they happened | A trade is visible from its exit-day close, an outcome after its re-entry window | `tests/attribute/test_trades.py`, `tests/replay/test_replay.py` |
-| Rescaling history with a price not yet known | A spin-off's factor needs the child's first close: it is used only from the day every price it rests on is visible, and sessions in between have no value | `tests/store/test_spinoffs.py`, `tests/features/test_bx.py` |
-| Moving a stop with a spin-off price not yet known | A position held into a spin-off's ex-date is frozen from that open (the record is on file by then) until the factor's close; its children are sold at their next open, and an event still unpriced after `spinoff_max_wait` sessions resumes on raw prices | `tests/execute/test_simulate_spinoffs.py`, `tests/replay/test_replay_spinoffs.py` |
-| A result that depends on later days | Replaying to day N gives the same decisions as replaying further | `tests/replay/test_replay.py` |
-| A market filter read from tomorrow's index bar | The SPY trend filter reads only the index closes final at that night's close, adjusted by the splits on file then | `tests/scan/test_bx_filters.py` |
-| One pass over a window reading the window's end | The B-Xtrender scan computes each series once at the window's last close and is held equal to a scan run each night; a security whose symbol (or spin-off child) was recorded in the security master late is recomputed as known that night | `tests/scan/test_bx_trender.py` |
-| Sizing on prices rescaled later | A B-Xtrender entry takes its close and ATR from the bars visible at the signal night, adjusted only by the splits on file then whose ex-date has come | `tests/replay/test_replay_bx.py` |
-| Trying settings until one works | Every parameter set a research replay runs under is registered and counted | `tests/strategy/test_config.py`, `tests/replay/test_report.py` |
-| Classing an old listing by today's fund table | The SEC fund table is today's and tickers are reused (FB is a fund today, Facebook until 2022): a ticker counts as a fund only for a segment with no CIK or the fund's own; the audit lists fund-class segments of company filers | `tests/ingest/test_instrument_class.py`, `tests/store/test_audit_m9.py` |
-| A share count before its filing was public | A market cap uses the SEC share count from the day after its filing date, of the company the security belonged to that night, with the splits on file then | `tests/store/test_shares.py` |
-| Peeking at the test period | Replays and judge runs that touch the sealed holdout are refused; a strategy may open it once, and the opening is recorded | `tests/evolve/test_holdout.py`, `tests/replay/test_replay_holdout.py` |
-
-On the real store, `asof market audit` runs 40 data checks with reviewed exceptions (the session
-calendar among them, against the NYSE schedule), and
-hand-checked reference histories (renames, ticker reuse, splits, spin-offs) are asserted as tests.
+All 17 guards, each with the tests that hold it: [docs/leakage.md](docs/leakage.md). On the real
+store, `asof market audit` runs 40 data checks with reviewed exceptions.
 
 ## Known limitations
 
-- **One short window.** The LLM judge has been replayed over 51 candidates in about four
-  months; no significance test has been run.
-- **Hindsight universe.** The watchlist was picked today, so companies that disappeared are
-  under-represented.
-- **Daily bars, simple fills.** Within a day the worst order of high and low is assumed;
-  fills pay a flat 5 bps of slippage and no commission.
-- **Closed trades in the replay report.** Its return and drawdown move when a trade closes and
-  its SPY is price only; the comparison above marks open positions daily against
-  total-return benchmarks.
-- **No income for the strategy.** Idle cash earns no interest and dividends on held stocks are
-  not credited; both count against it.
-- **Vendor history.** A few identity facts the data vendor rewrote after the fact cannot be
-  dated; they are listed in a baseline that may only shrink.
-- **One model, one prompt.** Answers are cached; another model or prompt may decide
-  differently. A training cutoff hides outcomes, not what the model knew about each company
-  before it.
-- **Rough market caps.** Share counts come from companies' SEC XBRL tags; an ADR's count is of
-  ordinary shares with no ratio on file, so it must clear ten times the bar. About 4% of
-  liquid-tier stock-nights in 2020-01..2025-06 have no usable count (BP, STZ, BRK.A among
-  them) and fall out of a cap filter on both sides of a comparison.
-- **Long only, gap-ups only.** Never tested in a falling or very volatile market.
+- **Hindsight.** The timing rule was shaped on the seven big tech stocks, partly on dates inside
+  the holdout year; the earnings-gap watchlist was picked today.
+- **Short samples.** One slow bear market; 51 LLM-judged candidates.
+- **Exploratory scripts.** The timing-rule runs are outside the replay pipeline and not in this
+  repository; their curves are committed as data.
+- **Daily bars, simple fills.** Flat 5 bps slippage, no commission; replays book no dividends.
+- **Rough market caps.** SEC share counts; ADRs and companies without an all-class count are
+  left out of the top-20 lists.
 - **Not built yet:** minute bars, macro data, the evolution loop (proposals and approval).
 
 ## Quickstart
@@ -231,42 +86,17 @@ uv run pytest                          # cases that need the real data store ski
 python3 -m http.server -d web 8000      # the demo page, from the committed data
 ```
 
-Building the store yourself needs free Alpaca keys and an SEC contact string, and takes hours:
-
-```bash
-export ASOF_DATA_DIR=~/asof-data      # default /data/asof
-export ALPACA_API_KEY=... ALPACA_SECRET_KEY=... ASOF_SEC_USER_AGENT="name you@example.com"
-uv run asof db init && uv run asof entities sync --download
-uv run asof market universe && uv run asof market backfill && uv run asof market import-bars
-uv run asof market actions && uv run asof market identity && uv run asof market instruments
-uv run asof market shares
-uv run asof market audit
-uv run asof docs sync && uv run asof docs audit && uv run asof evidence index
-uv run asof replay run --strategy earnings_gap --start 2023-01-03 --end 2026-10-21
-uv run asof replay report --run 1
-```
-
-The full pipeline, in order, is in [Commands at a glance](docs/commands.md#commands-at-a-glance).
+Building the store needs free Alpaca keys, an SEC contact string and several hours:
+[Commands at a glance](docs/commands.md#commands-at-a-glance).
 
 ## Status
 
-- [x] Point-in-time store: bars, security master, filings and chunks, all read through `as_of`
-- [x] Data audit and truncation test over the real store
-- [x] Evidence search and citation validator
-- [x] Fast loop: scanner, take-all and LLM judges, executor, ledger, attribution, replay report
-- [x] Demo page on GitHub Pages
-- [x] Share counts from SEC XBRL, point in time, for a rough market cap (`asof market shares`)
-- [ ] Minute bars, other XBRL facts, FRED
-- [x] Gate report: random entries, walk-forward, thin edge, benchmarks, side by side
-- [x] First feature: B-Xtrender on split- and spin-off-adjusted daily, weekly and monthly bars, matched against the chart
-- [x] B-Xtrender entry scan: liquid common stocks whose weekly (or monthly) and daily histograms both rose, after a measured warm-up (`asof scan bx`)
-- [x] B-Xtrender execution rules: sell half when the daily histogram turns red and the rest when the weekly bar falls, sized by ATR; optional monthly and SPY trend filters (`strategies/bx_trender`)
-- [x] B-Xtrender in the replay: each night held positions sell on that night's flags and candidates enter in rank order, sized on the bars visible then (`asof replay run --strategy bx_trender`)
-- [x] Gate report on B-Xtrender replays: random entries drawn from the scan's pool, checked on a made-up market with a planted edge (found) and without it (not found)
-- [x] B-Xtrender on development dates: three pre-registered variants replayed and measured; none beats SPY, the holdout stays sealed
-- [x] Entry alone (`asof gate entry`): held 7 to 60 sessions, B-Xtrender's picks earn no more than random stocks from the same pool
-- [x] THT trend filter on the entry (pre-registered, one attempt): the picks still earn no more than random stocks, from the whole pool or from its THT-green stocks (`asof gate diagnose` for re-entries, rank thirds, colour flips)
-- [ ] Strategy evolution: proposals, approval
+- [x] Point-in-time store, data audit and truncation test over the real store
+- [x] Evidence search and citation validator; LLM and take-all judges
+- [x] Replays with daily equity, gate report (random entries, walk-forward, benchmarks)
+- [x] B-Xtrender and THT features, scans and execution rules, measured on development dates
+- [x] Point-in-time market caps from SEC share counts
+- [ ] Minute bars, macro data, strategy evolution (proposals, approval)
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).
 
