@@ -17,7 +17,7 @@ def test_every_fetched_data_file_exists() -> None:
     listed = re.search(r"const names = \[([^\]]+)\]", PAGE)
     assert listed is not None
     files = [n.strip().strip('"') for n in listed.group(1).split(",")]
-    # the first six come from `asof demo build`; funnel and bx_dev are exported by hand
+    # the first six come from `asof demo build`; funnel and strategies are exported by hand
     assert files == [
         "meta",
         "runs",
@@ -26,7 +26,7 @@ def test_every_fetched_data_file_exists() -> None:
         "timeline",
         "entities",
         "funnel",
-        "bx_dev",
+        "strategies",
     ]
     for name in files:
         assert (WEB / "data" / f"{name}.json").is_file(), name
@@ -74,12 +74,18 @@ def test_findings_curves_line_up() -> None:
         assert f["dates"] == dates, mode
         assert all(len(f[k]) == len(dates) for k in ("strategy", "hold_same", "spy")), mode
     assert [r["rank"] for r in funnel["list_2020"]] == list(range(1, 21))
-    bx = json.loads((WEB / "data" / "bx_dev.json").read_text())
+    bx = json.loads((WEB / "data" / "strategies.json").read_text())
     days = bx["runs"]["S1"]["dates"]
     # exported by hand: a later re-export must not draw the sealed holdout onto the page
     sealed = load_protocol().holdout.start.isoformat()
     assert max(dates) < sealed and max(days) < sealed
     assert all(r["dates"] == days and len(r["equity"]) == len(days) for r in bx["runs"].values())
     assert {k for k in bx if k.startswith(("SPY", "QQQ"))} and all(
-        len(v) == len(days) for k, v in bx.items() if k != "runs"
+        len(v) == len(days) for k, v in bx.items() if k not in ("runs", "take_all")
     )
+    # later curves are rebased to SPY's close before their first session, which must exist
+    assert set(dates) <= set(days) and days.index(dates[0]) >= 1
+    take_all = bx["take_all"]
+    assert days.index(take_all["dates"][0]) >= 1
+    assert len(take_all["equity"]) == len(take_all["dates"])
+    assert set(take_all["dates"]) <= set(days) and max(take_all["dates"]) < sealed

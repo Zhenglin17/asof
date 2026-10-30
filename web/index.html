@@ -156,6 +156,26 @@ h2 { font-size: 28px; letter-spacing: -0.02em; margin: 0 0 6px; font-weight: 650
 .chips span { font-size: 13px; padding: 4px 9px; border-radius: 8px; background: var(--surface-2); font-variant-numeric: tabular-nums; }
 .chips span small { color: var(--muted); margin-left: 4px; }
 .chips span.hit { background: var(--mark); box-shadow: 0 0 0 1px var(--base); font-weight: 620; }
+.score { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-top: 12px; font-variant-numeric: tabular-nums; }
+.score th, .score td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--ring); vertical-align: top; }
+.score th { color: var(--muted); font-weight: 560; font-size: 12.5px; }
+.score td.num, .score th.num { text-align: right; white-space: nowrap; }
+.score tr.sep td { border-top: 1px solid var(--axis); }
+.score .muted { color: var(--muted); }
+.card-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.card-top .legend { margin-bottom: 0; }
+.two.even { grid-template-columns: 1fr 1fr; }
+@media (max-width: 900px) { .two.even { grid-template-columns: 1fr; } }
+.funnel .rows { margin-top: 6px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.pit { margin-bottom: 14px; }
+.pit h3 { margin: 0 0 6px; font-size: 17px; }
+.pit p { margin: 0; color: var(--ink-2); max-width: 820px; }
+.pit-list { margin-top: 14px; }
+.pit-list .note { margin-top: 8px; }
+details.fold { margin-top: 18px; border: 1px solid var(--ring); border-radius: 14px; background: var(--surface); }
+details.fold > summary { cursor: pointer; padding: 14px 18px; font-weight: 620; }
+details.fold > section.block { padding: 0 18px 18px; }
+section[id], details[id] { scroll-margin-top: 60px; }
 .era { margin-top: 72px; padding-top: 28px; border-top: 1px solid var(--ring); }
 .seg { display: inline-flex; background: var(--surface-2); border-radius: 10px; padding: 3px; border: 1px solid var(--ring); }
 .seg button {
@@ -291,11 +311,10 @@ footer a { color: var(--ink-2); }
   <div class="wrap">
     <a class="brand" href="#top">asof <span>· point-in-time market agent</span></a>
     <div class="links">
-      <a href="#findings">Findings</a>
-      <a class="opt" href="#bx">Rules</a>
-      <a href="#lab">Lab</a>
-      <a class="opt" href="#decisions">Decisions</a>
-      <a class="opt" href="#time">Time machine</a>
+      <a href="#overview">Strategies</a>
+      <a href="#findings">Timing</a>
+      <a class="opt" href="#next">Next</a>
+      <a href="#decisions">Receipts</a>
       <a class="opt" href="#leakage">Leakage</a>
       <a href="https://github.com/Zhenglin17/asof">GitHub</a>
     </div>
@@ -307,7 +326,7 @@ footer a { color: var(--ink-2); }
   <div class="wrap">
     <div class="eyebrow">Evidence-grounded · replayable · no look-ahead</div>
     <h1>A point-in-time market agent, with receipts.</h1>
-    <p class="lede">A research rig that may only read what was public at each moment. Trading ideas are replayed evening by evening and compared with fair baselines; a language model that reads filings must quote, word for word, a passage public at that instant. Below: what the tests found (so far, no timing edge), every cited judgement, and the guards against seeing the future.</p>
+    <p class="lede">A research rig that may only read what was public at each moment. Trading ideas are replayed evening by evening against fair baselines, and a language model reading filings must quote what was public then. So far nothing beats its baseline; the page shows each strategy, why, and what to test next.</p>
     <div class="counters">
       <div class="counter"><b data-count="judgements">–</b><span id="judged-label">candidates judged in the demo window</span></div>
       <div class="counter"><b data-count="quotes">–</b><span>quotes checked verbatim against the filing</span></div>
@@ -323,53 +342,85 @@ footer a { color: var(--ink-2); }
 </header>
 
 <main class="wrap">
+  <section class="block" id="overview">
+    <h2>Every strategy tried, on one chart</h2>
+    <p class="sub">Development dates only (2020-01 to 2025-06), against SPY with dividends reinvested. A line that starts later begins at SPY's level on its first day, so above or below the grey line means ahead of or behind the market from that day on. Each strategy is judged against its own baseline in the table.</p>
+    <div class="card">
+      <div class="legend" id="ov-legend"></div>
+      <div class="chart" id="ov-chart"></div>
+      <div class="table-scroll"><table class="score" id="ov-table"></table></div>
+      <p class="note" id="ov-note"></p>
+    </div>
+  </section>
+
   <section class="block" id="findings">
-    <h2>Does the timing rule add anything?</h2>
-    <p class="sub">One rule, frozen on 2026-10-29 after at least 18 exploratory versions on the seven biggest tech stocks: buy when the weekly and daily B-Xtrender histograms turn up, the daily one at or above zero, and the weekly THT trend is green; sell on its exit signals. Shown is the best of its eight frozen variants on every list. Each line below is set against the same list held throughout and re-weighted on the same days the rule trades: the only difference is when the rule is in or out. Equal weights, 5 bps a trade, 2020-02-03 to 2025-06-30 (development dates only).</p>
+    <h2>The timing rule: does it beat holding the same stocks?</h2>
+    <p class="sub">Frozen on 2026-10-29 after at least 18 exploratory versions on the seven biggest tech stocks: buy when the weekly and daily B-Xtrender histograms turn up, the daily one at or above zero, and the weekly THT trend is green; sell on its exit signals. Each list is set against the same stocks held throughout and re-weighted on the days the rule trades, so the only difference is when the rule is in or out. Equal weights, 5 bps a trade, 2020-02-03 to 2025-06-30; shown is A-spread-equal, the variant with the highest return on each list (not the highest Sharpe: on the top 20 that is A-cash-equal, 0.83 against 0.79); none of the eight beats holding on the top 20 or without the seven.</p>
     <div class="funnel" id="funnel-steps"></div>
     <div class="card">
-      <div class="legend" id="fn-legend"></div>
+      <div class="card-top">
+        <div class="legend" id="fn-legend"></div>
+        <div class="seg" id="fn-view">
+          <button type="button" data-v="growth" aria-pressed="true">Growth</button>
+          <button type="button" data-v="falls" aria-pressed="false">Falls in sell-offs</button>
+        </div>
+      </div>
       <div class="chart" id="fn-chart"></div>
+      <div class="chart" id="dd-chart" hidden></div>
       <p class="note" id="fn-note"></p>
     </div>
   </section>
 
-  <section class="block" id="defence">
-    <h2>The one place it looked like it helped</h2>
-    <p class="sub">Deepest fall inside each sell-off, on the top-20 list as known each January. In 2022 the rule fell 21% against holding's 29%, but its trend filter needs weekly history, and until 2022-04-18 it could not hold Microsoft while the held list did. From that date, with every name tradable, it fell about as far as holding. In the 2020 crash it fell about as much; in the 2025 tariff drop it fell more, on all three lists.</p>
+  <section class="block" id="next">
+    <h2>What I would test next: fast falls against slow bears</h2>
+    <p class="sub">A hunch, not a pattern yet. In 2022, the only slow bear in the sample and labelled after the fact, the timing rule fell less than holding on every list; in the fast falls of 2020, 2024-08 and 2025 it fell about as much or more on the top 20, and more on the seven in 2020 and 2025. A rule that sells and buys on confirmation would do this in a V-shaped fall (not yet checked trade by trade). The catch: on the day of a sharp fall nobody knows whether it is a V or the start of a slow bear, and price bars alone may not tell.</p>
     <div class="card">
-      <div class="chart short" id="dd-chart"></div>
-    </div>
-  </section>
-
-  <section class="block" id="pit">
-    <h2>A point-in-time trap, caught on the way</h2>
-    <p class="sub">The SEC publishes its fund ticker table as of today, without dates, and tickers are reused. Today FB is a ProShares fund; until 2022 it was Facebook. Classed by today's table, Facebook was an ETF from 2020-01 to 2022-06, so no stock scan ever saw it and the top-20 list had a hole at number 5. The fix: a ticker counts as a fund only when the listing has no company id (CIK) or the fund's own; an audit now lists fund-class listings of companies that file 10-Ks.</p>
-    <div class="card">
-      <div class="eyebrow" id="pit-head"></div>
-      <div class="chips" id="pit-list"></div>
-      <p class="note">Market cap = SEC share count public by that night × that night's close. Visa and Berkshire Hathaway report no all-class share count and are left out, so the 19th and 20th names here would rank lower in a full list.</p>
-    </div>
-  </section>
-
-  <section class="block" id="bx">
-    <h2>The first rule set, over the whole market</h2>
-    <p class="sub">Three pre-registered B-Xtrender variants traded every liquid US common stock, sized by risk, marked to market each close, against buying and holding SPY and QQQ with dividends reinvested. None beat SPY, so none was run on the sealed holdout year (2025-07 to 2026-06).</p>
-    <div class="card">
-      <div class="legend" id="bx-legend"></div>
-      <div class="chart" id="bx-chart"></div>
-      <p class="note" id="bx-note"></p>
+      <div class="table-scroll"><table class="score">
+        <thead><tr><th>Fall</th><th class="num">SPY, price</th><th>What was going on</th><th>What ended it</th><th class="num">Rule vs held, top 20</th></tr></thead>
+        <tbody>
+          <tr><td>2018-09-20 .. 12-24</td><td class="num">−20%</td><td>Rate hikes, a trade war</td><td>The Fed signalled patience (2019-01-04)</td><td class="num muted">before the window</td></tr>
+          <tr><td>2020-02-19 .. 03-23</td><td class="num">−34%</td><td>The pandemic</td><td>Unlimited Fed asset purchases (03-23), a fiscal package</td><td class="num">−29% vs −30%</td></tr>
+          <tr><td>2022-01-03 .. 10-12</td><td class="num">−25%</td><td>Inflation; rate hikes from 03-16; war in Ukraine from 02-24</td><td>No policy turn; the low came as inflation eased</td><td class="num">−21% vs −29%</td></tr>
+          <tr><td>2024-07-16 .. 08-05</td><td class="num">−8%</td><td>A Bank of Japan hike (07-31), a weak US jobs report (08-02), the yen carry trade unwinding</td><td>The Bank of Japan said it would not hike into unstable markets (08-07)</td><td class="num">−11% vs −9%</td></tr>
+          <tr><td>2025-02-19 .. 04-08</td><td class="num">−19%</td><td>Tariffs, announced for 04-02 and larger than expected</td><td>A 90-day pause (04-09)</td><td class="num">−16% vs −14%</td></tr>
+        </tbody>
+      </table></div>
+      <ul class="limits">
+        <li><b>Two guesses at what separates them.</b> A surprise against a repricing that arrives step by step; or whether policy turned: each V above ended soon after a turn, 2022 had none. Neither is known on the day of the fall; the second is easier to test.</li>
+        <li><b>Data to try.</b> The VIX term structure: in a shock, expected volatility over the next month jumps above that over three months (market quotes, not revised figures; whether it also inverted in early 2022 is unchecked). Macro data as first published (ALFRED), since revised figures leak the future. Dated news and central-bank statements, read by the same cited-evidence layer.</li>
+        <li><b>The limit.</b> Six SPY falls of 8% or more since 2018 (2018-02, 10%, is the sixth), four inside the rule's window. A rule learned from them cannot be tested on them: it has to be argued in advance, checked on single-stock falls, which are far more numerous, and then on falls still to come.</li>
+        <li><b>Not built yet.</b> Recorded as the next hypothesis, one attempt when it is run.</li>
+      </ul>
     </div>
   </section>
 
   <div class="era">
-    <div class="eyebrow">Earlier</div>
+    <div class="eyebrow">The first strategy, with receipts</div>
     <h2>Earnings gaps and an LLM judge</h2>
-    <p class="sub">The first strategy: after an earnings gap, a model reads the filing and answers take or pass, quoting its sources. Kept here because every judgement can be traced to the passage it rests on.</p>
+    <p class="sub">After an earnings gap, a model reads the filing and answers take or pass, quoting its sources word for word. Every judgement below can be traced to the passage it rests on. The parameter grid and the time machine are folded away.</p>
   </div>
 
+  <section class="block" id="decisions">
+    <h2>Every judgement, with its sources</h2>
+    <p class="sub">One dot per candidate judged (a candidate on a stock already held is skipped). Height is how the trade ended in R (multiples of the risk taken). A pass, whether the model declined or its conviction fell below the floor, is placed where take-all ended on the same candidate: what was left out. Click a dot to read the model's claims and the passages they quote.</p>
+    <div class="card">
+      <div class="legend">
+        <span><i class="dot" style="background:var(--llm)"></i>Take</span>
+        <span><i class="dot" style="background:var(--base)"></i>Pass (take-all's result)</span>
+        <span><i class="diamond"></i>No-call (nothing citable)</span>
+        <span style="color:var(--muted)">size = conviction</span>
+      </div>
+      <div class="chart scatter" id="scatter"></div>
+      <p class="note" id="dec-note"></p>
+      <details class="table">
+        <summary>Table view</summary>
+        <div class="table-scroll"><table id="dec-table"><thead><tr><th>Evening</th><th>Symbol</th><th>Verdict</th><th class="num">Conviction</th><th class="num">Gap</th><th class="num">R</th><th class="num">Take-all R</th></tr></thead><tbody></tbody></table></div>
+      </details>
+    </div>
+  </section>
+
+  <details class="fold" id="lab-fold"><summary>Strategy lab: 36 settings, replayed</summary>
   <section class="block" id="lab">
-    <h2>Strategy lab</h2>
     <p class="sub">Change how positions are managed and how sure the model must be. Every combination below was replayed beforehand, evening by evening, by the real pipeline; nothing on this page is simulated in the browser.</p>
     <div class="controls">
       <div class="control">
@@ -406,28 +457,12 @@ footer a { color: var(--ink-2); }
       </div>
     </div>
   </section>
+  </details>
 
-  <section class="block" id="decisions">
-    <h2>Every judgement, with its sources</h2>
-    <p class="sub">One dot per candidate judged (a candidate on a stock already held is skipped). Height is how the trade ended in R (multiples of the risk taken). A pass, whether the model declined or its conviction fell below the floor, is placed where take-all ended on the same candidate: what was left out. Click a dot to read the model's claims and the passages they quote.</p>
-    <div class="card">
-      <div class="legend">
-        <span><i class="dot" style="background:var(--llm)"></i>Take</span>
-        <span><i class="dot" style="background:var(--base)"></i>Pass (take-all's result)</span>
-        <span><i class="diamond"></i>No-call (nothing citable)</span>
-        <span style="color:var(--muted)">size = conviction</span>
-      </div>
-      <div class="chart scatter" id="scatter"></div>
-      <p class="note" id="dec-note"></p>
-      <details class="table">
-        <summary>Table view</summary>
-        <div class="table-scroll"><table id="dec-table"><thead><tr><th>Evening</th><th>Symbol</th><th>Verdict</th><th class="num">Conviction</th><th class="num">Gap</th><th class="num">R</th><th class="num">Take-all R</th></tr></thead><tbody></tbody></table></div>
-      </details>
-    </div>
-  </section>
 
+
+  <details class="fold" id="time-fold"><summary>Time machine: what the agent could see each evening</summary>
   <section class="block" id="time">
-    <h2>Time machine</h2>
     <p class="sub">Drag through the window. A company lights up once one of its filings is public by 20:00 New York that evening, the instant the replay decides at. Candidates glow on the evening they are judged. Nothing to the right of the slider exists yet for the agent. Tickers are today's.</p>
     <div class="card">
       <div class="tm-top">
@@ -444,10 +479,20 @@ footer a { color: var(--ink-2); }
       </div>
     </div>
   </section>
+  </details>
 
   <section class="block" id="leakage">
     <h2>How it avoids seeing the future</h2>
     <p class="sub">A backtest that peeks is worse than none. Each way of peeking below has a mechanism in the code and a test that fails if it comes back.</p>
+    <div class="card pit" id="pit">
+    <h3>A trap caught on the way</h3>
+    <p>The SEC publishes its fund ticker table as of today, without dates, and tickers are reused. Today FB is a ProShares fund; until 2022 it was Facebook. Classed by today's table, Facebook was an ETF from 2020-01 to 2022-06, so no stock scan ever saw it and the top-20 list had a hole at number 5. The fix: a ticker counts as a fund only when the listing has no company id (CIK) or the fund's own; an audit now lists fund-class listings of companies that file 10-Ks.</p>
+    <div class="pit-list">
+      <div class="eyebrow" id="pit-head"></div>
+      <div class="chips" id="pit-list"></div>
+      <p class="note">Market cap = SEC share count public by that night × that night's close. Visa and Berkshire Hathaway report no all-class share count and are left out, so the 19th and 20th names here would rank lower in a full list.</p>
+    </div>
+  </div>
     <div class="guards" id="guards"></div>
   </section>
 
@@ -501,7 +546,7 @@ function el(tag, attrs = {}, ...kids) {
 }
 
 async function load() {
-  const names = ["meta", "runs", "decisions", "chunks", "timeline", "entities", "funnel", "bx_dev"];
+  const names = ["meta", "runs", "decisions", "chunks", "timeline", "entities", "funnel", "strategies"];
   const got = await Promise.all(names.map(n => fetch(`data/${n}.json`).then(r => {
     if (!r.ok) throw new Error(`data/${n}.json: ${r.status}`);
     return r.json();
@@ -520,7 +565,7 @@ document.getElementById("theme").addEventListener("click", () => {
   root.setAttribute("data-theme", root.getAttribute("data-theme") === "dark" ? "light" : "dark");
   try { localStorage.setItem("asof-theme", root.getAttribute("data-theme")); } catch (e) { /* storage blocked */ }
   applyThemeLabel();
-  if (D) { renderFunnel(); renderDefence(); renderBx(); renderLab(true); renderLong(); renderScatter(); drawSweep(); }
+  if (D) { renderOverview(); renderFunnel(); renderLab(true); renderLong(); renderScatter(); drawSweep(); }
 });
 applyThemeLabel();
 
@@ -578,101 +623,163 @@ function drawSweep() {
 }
 let sweepRaf = 0;
 
-/* ---------- findings ---------- */
+/* ---------- strategies ---------- */
+// Strategy curves are values per date with 1.0 = the money at the start; SPY is rebased to its close before a curve's first date.
+const maxDD = v => { let peak = -Infinity, dd = 0; for (const x of v) { peak = Math.max(peak, x); dd = Math.min(dd, x / peak - 1); } return dd; };
+function sharpe(v, base = 1) {
+  const r = v.map((x, i) => x / (i ? v[i - 1] : base) - 1);
+  const m = r.reduce((a, b) => a + b, 0) / r.length, sd = Math.sqrt(r.reduce((a, b) => a + (b - m) ** 2, 0) / r.length);
+  return m / sd * Math.sqrt(252);
+}
+const curveStats = (v, base = 1) => ({ total: v.at(-1) / base - 1, sharpe: sharpe(v, base), dd: maxDD([base, ...v]) });
+const pts = (dates, v) => dates.map((d, i) => [d, v[i]]);
+// SPY with dividends over the given sessions, 1.0 at the close before the first of them
+function spyTR(days) {
+  const S = D.strategies, all = S.runs.S1.dates, v = S[Object.keys(S).find(k => k.startsWith("SPY"))];
+  const i = all.indexOf(days[0]);
+  if (i < 0) throw new Error(`no SPY close for ${days[0]}`);
+  const base = i > 0 ? v[i - 1] : 1;
+  return days.map(d => v[all.indexOf(d)] / base);
+}
+// SPY held at a strategy's mean invested share, the rest in cash earning nothing
+function spyMatched(days, exposure) {
+  const e = exposure.reduce((a, b) => a + b, 0) / exposure.length, s = spyTR(days);
+  let x = 1;
+  return { share: e, curve: s.map((v, i) => (x *= 1 + e * (v / (i ? s[i - 1] : 1) - 1))) };
+}
+function lineLegend(id, items) {
+  document.getElementById(id).replaceChildren(...items.map(([c, label, dash]) =>
+    el("span", {}, el("i", { class: "line", style: `background:${dash ? `repeating-linear-gradient(90deg,${c} 0 4px,transparent 4px 7px)` : c}` }), label)));
+}
+function renderOverview() {
+  const S = D.strategies, dates = S.runs.S1.dates, F = D.funnel.all, T = S.take_all;
+  const spyKey = Object.keys(S).find(k => k.startsWith("SPY")), spy = S[spyKey];
+  const spyAt = d => spy[dates.indexOf(d)];
+  // a later start is drawn from SPY's level at the close before its first session
+  const before = d => { const i = dates.indexOf(d); if (i < 1) throw new Error(`no SPY close before ${d}`); return spy[i - 1]; };
+  const lines = [
+    ["SPY, dividends reinvested", dates, spy, 1, css("--spy"), 1.5],
+    ["B-Xtrender S1, every liquid US stock", dates, S.runs.S1.equity, 1, css("--base"), 1.8],
+    ["Timing rule, top 20 as known each January", F.dates, F.strategy, before(F.dates[0]), css("--llm"), 2],
+    ["Earnings gaps, take-all", T.dates, T.equity, before(T.dates[0]), css("--nocall"), 1.8],
+  ];
+  lineLegend("ov-legend", lines.map(([n, , , , c]) => [c, n]));
+  const axis = axisStyle();
+  charts.ov.setOption({
+    grid: { left: 52, right: 18, top: 10, bottom: 26 },
+    tooltip: { ...tooltip(v => v.toFixed(2)), formatter: params => {
+      const date = params[0] ? new Date(params[0].value[0]).toISOString().slice(0, 10) : "";
+      return `<div style="color:${css("--muted")}">${date}</div>` + params.map(p => {
+        // each curve is 1.0 at its own start, so this is the return since that start
+        const [, d, v] = lines[p.seriesIndex], since = v[d.indexOf(date)] - 1;
+        return `<div><span style="display:inline-block;width:12px;height:2px;background:${p.color};vertical-align:middle;margin-right:6px"></span><b>${fmtPct(since, 0)}</b> <span style="color:${css("--ink-2")}">${p.seriesName}, since its start</span></div>`;
+      }).join("");
+    } },
+    xAxis: { type: "time", ...axis, splitLine: { show: false } },
+    yAxis: { type: "value", scale: true, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => v.toFixed(1) } },
+    series: lines.map(([name, d, v, k, c, w], i) => ({ name, type: "line", z: i === 0 ? 1 : 3, showSymbol: false, lineStyle: { width: w, color: c }, itemStyle: { color: c }, data: d.map((x, j) => [x, v[j] * k]) })),
+  }, true);
+
+  const matched = R => { const m = spyMatched(R.dates, R.exposure); return [`SPY at ${Math.round(m.share * 100)}% invested`, curveStats(m.curve)]; };
+  const rows = [
+    ["Earnings gaps, take-all", "2023-01 .. 2025-06", curveStats(T.equity), ...matched(T)],
+    ["B-Xtrender S1", "2020-01 .. 2025-06", curveStats(S.runs.S1.equity), ...matched(S.runs.S1)],
+    ["B-Xtrender S3 (S1 + SPY above its 200-day mean)", "2020-01 .. 2025-06", curveStats(S.runs.S3.equity), ...matched(S.runs.S3)],
+    ["Timing rule, top 20 as known each January", "2020-02 .. 2025-06", curveStats(F.strategy), "Same 20, held", curveStats(F.hold_same)],
+    ["Timing rule, top 20 without the seven", "2020-02 .. 2025-06", curveStats(D.funnel.ex7.strategy), "Same 13 to 15, held", curveStats(D.funnel.ex7.hold_same)],
+    ["Timing rule, the seven (in sample)", "2020-02 .. 2025-06", curveStats(D.funnel.mag7.strategy), "Same seven, held", curveStats(D.funnel.mag7.hold_same)],
+  ];
+  const td = x => el("td", { class: "num" }, x);
+  const cells = m => [td(fmtPct(m.total, 0)), td(m.sharpe.toFixed(2)), td(fmtPct(m.dd, 0))];
+  const tbl = document.getElementById("ov-table");
+  tbl.replaceChildren(
+    el("thead", {}, el("tr", {}, el("th", {}, "Strategy"), el("th", {}, "Window"), el("th", { class: "num" }, "Return"), el("th", { class: "num" }, "Sharpe"), el("th", { class: "num" }, "Max fall"),
+      el("th", {}, "Its baseline"), el("th", { class: "num" }, "Return"), el("th", { class: "num" }, "Sharpe"), el("th", { class: "num" }, "Max fall"))),
+    el("tbody", {}, ...rows.map(([n, w, m, bn, b], i) => el("tr", { class: i === 3 ? "sep" : "" }, el("td", {}, n), el("td", { class: "muted" }, w), ...cells(m), el("td", {}, bn), ...cells(b)))));
+  const full = R => curveStats(spyTR(R.dates));
+  document.getElementById("ov-note").textContent =
+    `Sharpe: daily return over its volatility, annualized, no risk-free rate. A strategy that keeps cash is set against SPY (with dividends) held at its own mean invested share, the rest in cash; ` +
+    `fully invested, SPY made ${fmtPct(full(S.runs.S1).total, 0)} over S1's window and ${fmtPct(full(T).total, 0)} over take-all's. The B-Xtrender replays book no dividends; ` +
+    `they ran before the fund-table fix described below, so they never saw Facebook. S2 needs three years of monthly bars and trades from 2023-01: −5.3% against SPY's +66.3%. ` +
+    `Take-all did beat SPY at its own invested share over these dates, but its real test is random stocks from the same candidate pool on the same nights: there it shows no edge (+0.69% a leg, p = 0.11), ` +
+    `so the gain came from a watchlist picked today and the market, not from the gap; S1 shows none either (−0.56% against +0.35%). Take-all is cut here at 2025-06; the full replay, its holdout dates and the LLM judge are further down.` Next to SPY the timing rule on the seven looks far better (Sharpe ${curveStats(D.funnel.mag7.strategy).sharpe.toFixed(2)} against ${curveStats(spyTR(F.dates)).sharpe.toFixed(2)}); next to the same seven held, it is level.`;
+}
+
+/* ---------- timing rule ---------- */
 const STEPS = [
   ["mag7", "Step 1", "The seven big tech stocks", "picked today, in sample"],
   ["all", "Step 2", "Top 20 by market cap, as known each January", ""],
   ["ex7", "Step 3", "The same top 20 without the seven", ""],
 ];
-let fnStep = "mag7";
-const maxDD = v => { let peak = -Infinity, dd = 0; for (const x of v) { peak = Math.max(peak, x); dd = Math.min(dd, x / peak - 1); } return dd; };
-const pts = (dates, v) => dates.map((d, i) => [d, v[i]]);
-function legend(id, items) {
-  document.getElementById(id).replaceChildren(...items.map(([c, label, dash]) =>
-    el("span", {}, el("i", { class: "line", style: `background:${dash ? `repeating-linear-gradient(90deg,${c} 0 4px,transparent 4px 7px)` : c}` }), label)));
-}
+let fnStep = "mag7", fnView = "growth";
 // the gap between the two totals as printed, so the cards add up for a reader
 const fnGap = F => Math.round((F.strategy.at(-1) - 1) * 100) - Math.round((F.hold_same.at(-1) - 1) * 100);
 function renderFunnel() {
   const box = document.getElementById("funnel-steps");
   box.replaceChildren(...STEPS.map(([k, step, name, tag]) => {
-    const F = D.funnel[k], s = F.strategy.at(-1) - 1, h = F.hold_same.at(-1) - 1, gap = fnGap(F);
+    const F = D.funnel[k], s = curveStats(F.strategy), h = curveStats(F.hold_same), q = curveStats(spyTR(F.dates)), gap = fnGap(F);
     const b = el("button", { type: "button", "aria-pressed": String(k === fnStep) },
       el("div", { class: "step" }, step),
       el("div", { class: "name" }, name, ...(tag ? [el("span", { class: "tag" }, tag)] : [])),
-      el("div", { class: "nums" }, el("span", {}, el("b", {}, fmtPct(s, 0)), el("small", {}, " rule")), el("span", {}, el("b", {}, fmtPct(h, 0)), el("small", {}, " held"))),
-      el("div", { class: "gap" }, gap === 0 ? "Even with holding" : `${Math.abs(gap)} point${Math.abs(gap) === 1 ? "" : "s"} ${gap > 0 ? "ahead of" : "behind"} holding`));
+      el("div", { class: "nums" }, el("span", {}, el("b", {}, fmtPct(s.total, 0)), el("small", {}, " rule")), el("span", {}, el("b", {}, fmtPct(h.total, 0)), el("small", {}, " held"))),
+      el("div", { class: "gap" }, gap === 0 ? "Even with holding" : `${Math.abs(gap)} point${Math.abs(gap) === 1 ? "" : "s"} ${gap > 0 ? "ahead of" : "behind"} holding`),
+      el("div", { class: "rows" }, `Sharpe ${s.sharpe.toFixed(2)} · held ${h.sharpe.toFixed(2)} · SPY ${q.sharpe.toFixed(2)}`, el("br"),
+        `Max fall ${fmtPct(s.dd, 0)} · held ${fmtPct(h.dd, 0)} · SPY ${fmtPct(q.dd, 0)}`));
     b.addEventListener("click", () => { fnStep = k; renderFunnel(); });
     return b;
   }));
   const F = D.funnel[fnStep], axis = axisStyle();
-  const lines = [["Rule", F.strategy, css("--llm"), 2], ["Same list held, re-weighted on the rule's days", F.hold_same, css("--base"), 1.5], ["SPY, price only", F.spy, css("--spy"), 1.5]];
-  legend("fn-legend", lines.map(([n, , c]) => [c, n]));
-  charts.fn.setOption({
-    grid: { left: 52, right: 18, top: 10, bottom: 26 },
-    tooltip: tooltip(v => fmtPct(v - 1, 0)),
-    xAxis: { type: "time", ...axis, splitLine: { show: false } },
-    yAxis: { type: "log", logBase: 2, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v - 1, 0) } },
-    series: lines.map(([name, v, c, w]) => ({ name, type: "line", showSymbol: false, lineStyle: { width: w, color: c }, itemStyle: { color: c }, data: pts(F.dates, v) })),
-  }, true);
+  const lines = [["Rule", F.strategy, css("--llm"), 2], ["Same stocks held, re-weighted on the rule's days", F.hold_same, css("--base"), 1.5], ["SPY, dividends reinvested", spyTR(F.dates), css("--spy"), 1.5]];
+  lineLegend("fn-legend", lines.map(([n, , c]) => [c, n]));
+  document.getElementById("fn-chart").hidden = fnView !== "growth";
+  document.getElementById("dd-chart").hidden = fnView !== "falls";
+  if (fnView === "growth") {
+    charts.fn.setOption({
+      grid: { left: 52, right: 18, top: 10, bottom: 26 },
+      tooltip: tooltip(v => fmtPct(v - 1, 0)),
+      xAxis: { type: "time", ...axis, splitLine: { show: false } },
+      yAxis: { type: "log", logBase: 2, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v - 1, 0) } },
+      series: lines.map(([name, v, c, w]) => ({ name, type: "line", showSymbol: false, lineStyle: { width: w, color: c }, itemStyle: { color: c }, data: pts(F.dates, v) })),
+    }, true);
+    charts.fn.resize();
+  } else renderFalls(F, lines);
   const n = {
-    mag7: "On the seven, where the rule was shaped, it matched holding on return and fell less (",
-    all: "On a list knowable at the time, a third of it the seven, it matched holding (",
-    ex7: `On the names it was not shaped on, it trailed holding by ${-fnGap(F)} points (`,
+    mag7: "On the seven, where the rule was shaped, it matched holding on return and fell less. ",
+    all: "On a list knowable at the time, a third of it the seven, it matched holding. ",
+    ex7: `On the names it was not shaped on, it trailed holding by ${-fnGap(F)} points. `,
   }[fnStep];
-  document.getElementById("fn-note").textContent = n +
-    `largest fall ${fmtPct(maxDD(F.strategy), 0)} vs ${fmtPct(maxDD(F.hold_same), 0)}). Bought each January and left alone, the list made ${fmtPct(F.hold_yearly.at(-1) - 1, 0)}. ` +
-    `The total depends on the start: an earlier run on the seven begun on 2020-01-02 shows +687%, being up 28% by the close of 2020-02-03 and carrying those positions on. ` +
-    `These are exploratory runs outside the replay pipeline, with no pass mark set in advance; the rule's exploration also looked at 2025-07 to 2025-12, inside the sealed holdout year.`;
+  document.getElementById("fn-note").textContent = fnView === "growth"
+    ? n + `Bought each January and left alone, the list made ${fmtPct(F.hold_yearly.at(-1) - 1, 0)}. ` +
+      `The total depends on the start: an earlier run on the seven begun on 2020-01-02 shows +687%, being up 28% by the close of 2020-02-03 and carrying those positions on. ` +
+      `Exploratory runs outside the replay pipeline, with no pass mark set in advance; the rule's exploration also looked at 2025-07 to 2025-12, inside the sealed holdout year, so +819% from that run is not shown.`
+    : `Deepest fall inside each sell-off. In 2022 the rule fell less than holding on every list, also from 2022-04-18, once every name had the weekly history its trend filter needs (the last group, which measures only the second half of the decline): one slow bear, labelled after the fact. ` +
+      `In the fast falls of 2020, 2024-08 and 2025 it fell about as much as holding or more on the top 20 and without the seven, as a rule that sells after a fall and buys back after a rebound would (not yet checked trade by trade).`;
 }
-const EPISODES = [["2020 crash", "2020-02-01", "2020-04-30"], ["2022 bear", "2022-01-01", "2022-12-31"], ["2025 tariffs", "2025-03-01", "2025-06-30"], ["From 2022-04-18, all names tradable", "2022-04-18", "2025-06-30"]];
-function renderDefence() {
-  const F = D.funnel.all, axis = axisStyle();
+const EPISODES = [["2020 crash", "2020-02-01", "2020-04-30"], ["2022 bear", "2022-01-01", "2022-12-31"], ["2024-08", "2024-07-01", "2024-09-30"], ["2025 tariffs", "2025-03-01", "2025-06-30"], ["2022 from 04-18, all names tradable", "2022-04-18", "2022-12-31"]];
+function renderFalls(F, lines) {
+  const axis = axisStyle();
   const dd = v => EPISODES.map(([, a, b]) => maxDD(v.filter((_, i) => F.dates[i] >= a && F.dates[i] <= b)));
-  const series = [["Rule", F.strategy, css("--llm")], ["Held, same days", F.hold_same, css("--base")], ["SPY, price only", F.spy, css("--spy")]];
   charts.dd.setOption({
-    grid: { left: 52, right: 18, top: 28, bottom: 26 },
-    legend: { top: 0, right: 0, textStyle: { color: css("--ink-2"), fontSize: 12 }, itemWidth: 12, itemHeight: 8 },
+    grid: { left: 52, right: 18, top: 10, bottom: 26 },
     tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, backgroundColor: css("--surface"), borderColor: css("--ring"), textStyle: { color: css("--ink"), fontSize: 12 }, valueFormatter: v => fmtPct(v, 0) },
     xAxis: { type: "category", data: EPISODES.map(e => e[0]), ...axis, splitLine: { show: false } },
-    yAxis: { type: "value", ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v, 0) } },
-    series: series.map(([name, v, c]) => ({ name, type: "bar", barGap: "10%", itemStyle: { color: c, borderRadius: [0, 0, 3, 3] },
+    // room below the deepest bar for its label
+    yAxis: { type: "value", min: v => Math.floor((v.min - 0.06) * 10) / 10, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v, 0) } },
+    series: lines.map(([name, v, c]) => ({ name, type: "bar", barGap: "10%", itemStyle: { color: c, borderRadius: [0, 0, 3, 3] },
       label: { show: true, position: "bottom", color: css("--ink-2"), fontSize: 11, formatter: p => fmtPct(p.value, 0) }, data: dd(v) })),
   }, true);
+  charts.dd.resize();
 }
+document.querySelectorAll("#fn-view button").forEach(b => b.addEventListener("click", () => {
+  fnView = b.dataset.v;
+  document.querySelectorAll("#fn-view button").forEach(x => x.setAttribute("aria-pressed", x === b));
+  renderFunnel();
+}));
 function renderPit() {
   const L = D.funnel.list_2020;
   document.getElementById("pit-head").textContent = `Top 20 US common stocks by market cap, as known on ${D.funnel.pick_night_2020}, in $ billions`;
   document.getElementById("pit-list").replaceChildren(...L.map(r =>
     el("span", { class: r.symbol === "FB" ? "hit" : "", title: r.symbol === "FB" ? "Missing before the fix" : "" }, `${r.rank}. ${r.symbol}`, el("small", {}, fmtInt(r.cap_bn)))));
-}
-function renderBx() {
-  const B = D.bx_dev, axis = axisStyle(), dates = B.runs.S1.dates;
-  const spyKey = Object.keys(B).find(k => k.startsWith("SPY")), qqqKey = Object.keys(B).find(k => k.startsWith("QQQ"));
-  const lines = [
-    ["S1: weekly and daily histograms turn up", B.runs.S1.equity, css("--llm"), 2, false],
-    ["S2: and the monthly bar rose (cash until 2023)", B.runs.S2.equity, css("--nocall"), 1.5, false],
-    ["S3: new entries only while SPY is above its 200-day mean", B.runs.S3.equity, css("--base"), 1.5, false],
-    ["SPY, dividends reinvested", B[spyKey], css("--spy"), 1.5, false],
-    ["QQQ, dividends reinvested", B[qqqKey], css("--ink-2"), 1.2, true],
-  ];
-  legend("bx-legend", lines.map(([n, , c, , d]) => [c, n, d]));
-  charts.bx.setOption({
-    grid: { left: 52, right: 18, top: 10, bottom: 26 },
-    tooltip: tooltip(v => fmtPct(v - 1, 0)),
-    xAxis: { type: "time", ...axis, splitLine: { show: false } },
-    yAxis: { type: "value", scale: true, ...axis, axisLabel: { ...axis.axisLabel, formatter: v => fmtPct(v - 1, 0) } },
-    // S1 on top: it runs on the same path as S3 until SPY first closes below its 200-day mean
-    series: lines.map(([name, v, c, w, dash], i) => ({ name, type: "line", z: i === 0 ? 3 : 2, showSymbol: false, lineStyle: { width: w, color: c, type: dash ? "dashed" : "solid" }, itemStyle: { color: c }, data: pts(dates, v) })),
-  }, true);
-  const f = k => fmtPct(B.runs[k].equity.at(-1) - 1);
-  // S2 is in cash until it has 36 completed monthly bars; its own window's figures are the gate
-  // report's (SPY bought at that window's first open, which this file does not carry)
-  document.getElementById("bx-note").textContent =
-    `${dates[0]} to ${dates.at(-1)}: S1 ${f("S1")}, S3 ${f("S3")}; SPY ${fmtPct(B[spyKey].at(-1) - 1)}. ` +
-    `S2 can first trade in 2023-01; over 2023-01 to 2025-06 it made −5.3% against SPY's +66.3%. About 63% invested on average. ` +
-    `Three variants, three attempts on record. Against random stocks bought from the same pool on the same nights, S1's entries earned no more. ` +
-    `These replays ran before the fund-table fix above, so they never saw Facebook; they book no dividends.`;
 }
 
 /* ---------- lab ---------- */
@@ -1023,7 +1130,7 @@ function renderGuards() {
     el("div", { class: "guard" }, el("div", { class: "q" }, q), el("div", { class: "a" }, a), el("div", { class: "t" }, t))));
   const L = [
     ["The timing rule was shaped on the seven.", " The B-Xtrender + THT rule was explored on the biggest tech stocks before it was frozen, so step 1 of the funnel is in sample by construction."],
-    ["One slow bear market.", " The timing rule's smaller fall in 2022 comes mostly from months it could not yet hold Microsoft; there is no other slow bear in the window."],
+    ["One slow bear market.", " The timing rule's one benefit, a smaller fall in 2022, rests on the only slow bear in the window."],
     ["Exploratory scripts.", " The funnel ran outside the replay pipeline, with no pass mark set in advance; it is a measurement, not a test."],
     ["The LLM judge saw one short window.", ` ${decisionRows().length} decisions between ${D.meta.window.start} and ${D.meta.window.end}. That cannot tell whether the judge helps; the pipeline running end to end is the result.`],
     ["Earnings-gap demo: the grid is a search.", ` ${D.meta.grid_points} settings are offered here; the best-looking one is the luckiest one. A high minimum conviction leaves only a handful of trades.`],
@@ -1044,13 +1151,18 @@ async function main() {
     return;
   }
   for (const id of ["equity", "drawdown", "long", "scatter"]) charts[id] = echarts.init(document.getElementById(id), null, { renderer: "canvas" });
-  for (const [k, id] of [["fn", "fn-chart"], ["dd", "dd-chart"], ["bx", "bx-chart"]]) charts[k] = echarts.init(document.getElementById(id), null, { renderer: "canvas" });
-  renderFunnel(); renderDefence(); renderPit(); renderBx();
+  for (const [k, id] of [["ov", "ov-chart"], ["fn", "fn-chart"], ["dd", "dd-chart"]]) charts[k] = echarts.init(document.getElementById(id), null, { renderer: "canvas" });
+  renderOverview(); renderFunnel(); renderPit();
+  // charts inside a folded section have no size until it opens
+  document.querySelectorAll("details.fold").forEach(d => d.addEventListener("toggle", () => { if (d.open) Object.values(charts).forEach(c => c.resize()); }));
   heroCounts(); drawSweep(); setupSliders(); renderLab(true); renderLong(); renderScatter(); setupTime(); renderGuards();
   requestAnimationFrame(() => Object.values(charts).forEach(c => c.resize()));
   // #UNH-2026-07-16 opens that evening's decision, so one judgement can be linked to.
   let hash = "";
   try { hash = decodeURIComponent(location.hash.slice(1)); } catch (e) { /* malformed link */ }
+  // the browser jumped to #section before the charts took their height: jump again
+  const target = hash && document.getElementById(hash);
+  if (target) { target.closest("details")?.setAttribute("open", ""); requestAnimationFrame(() => target.scrollIntoView()); }
   const m = hash.match(/^(.+)-(\d{4}-\d{2}-\d{2})$/);
   const linked = m && decisionRows().find(r => r.symbol === m[1] && evening(r.as_of) === m[2]);
   if (linked) openDrawer(linked);

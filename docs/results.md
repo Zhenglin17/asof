@@ -11,19 +11,20 @@ above zero, and the weekly THT trend is green; sell on its exit signals. It came
 not cover, and was frozen on 2026-10-29 with eight variants (exit A or B, idle cash kept or
 spread over the holdings, equal or risk weights). It was then run on three lists from 2020-02-03
 to 2025-06-30, 5 bps a trade. These runs used exploratory scripts outside the replay pipeline,
-and no pass mark was set in advance. Shown is A-spread-equal, the best of the eight on every
-list; the other seven earn less.
+and no pass mark was set in advance. Shown is A-spread-equal, the variant with the highest return
+on each list (not the highest Sharpe: on the top 20 that is A-cash-equal, 0.83 against 0.79); none
+of the eight beats holding on the top 20 or without the seven.
 
 "Held, same days" is the same list held throughout and re-weighted on the days the rule trades,
 so that the only difference is when the rule is in or out of a stock. "Held, yearly" buys the
-list each January and leaves it. SPY is price only.
+list each January and leaves it. SPY reinvests dividends, from the close before 2020-02-03.
 
 | List | Rule | Held, same days | Held, yearly | Max drawdown, rule | Held, same days |
 |---|--:|--:|--:|--:|--:|
 | Top 20 US common stocks by market cap, as known each January | +117% | +118% | +135% | 29.0% | 30.2% |
 | The same top 20 without the seven | +37% | +56% | +55% | 32.4% | 31.4% |
 | The seven big tech stocks (in sample: the rule was shaped here) | +436% | +433% | +494% | 41.9% | 49.8% |
-| SPY, price only | +91% | | | 34.2% | |
+| SPY, dividends reinvested | +108% | | | 33.8% | |
 
 The top-20 list is picked each January from SEC share counts public by that night times that
 night's close; Visa and Berkshire Hathaway report no all-class share count and are left out. About
@@ -33,18 +34,23 @@ make.
 
 Deepest fall inside each sell-off (rule against held, same days):
 
-| | 2020 crash | 2022 bear | 2025 tariffs | From 2022-04-18 |
-|---|--:|--:|--:|--:|
-| Top 20 | 29% / 30% | 21% / 29% | 16% / 14% | 23% / 22% |
-| Without the seven | 32% / 31% | 16% / 22% | 16% / 12% | 21% / 18% |
-| The seven | 42% / 33% | 30% / 50% | 24% / 19% | 35% / 40% |
+| | 2020 crash | 2022 bear | 2022 from 04-18 | 2024-08 | 2025 tariffs |
+|---|--:|--:|--:|--:|--:|
+| Top 20 | 29% / 30% | 21% / 29% | 17% / 22% | 11% / 9% | 16% / 14% |
+| Without the seven | 32% / 31% | 16% / 22% | 15% / 18% | 7% / 6% | 16% / 12% |
+| The seven | 42% / 33% | 30% / 50% | 23% / 40% | 16% / 18% | 24% / 19% |
 
-The smaller falls in 2022 come mostly from the warm-up: the weekly THT colour needs history, and
-Microsoft had none until 2022-04-18 (NVIDIA 2021-04-16, Apple 2020-05-15), so the rule could not
-hold it while the held list did. From 2022-04-18, with every name tradable, the rule fell about
-as far as holding on the top 20 and further without the seven, and trailed holding on return on
-all three lists (+64% against +69%, +29% against +42%, +112% against +120%). Only on the seven,
-where it was shaped, does a smaller fall remain.
+The rule fell less than holding in 2022 on every list. The weekly THT colour needs history, and
+Microsoft had none until 2022-04-18 (NVIDIA 2021-04-16, Apple 2020-05-15), so for part of 2022 the
+rule could not hold it while the held list did; but from 2022-04-18 to the end of 2022, with every
+name tradable, the smaller fall remains (third column), so it is not a warm-up effect. That window
+starts mid-decline and measures only the second half of it. The rule spreads its money over the
+names with a signal and holds cash only when none has one, so the smaller fall comes from days out
+of the market altogether, which is the timing decision itself. It is one slow bear, labelled
+after the fact. In the fast falls of 2020, 2024-08 and 2025 the rule fell as much as holding or more on
+the top 20 and without the seven. From 2022-04-18 to 2025-06-30 it trailed holding on return on
+all three lists (+64% against +69%, +29% against +42%, +112% against +120%), consistent with
+giving back in later fast falls and rebounds what it saved in 2022 (not yet checked trade by trade).
 
 The total depends on the start date. An earlier exploratory run of the same rule on the seven,
 begun on 2020-01-02, shows +687% to 2025-06-30: it was up 17% by the end of January and 28% by

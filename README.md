@@ -32,7 +32,7 @@ Commands, stages and the source layout: [docs/commands.md](docs/commands.md).
 | B-Xtrender S1 and S3, liquid US stocks | 2020-01 .. 2025-06 | −4.5%, −10.1% | SPY +107% |
 | B-Xtrender S2 (needs three years of monthly bars) | 2023-01 .. 2025-06 | −5.3% | SPY +66% |
 | B-Xtrender entries alone, held 7 to 60 sessions | 2020-01 .. 2025-06 | no better than random stocks from the same pool | |
-| Timing rule, top 20 by market cap as known each January | 2020-02 .. 2025-06 | +117% | held +118%, SPY +91% |
+| Timing rule, top 20 by market cap as known each January | 2020-02 .. 2025-06 | +117% | held +118%, SPY +108% |
 | The same top 20 without the seven big tech stocks | 2020-02 .. 2025-06 | +37% | held +56% |
 | The seven (in sample: the rule was shaped here) | 2020-02 .. 2025-06 | +436% | held +433% |
 | LLM judge on earnings gaps | 2026-07 .. 2026-10 | 51 candidates, no detectable difference | take-all |
@@ -40,10 +40,13 @@ Commands, stages and the source layout: [docs/commands.md](docs/commands.md).
 So far nothing tested beats its own baseline. The B-Xtrender replays were about 63% invested and
 book no dividends, against SPY with dividends; they ran before a fix that restored Facebook to
 the stock universe. "Held" is the same list held throughout and re-weighted on the days the
-timing rule trades, so the only difference is when the rule is in or out; SPY on those rows is
-price only. The timing rule shown is the best of its eight frozen variants. Its smaller fall in
-2022 (21% against 29%) comes from months when it could not yet hold Microsoft; from 2022-04-18 it
-fell 23% against 22%.
+timing rule trades, so the only difference is when the rule is in or out. The timing rule shown
+is the one of its eight frozen variants with the highest return; none of them beats holding on
+the top 20 or without the seven. Its one benefit is a smaller
+fall in 2022, the only slow bear in the sample and labelled after the fact: 21% against 29% on the
+top 20, and 17% against 22% from 2022-04-18, once every name could be traded (that measures only
+the second half of the decline). In the fast falls of 2020, 2024-08 and 2025 it fell 29%, 11% and
+16% against holding's 30%, 9% and 14%.
 
 No B-Xtrender or timing-rule figure uses a date after 2025-06, and none of these strategies has
 been run on the sealed holdout year (2025-07 .. 2026-06). But the timing rule was explored on

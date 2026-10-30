@@ -593,8 +593,11 @@ cannot tell whether the judge helps. Convictions clustered at 0.5 to 0.6.
 uv run asof demo build --jobs 5          # ~7 minutes; llm answers must already be cached
 ```
 
-The demo page is static: every number it shows was computed beforehand by a real replay. The
-command replays a small grid over the LLM window, take-all and LLM, each over trail
+The demo page is static: every number it shows was computed beforehand, in Python, not in the
+browser. Two files are not written by this command: `web/data/strategies.json` holds the daily
+equity (and invested share) of replay runs 4 and 8 to 10 up to 2025-06-30 with the benchmarks
+over the same sessions, and `web/data/funnel.json` holds the curves of the exploratory timing-rule
+runs on the top-20 lists, which ran outside the replay pipeline. The command replays a small grid over the LLM window, take-all and LLM, each over trail
 (`execute.stop.trail_atr` 1.0 / 1.5 / 2.0) and risk per decision (`execute.sizing.risk_pct`
 0.25 / 0.5 / 1.0), the LLM also over `judge.min_conviction` (0 / 0.55 / 0.6): 36 replays, plus
 take-all with the defaults over 2023-2026. Each worker replays on its own copy of the database,
@@ -982,6 +985,6 @@ configs/             watchlist.yaml (instruments that get filings and fundamenta
                      truncation_instants.txt (instants the truncation test rebuilds at),
                      truncation_impact_baseline.txt (known leak impact, a ratchet),
                      docs_exceptions.yaml (reviewed filing coverage gaps)
-web/                 the static demo page (index.html) and its data (data/, from `asof demo build`)
-docs/                public documentation: this manual and the README screenshot
+web/                 the static demo page (index.html) and its data (data/, mostly from `asof demo build`)
+docs/                public documentation: this manual, results, leakage guards, the architecture diagram
 ```
