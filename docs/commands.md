@@ -77,6 +77,10 @@ The [README](../README.md) is the short tour.
       the same dates, max-statistic correction across runs (`asof gate null`)
 - [x] Entry alone: each entry and its random picks held the same fixed number of sessions,
       so the exit no longer follows the real stock's path (`asof gate entry`)
+- [x] THT fair-value colour on split-adjusted daily bars, matched against the chart
+      (`asof.features.tht`); as a B-Xtrender entry filter, with random picks drawn from the
+      pool or from its THT-green members (`--null-pool`), and diagnostics beside the entry
+      test: quick re-entries, candidates by rank, colour flips (`asof gate diagnose`)
 - [x] Daily equity: every replay marks its account at each close (table `equity_daily`) and
       is compared with the benchmarks on return, drawdown, Sharpe and exposure
       (`asof gate compare`)
@@ -678,6 +682,8 @@ run 1 cross one).
 ```bash
 uv run asof gate entry --run 8 --hold 7 --hold 11 --hold 19          # one run, three holds
 uv run asof gate entry --run 8 --run 9 --run 10 --hold 7 --hold 19   # every (run, hold) is one family
+uv run asof gate entry --run 11 --hold 11 --null-pool plain --null-pool tht  # also draw from THT-green stocks
+uv run asof gate diagnose --run 8 --run 11 --current-strategy       # re-entries, rank thirds, THT flips
 ```
 
 `gate null` keeps each leg's real exit date. A B-Xtrender exit follows the real stock's own path
@@ -687,6 +693,17 @@ halves of one position are one entry) buys the entry session's open and sells th
 sessions later, and so does each random pick from the same evening's pool: what is left is
 which stock was bought. Prices, splits, spin-offs, slippage and the pool are the null's; an
 entry draws the same stocks for every hold, so holds compare entry by entry.
+
+`--null-pool tht` draws only from the pool's members whose THT colour was green that evening,
+for a run whose scan has the THT filter: does the B-Xtrender timing add anything among stocks
+the trend filter already passed. Every (run, hold, pool) is one cell of the family.
+
+`gate diagnose` prints numbers to read beside the entry test, outside its family and its
+attempts: entries that buy back a stock sold within `--within` sessions against the rest;
+every night's candidates, bought or not, split into thirds by their scan rank; and, with the
+THT filter, how often the pool's colours flip. Each excess is a fixed `--hold` against the
+mean of every priced member of the same night's pool, which is what a random pick earns on
+average.
 
 Entries are the run's filled long decisions, not its closed trades: a position still open at
 the replay's end has no trade row, and leaving it out would pick entries by how they went on.
@@ -899,6 +916,40 @@ not claimed: the test is one-sided and most intervals cross zero. The real exits
 either: -0.91% a leg over random with the real exits against -0.60% at a fixed hold of 11
 sessions (S1's median hold is 10). The picks are 1.2 to 1.7 times as volatile as the pool's
 average stock. All of this is over 2020-01 to 2025-06; the holdout stays sealed.
+
+```bash
+uv run asof replay run --strategy bx_trender --start 2020-01-02 --end 2025-06-30 \
+    --set 'scan.tht_filter={length: 33, min_crossings: 20, median_window: null}'  # B, run 11
+uv run asof gate entry --run 11 --hold 7 --hold 11 --hold 19 --hold 29 --hold 60 \
+    --null-pool plain --null-pool tht
+```
+
+Variant B, pre-registered before it ran: S1 plus the stock's THT fair-value colour green at the
+signal close (one attempt; a market-cap floor was dropped before running, since $500M removes
+1 to 4% of a tier that already needs $50M a day). The rule was a fixed hold of 11 sessions
+against the plain pool, corrected over the 10 cells, at p 0.10 or below with a positive excess.
+B does not pass it. The replay took 15 minutes, the entry test 15.
+
+| B hold | Entries | BX pick | Random, pool | Excess | 90% interval | Random, THT-green | Excess | 90% interval |
+|--:|--:|--:|--:|--:|---|--:|--:|---|
+| 7 | 1,802 | -0.03% | +0.37% | -0.40% | -0.96% .. +0.16% | +0.28% | -0.31% | -0.85% .. +0.25% |
+| 11 | 1,795 | -0.12% | +0.49% | -0.61% | -1.30% .. +0.10% | +0.32% | -0.43% | -1.12% .. +0.27% |
+| 19 | 1,781 | -0.30% | +0.72% | -1.02% | -1.80% .. -0.20% | +0.38% | -0.68% | -1.47% .. +0.15% |
+| 29 | 1,750 | -0.22% | +0.91% | -1.13% | -2.34% .. +0.12% | +0.41% | -0.63% | -1.77% .. +0.57% |
+| 60 | 1,680 | -1.43% | +1.25% | -2.67% | -3.95% .. -1.42% | +0.58% | -2.01% | -3.34% .. -0.69% |
+
+Every p adjusted is 1.000. B and S1 share 1,209 of about 1,820 entries; the entries only one of
+them took earn the same at a fixed 11 (S1 only -0.94%, B only -0.98% against the pool's mean;
+difference -0.05%, -0.82% .. +0.68%). Against the pool's mean the excess is negative in 2021
+(S1 -2.12%) and the first half of 2025 (-3.08%) and within noise in 2020, 2022, 2023 and 2024.
+
+`gate diagnose` (52 minutes for both runs): 3 of about 1,790 entries buy back a stock sold within
+10 sessions, which follows from the rules (the weekly bar must fall to sell and rise to buy).
+Every night's candidates by rank thirds (S1, 1,170 nights, about 243 a night): top +0.06%,
+middle +0.06%, bottom -0.22% (-0.35% .. -0.08%), top minus bottom +0.27% (+0.03% .. +0.53%),
+so the ranking sets the bottom third apart but the top third is not told apart from a random
+pick. THT colours of pool members flip 7.9 times a security-year (5.4 in 2020, 8.7 in 2022);
+6.7% of green spells last under 5 sessions.
 
 ## Layout
 

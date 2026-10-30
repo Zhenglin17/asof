@@ -7,7 +7,7 @@ import time
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, NoReturn, cast
 
 import duckdb
 import httpx
@@ -20,11 +20,12 @@ from asof.demo.build import build
 from asof.evidence.retrieve import search
 from asof.evidence.validate import ClaimCitation, DecisionDraft, validate
 from asof.evolve.benchmark import benchmarks
-from asof.evolve.entry import entry_test
+from asof.evolve.entry import NullPool, entry_test
+from asof.evolve.entry_diagnostics import rank_tertiles, reentries, tht_flips
 from asof.evolve.gate import check as gate_measure
 from asof.evolve.gate import render_report
 from asof.evolve.holdout import HoldoutError
-from asof.evolve.null import null_test
+from asof.evolve.null import config_of, null_test
 from asof.evolve.protocol import load_protocol
 from asof.evolve.versus import compare_run
 from asof.ingest.alpaca import AlpacaClient, AlpacaError, Timeframe
@@ -143,6 +144,7 @@ from asof.store.universe import (
 )
 from asof.strategy import (
     AnyStrategyConfig,
+    BxStrategyConfig,
     apply_overrides,
     content_hash,
     load_any_strategy,
@@ -2026,6 +2028,14 @@ def gate_entry(
         int | None, typer.Option("--permutations", help="Defaults to the protocol's.")
     ] = None,
     seed: Annotated[int, typer.Option("--seed")] = 0,
+    null_pools: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--null-pool",
+            help="plain (default): the scan's pool; tht: its THT-green members. Give both to "
+            "put both in the family.",
+        ),
+    ] = None,
     current_strategy: Annotated[
         bool,
         typer.Option(
@@ -2043,7 +2053,7 @@ def gate_entry(
 ) -> None:
     """Each run's entries in the protocol's development dates against random entries, both held
     a fixed number of sessions: the exit no longer follows the real security's path, so what
-    is left is the entry. p adjusted is corrected for every (run, hold) row of this call only;
+    is left is the entry. p adjusted is corrected for every (run, hold, pool) row of this call only;
     the interval resamples blocks of hold sessions. Dropped: fixed exit after dev (beyond),
     real security without an exit price (unpriced)."""
     protocol = load_protocol()
@@ -2057,24 +2067,105 @@ def gate_entry(
                 results = entry_test(
                     session, con, root, runs, cfg=cfg, holds=holds, dev=protocol.dev,
                     permutations=permutations or protocol.permutations, seed=seed,
+                    null_pools=cast(list[NullPool], null_pools or ["plain"]),
                 )  # fmt: skip
             except (LookupError, ValueError) as error:
                 _fail(str(error))
     finally:
         con.close()
         engine.dispose()
-    typer.echo(f"{'run':>5} {'hold':>5} {'entries':>7} {'mean':>8} {'random':>8} {'excess':>8} "
+    typer.echo(f"{'run':>5} {'hold':>5} {'pool':>5} {'entries':>7} {'mean':>8} {'random':>8} "
+               f"{'excess':>8} "
                f"{'ci low':>8} {'ci high':>8} {'sd ratio':>8} {'p':>7} {'p adj':>7} "
                f"{'beyond':>6} {'unpriced':>8}")  # fmt: skip
     for h in results:
         r = h.result
         typer.echo(
-            f"{h.run_id:>5} {h.hold:>5} {r.trades:>7} {r.mean:>+8.2%} {r.null_mean:>+8.2%} "
+            f"{h.run_id:>5} {h.hold:>5} {h.null_pool:>5} {r.trades:>7} {r.mean:>+8.2%} "
+            f"{r.null_mean:>+8.2%} "
             f"{r.excess:>+8.2%} {h.ci[0]:>+8.2%} {h.ci[1]:>+8.2%} {h.sd_ratio:>8.2f} "
             f"{r.p_raw:>7.4f} {r.p_adjusted:>7.4f} {h.beyond_window:>6} {h.unpriced:>8}"
         )
     # the correction covers this call's cells only: another call is another family
-    typer.echo("family: " + " ".join(f"{h.run_id}:{h.hold}" for h in results))
+    typer.echo("family: " + " ".join(f"{h.run_id}:{h.hold}:{h.null_pool}" for h in results))
+
+
+@gate_app.command("diagnose")
+def gate_diagnose(
+    runs: Annotated[list[int], typer.Option("--run", help="A B-Xtrender replay run.")],
+    hold: Annotated[int, typer.Option("--hold", help="Sessions each entry is held.")] = 11,
+    within: Annotated[
+        int, typer.Option("--within", help="A re-entry buys back within this many sessions.")
+    ] = 10,
+    short: Annotated[
+        int, typer.Option("--short", help="A green spell under this many sessions is short.")
+    ] = 5,
+    bootstrap: Annotated[int, typer.Option("--bootstrap")] = 2000,
+    seed: Annotated[int, typer.Option("--seed")] = 0,
+    current_strategy: Annotated[
+        bool,
+        typer.Option(
+            "--current-strategy",
+            help="Use today's strategy files for runs replayed under another version.",
+        ),
+    ] = False,
+    strategies_dir: Annotated[Path, typer.Option("--strategies-dir")] = Path("strategies"),
+    data_dir: Annotated[
+        Path | None, typer.Option("--data-dir", help="Defaults to $ASOF_DATA_DIR.")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Defaults to $ASOF_DATA_DIR/meta.db.")
+    ] = None,
+) -> None:
+    """Numbers to read beside ``gate entry``, outside its family and its attempts, over the
+    protocol's development dates: entries that buy back a stock sold within --within sessions
+    against the rest; every night's candidates (room or not) by thirds of their rank; and, for
+    a run whose scan has a THT filter, how often its pool's colours flip. Excess is a fixed
+    --hold against the mean of the same night's pool."""
+    protocol = load_protocol()
+    root = _market_root(data_dir)
+    engine = make_engine(db or default_db_path())
+    con = duckdb.connect()
+    try:
+        with Session(engine) as session:
+            cfg = _family_config(session, runs, strategies_dir, current_strategy)
+            for r in runs:
+                c = config_of(cfg, r)
+                if not isinstance(c, BxStrategyConfig):
+                    _fail(f"run {r}: diagnostics are for B-Xtrender runs")
+                try:
+                    back = reentries(session, con, root, r, cfg=c, dev=protocol.dev, hold=hold,
+                                     within=within, bootstrap=bootstrap, seed=seed)  # fmt: skip
+                    thirds = rank_tertiles(session, con, root, cfg=c, dev=protocol.dev, hold=hold,
+                                           bootstrap=bootstrap, seed=seed)  # fmt: skip
+                    flips = (tht_flips(con, root, cfg=c.scan, dev=protocol.dev, short=short)
+                             if c.scan.tht_filter is not None else None)  # fmt: skip
+                except (LookupError, ValueError) as error:
+                    _fail(str(error))
+                d, lo, hi = back.difference
+                typer.echo(f"run {r} · hold {hold}")
+                typer.echo(f"  re-entries within {within}: {back.reentries} of {back.entries} "
+                           f"({back.reentries / back.entries:.1%}); excess minus the rest "
+                           f"{d:+.2%} ({lo:+.2%} .. {hi:+.2%})")  # fmt: skip
+                typer.echo(f"  candidates by rank, {thirds.nights} nights "
+                           f"({thirds.unopened} without the next open, {thirds.dropped} "
+                           "without a priced exit in dev; left out):")  # fmt: skip
+                for name, g in zip(("top", "middle", "bottom"), thirds.tertiles, strict=True):
+                    typer.echo(f"    {name:<6} {g.entries:>6} {g.excess:>+8.2%} "
+                               f"({g.ci[0]:+.2%} .. {g.ci[1]:+.2%})")  # fmt: skip
+                d, lo, hi = thirds.top_minus_bottom
+                typer.echo(f"    top minus bottom {d:+.2%} ({lo:+.2%} .. {hi:+.2%})")
+                if flips is not None:
+                    typer.echo(f"  THT flips per security-year {flips.flips_per_year:.1f}; "
+                               f"green spells under {short} sessions "
+                               f"{flips.short_green_share:.1%}")  # fmt: skip
+                    by_year = flips.by_month.assign(year=flips.by_month["month"].str[:4])
+                    for year, g in by_year.groupby("year"):
+                        rate = g["flips"].sum() / (g["security_sessions"].sum() / 252)
+                        typer.echo(f"    {year}: {rate:.1f} flips per security-year")
+    finally:
+        con.close()
+        engine.dispose()
 
 
 @gate_app.command("report")

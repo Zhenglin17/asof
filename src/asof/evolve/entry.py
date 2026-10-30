@@ -8,7 +8,8 @@ entry (the halves of one position are one entry) buys the entry session's open a
 open ``hold`` sessions later, and so does each draw from that day's pool: the only difference
 left is which security was bought. Prices, splits, spin-offs, slippage and draws are the null's;
 an entry draws the same securities for every hold (its key does not name the hold), so holds
-compare entry by entry. Every (run, hold) cell is one member of the max-statistic family.
+compare entry by entry. Every (run, hold, null pool) cell is one member of the max-statistic
+family; the "tht" pool keeps the scan pool's THT-green members.
 
 Entries are the run's filled long decisions, not its closed trades: a position still open at
 the replay's end has no trade row, and leaving it out would choose entries by how they went on.
@@ -25,6 +26,7 @@ from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
+from typing import Literal
 
 import duckdb
 import numpy as np
@@ -65,11 +67,15 @@ class FixedHold:
 class HoldResult:
     run_id: int
     hold: int
-    result: VariantResult  # corrected over every (run, hold) cell
+    result: VariantResult  # corrected over every (run, hold, null pool) cell
     ci: tuple[float, float]  # per-entry excess over its draws, resampled by entry session
     sd_ratio: float  # spread of the real returns / spread of every draw
     beyond_window: int
     unpriced: int
+    null_pool: str = "plain"  # "tht": draws only from the pool's THT-green members
+
+
+NullPool = Literal["plain", "tht"]
 
 
 def entries_of(spans: Sequence[Span]) -> list[Entry]:
@@ -200,16 +206,29 @@ def entry_test(
     permutations: int,
     seed: int,
     bootstrap: int = 2000,
+    null_pools: Sequence[NullPool] = ("plain",),
 ) -> list[HoldResult]:
-    """Each run's entries in dev, held every one of ``holds`` sessions; sorted by (run, hold)."""
+    """Each run's entries in dev, held every one of ``holds`` sessions, against draws from each
+    of ``null_pools``: "plain" the scan's pool, "tht" its THT-green members (does the BX timing
+    add anything among stocks the trend filter already passed). Every (run, hold, pool) is one
+    cell of one family; sorted by (run, hold, pool)."""
     if not holds or len(set(holds)) != len(holds) or min(holds) < 1:
         raise ValueError(f"holds must be distinct and at least one session: {list(holds)}")
+    if (
+        not null_pools
+        or len(set(null_pools)) != len(null_pools)
+        or not set(null_pools) <= {"plain", "tht"}
+    ):
+        raise ValueError(f"null pools must be distinct, of plain and tht: {list(null_pools)}")
     for r in run_ids:
         if config_of(cfg, r).strategy.universe != "liquid_common":
             raise ValueError(
                 f"run {r}: only B-Xtrender runs, whose entry is the open after the decision; "
                 f"universe {config_of(cfg, r).strategy.universe!r}"
             )
+        scan = getattr(config_of(cfg, r), "scan", None)
+        if "tht" in null_pools and getattr(scan, "tht_filter", None) is None:
+            raise ValueError(f"run {r}: the tht null pool needs a scan with a tht_filter")
     as_of = datetime.combine(dev.end, time(20), tzinfo=ET)
     calendar = visible_sessions(con, root, "1Day", as_of)
     index = {d: i for i, d in enumerate(calendar)}
@@ -225,33 +244,38 @@ def entry_test(
             raise ValueError(f"run {r} has no entry within dev {dev.start} .. {dev.end}")
     real: dict[str, np.ndarray] = {}
     null: dict[str, np.ndarray] = {}
-    parts: dict[tuple[int, int], FixedHold] = {}
+    parts: dict[tuple[int, int, str], FixedHold] = {}
     for r in run_ids:
         c = config_of(cfg, r)
         # build_panel reads only the entry sessions of its spans
         sessions = [Span(f"{e.security_id}:{e.entry_session}:fixed", e.entry_session,
                          e.entry_session, "open", 0.0) for e in entries[r]]  # fmt: skip
-        panel = build_panel(session, con, root, sessions, cfg=c, as_of=as_of)
         bps = c.execute.fills.slippage_bps
-        for h in holds:
-            fh = fixed_hold(entries[r], panel, calendar, hold=h, last=dev.end,
-                            slippage_bps=bps)  # fmt: skip
-            if not fh.spans:
-                raise ValueError(f"run {r}: no entry in dev has a priced exit {h} sessions on")
-            real[f"{r}:{h}"] = np.array([s.ret for s in fh.spans])
-            null[f"{r}:{h}"] = null_returns(
-                fh.spans, panel, permutations=permutations, seed=seed, slippage_bps=bps
-            )
-            parts[(r, h)] = fh
+        for kind in null_pools:
+            panel = build_panel(session, con, root, sessions, cfg=c, as_of=as_of,
+                                pool_tht=kind == "tht")  # fmt: skip
+            for h in holds:
+                fh = fixed_hold(entries[r], panel, calendar, hold=h, last=dev.end,
+                                slippage_bps=bps)  # fmt: skip
+                if not fh.spans:
+                    raise ValueError(f"run {r}: no entry in dev has a priced exit {h} sessions on")
+                key = f"{r}:{h}:{kind}"
+                real[key] = np.array([s.ret for s in fh.spans])
+                null[key] = null_returns(
+                    fh.spans, panel, permutations=permutations, seed=seed, slippage_bps=bps
+                )
+                parts[(r, h, kind)] = fh
     family = max_statistic(real, null)
     out = []
-    for r, h in sorted(parts):
-        fh, values, drawn = parts[(r, h)], real[f"{r}:{h}"], null[f"{r}:{h}"]
+    for r, h, kind in sorted(parts):
+        key = f"{r}:{h}:{kind}"
+        fh, values, drawn = parts[(r, h, kind)], real[key], null[key]
         out.append(
             HoldResult(
                 run_id=r,
                 hold=h,
-                result=family[f"{r}:{h}"],
+                null_pool=kind,
+                result=family[key],
                 ci=cluster_ci(
                     values - drawn.mean(axis=0),
                     [index[s.entry_session] // h for s in fh.spans],

@@ -264,6 +264,7 @@ The full pipeline, in order, is in [Commands at a glance](docs/commands.md#comma
 - [x] Gate report on B-Xtrender replays: random entries drawn from the scan's pool, checked on a made-up market with a planted edge (found) and without it (not found)
 - [x] B-Xtrender on development dates: three pre-registered variants replayed and measured; none beats SPY, the holdout stays sealed
 - [x] Entry alone (`asof gate entry`): held 7 to 60 sessions, B-Xtrender's picks earn no more than random stocks from the same pool
+- [x] THT trend filter on the entry (pre-registered, one attempt): the picks still earn no more than random stocks, from the whole pool or from its THT-green stocks (`asof gate diagnose` for re-entries, rank thirds, colour flips)
 - [ ] Strategy evolution: proposals, approval
 
 Feature by feature: [Status in detail](docs/commands.md#status-in-detail).

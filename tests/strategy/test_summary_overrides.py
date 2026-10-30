@@ -27,6 +27,7 @@ CASES = [
     ("scan.market_filter={symbol: SPY, sma_sessions: 200}", "execute.sizing.risk_pct=0.25"),
     ("scan.daily_min=null",),
     ("execute.exits=[daily_red, weekly_down]", "scan.bx.l1=4"),
+    ("scan.tht_filter={length: 33, min_crossings: 20, median_window: null}",),
 ]
 
 
@@ -46,6 +47,15 @@ def test_a_summary_reads_back_to_the_version_it_was_written_for(
 def test_no_summary_is_no_override() -> None:
     assert overrides_of_summary(None) == []
     assert overrides_of_summary("") == []
+
+
+def test_the_stored_tht_summary_reads_none_inside_a_mapping_as_null() -> None:
+    # measured: run 11 (2026-10-29) stored this; "None" inside the mapping read back as the
+    # string 'None' and failed median_window's int | None
+    summary = "scan.tht_filter={'length': 33, 'min_crossings': 20, 'median_window': None}"
+    assert overrides_of_summary(summary) == [
+        "scan.tht_filter={'length': 33, 'min_crossings': 20, 'median_window': null}"
+    ]
 
 
 def test_the_stored_s3_summary_parses() -> None:

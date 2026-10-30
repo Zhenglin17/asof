@@ -6,8 +6,10 @@ in that night's liquid tier, the last completed state bar (weekly for ``mid``, m
 session's, and its series has run long enough for the seed of the EMAs to have faded
 (``warmup``). Optional filters: the daily histogram at or above ``daily_min``, the last completed
 monthly bar above the one before it (``require_monthly_up``), and the index closing above its
-moving average (``market_filter``; a night it fails has no candidate and an empty pool). Exits
-and sizing belong to the executor.
+moving average (``market_filter``; a night it fails has no candidate and an empty pool), and
+the security's THT fair-value colour green that session (``tht_filter``; the pool keeps every
+colour unless ``pool_range`` is asked for its green members). Exits and sizing belong to the
+executor.
 
 Every series starts at the security's first visible bar (a later start gives other values).
 ``scan_range`` computes the series once, at the close of its last session, and reads each
@@ -30,6 +32,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from asof.features.bx import PRICES, adjust_for_splits, bx_features
+from asof.features.tht import tht_features
 from asof.store.market import visible_bars, visible_master, visible_sessions, visible_splits
 from asof.store.spinoffs import spinoff_events
 from asof.store.universe import liquid_securities
@@ -73,6 +76,15 @@ class MarketFilter(_Section):
     sma_sessions: int
 
 
+class ThtFilter(_Section):
+    """A candidate's THT fair-value colour must be green at the signal close
+    (``asof.features.tht``)."""
+
+    length: int
+    min_crossings: int
+    median_window: int | None
+
+
 class BxScanConfig(_Section):
     variant: Literal["mid", "long"]
     universe: UniverseConfig
@@ -81,6 +93,7 @@ class BxScanConfig(_Section):
     daily_min: float | None = None
     require_monthly_up: bool = False
     market_filter: MarketFilter | None = None
+    tht_filter: ThtFilter | None = None
 
 
 def load_scan_config(path: Path, overrides: Sequence[str] = ()) -> BxScanConfig:
@@ -136,11 +149,13 @@ def bx_panel(
     l1: int = 5,
     l2: int = 20,
     l3: int = 5,
+    tht: ThtFilter | None = None,
 ) -> pd.DataFrame:
     """``bx_features`` of every bar visible at ``as_of`` of these securities, from each one's
     first bar: split-adjusted by the splits visible then, spin-offs as decided then. Bars and
     spin-off records are matched under every symbol a security has carried, so a renamed
-    security keeps the events filed under its old name."""
+    security keeps the events filed under its old name. With ``tht``, also ``tht_color`` of
+    the same bars and events."""
     wanted = set(security_ids)
     symbols = sorted(
         {
@@ -150,13 +165,24 @@ def bx_panel(
         }
     )
     if not symbols:
-        return bx_features(pd.DataFrame(columns=["security_id", "session_date", *PRICES]))
+        out = bx_features(pd.DataFrame(columns=["security_id", "session_date", *PRICES]))
+        if tht is not None:
+            out["tht_color"] = pd.Series([], dtype=object)
+        return out
     bars = visible_bars(con, root, "1Day", as_of, symbols=symbols).to_pandas()
     bars = pd.DataFrame(bars[bars["security_id"].isin(wanted)])
     daily = adjust_for_splits(bars, visible_splits(con, root, as_of, symbols).to_pandas())
     events = spinoff_events(con, root, as_of, symbols).to_pandas()
     events = pd.DataFrame(events[events["security_id"].isin(wanted)])
-    return bx_features(daily, spinoffs=events, l1=l1, l2=l2, l3=l3)
+    out = bx_features(daily, spinoffs=events, l1=l1, l2=l2, l3=l3)
+    if tht is not None:
+        # both sort by security and session over the same rows
+        colors = tht_features(daily, spinoffs=events, **tht.model_dump())
+        keys = ["security_id", "session_date"]
+        if not (colors[keys].to_numpy() == out[keys].to_numpy()).all():
+            raise AssertionError("tht_features and bx_features rows are not aligned")
+        out["tht_color"] = colors["tht_color"].to_numpy()
+    return out
 
 
 def _eligible(rows: pd.DataFrame, tier: pa.Table | pd.DataFrame, cfg: BxScanConfig) -> pd.DataFrame:
@@ -190,6 +216,8 @@ def signals(
         rises &= ok["bx_daily"] >= cfg.daily_min
     if cfg.require_monthly_up:
         rises &= ok["bx_monthly"] > ok["bx_monthly_prev"]
+    if cfg.tht_filter is not None:
+        rises &= _green(ok)
     ok = pd.DataFrame(ok[rises.to_numpy()])
     # the bar that turned up most ranks first: a value pinned near +50 that rose 0.01 does not
     # outrank one that just turned (2025-03-14: JTAI weekly 49.99 after 49.99 led by level)
@@ -213,6 +241,11 @@ def signals(
         )
         for rank, r in enumerate(ok.to_dict("records"), start=1)
     ]
+
+
+def _green(rows: pd.DataFrame) -> pd.Series:
+    """THT green; no colour (None or NaN) is not green."""
+    return pd.Series(rows["tht_color"].to_numpy() == "green", index=rows.index, dtype=bool)
 
 
 def _day(value: Any) -> date:
@@ -312,7 +345,7 @@ def _tonight(
         return None
     tier = _tier(con, root, as_of, cfg)
     ids = tier.column("security_id").to_pylist()
-    panel = bx_panel(con, root, as_of, ids, **cfg.bx.model_dump())
+    panel = bx_panel(con, root, as_of, ids, **cfg.bx.model_dump(), tht=cfg.tht_filter)
     rows = pd.DataFrame(panel[panel["session_date"] == sessions[-1]])
     return sessions[-1], rows, tier
 
@@ -361,7 +394,7 @@ def _nights(
     days = [d for d in _sessions(con, root, as_of) if start <= d]
     tiers = {d: _tier(con, root, _close(d), cfg) for d in days}
     ids = sorted({sid for t in tiers.values() for sid in t.column("security_id").to_pylist()})
-    panel = bx_panel(con, root, as_of, ids, **cfg.bx.model_dump())
+    panel = bx_panel(con, root, as_of, ids, **cfg.bx.model_dump(), tht=cfg.tht_filter)
     by_day = {d: g for d, g in panel.groupby("session_date", sort=False)}
     empty = panel.iloc[0:0]
 
@@ -392,7 +425,7 @@ def _nights(
         rows = pd.DataFrame(by_day.get(d, empty))
         stale = [sid for sid in tiers[d].column("security_id").to_pylist() if lagged(sid, d)]
         if stale:
-            fresh = bx_panel(con, root, _close(d), stale, **cfg.bx.model_dump())
+            fresh = bx_panel(con, root, _close(d), stale, **cfg.bx.model_dump(), tht=cfg.tht_filter)
             rows = pd.concat(
                 [rows[~rows["security_id"].isin(stale)], fresh[fresh["session_date"] == d]],
                 ignore_index=True,
@@ -422,14 +455,40 @@ def scan_range(
 
 
 def pool_range(
-    con: duckdb.DuckDBPyConnection, root: Path, start: date, end: date, cfg: BxScanConfig
+    con: duckdb.DuckDBPyConnection,
+    root: Path,
+    start: date,
+    end: date,
+    cfg: BxScanConfig,
+    *,
+    pool_tht: bool = False,
 ) -> dict[date, frozenset[str]]:
-    """``pool`` of every session from ``start`` through ``end``."""
+    """``pool`` of every session from ``start`` through ``end``. ``pool_tht`` keeps only the
+    members THT-green that session: draws that differ from the candidates in the BX timing
+    alone, not in the trend filter."""
+    if pool_tht and cfg.tht_filter is None:
+        raise ValueError("pool_tht needs a scan with a tht_filter")
     nights = _nights(con, root, start, end, cfg)
     open_ = _open_nights(con, root, [d for d, _, _ in nights], cfg)
-    return {
-        d: frozenset(_eligible(rows, tier, cfg)["security_id"].astype(str))
-        if open_[d]
-        else frozenset()
-        for d, rows, tier in nights
-    }
+    out = {}
+    for d, rows, tier in nights:
+        ok = _eligible(rows, tier, cfg) if open_[d] else rows.iloc[0:0]
+        if pool_tht and not ok.empty:
+            ok = ok[_green(ok).to_numpy()]
+        out[d] = frozenset(ok["security_id"].astype(str))
+    return out
+
+
+def pool_colors(
+    con: duckdb.DuckDBPyConnection, root: Path, start: date, end: date, cfg: BxScanConfig
+) -> pd.DataFrame:
+    """security_id, session_date, tht_color of each night's ``pool`` members from ``start``
+    through ``end``: the colour the THT filter read for every stock it could have passed."""
+    if cfg.tht_filter is None:
+        raise ValueError("pool colours need a scan with a tht_filter")
+    nights = _nights(con, root, start, end, cfg)
+    open_ = _open_nights(con, root, [d for d, _, _ in nights], cfg)
+    columns = ["security_id", "session_date", "tht_color"]
+    parts = [pd.DataFrame(_eligible(rows, tier, cfg)[columns])
+             for d, rows, tier in nights if open_[d]]  # fmt: skip
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns)

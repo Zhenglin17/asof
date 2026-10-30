@@ -371,18 +371,21 @@ def _canonical_overrides(path: Path, overrides: Sequence[str]) -> list[tuple[str
 
 # ", " starts a new override only where a dotted setting path and "=" follow
 _NEXT_OVERRIDE = re.compile(r", (?=[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+=)")
+# Python's None as a mapping value or list item: after "{", "[", "," or ":" and before ",", "}"
+# or "]", so a string holding the word (`'not None'`) is left alone
+_NONE = re.compile(r"([{\[,:]\s*)None(?=\s*[,}\]])")
 
 
 def overrides_of_summary(summary: str | None) -> list[str]:
     """The overrides ``register_version`` joined into a version's summary, readable again by
     ``apply_overrides``: values were printed by Python, so one may hold ", " (a mapping, a list)
-    and None stands for YAML null."""
+    and None, alone or inside a mapping or list, stands for YAML null."""
     if not summary:
         return []
     out = []
     for part in _NEXT_OVERRIDE.split(summary):
         key, _, value = part.partition("=")
-        out.append(f"{key}={'null' if value == 'None' else value}")
+        out.append(f"{key}={'null' if value == 'None' else _NONE.sub(r'\1null', value)}")
     return out
 
 

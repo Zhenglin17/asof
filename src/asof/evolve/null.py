@@ -96,11 +96,15 @@ def _bx_pools(
     calendar: Sequence[date],
     evenings: Mapping[date, date],
     as_of: datetime,
+    *,
+    pool_tht: bool = False,
 ) -> dict[date, frozenset[str]]:
     """The scan's pool of each evening, read over the whole span of evenings at once as the BX
-    replay reads its window (``scan_nights``), so a draw comes from what that scan saw."""
+    replay reads its window (``scan_nights``), so a draw comes from what that scan saw;
+    ``pool_tht`` keeps its THT-green members (``pool_range``)."""
     assert isinstance(cfg, BxStrategyConfig)
-    nights = pool_range(con, root, min(evenings.values()), max(evenings.values()), cfg.scan)
+    first, last = min(evenings.values()), max(evenings.values())
+    nights = pool_range(con, root, first, last, cfg.scan, pool_tht=pool_tht)
     return {entry: nights[evening] for entry, evening in evenings.items()}
 
 
@@ -320,9 +324,10 @@ def build_panel(
     *,
     cfg: AnyStrategyConfig,
     as_of: datetime,
+    pool_tht: bool = False,
 ) -> Panel:
-    """Pools as the scanner saw them the evening before each entry; prices and splits as known
-    at ``as_of``."""
+    """Pools as the scanner saw them the evening before each entry (only their THT-green
+    members with ``pool_tht``, B-Xtrender only); prices and splits as known at ``as_of``."""
     if cfg.strategy.universe not in POOLS:
         raise ValueError(
             f"unknown universe {cfg.strategy.universe!r}; known: {', '.join(sorted(POOLS))}"
@@ -341,7 +346,12 @@ def build_panel(
     if not entries:
         return Panel(sessions=(), open={}, close={}, splits={}, pools={})
     evenings = {entry: calendar[index[entry] - 1] for entry in entries}
-    pools = POOLS[cfg.strategy.universe](session, con, root, cfg, calendar, evenings, as_of)
+    if pool_tht:
+        if not isinstance(cfg, BxStrategyConfig):
+            raise ValueError("pool_tht is a B-Xtrender pool")
+        pools = _bx_pools(session, con, root, cfg, calendar, evenings, as_of, pool_tht=True)
+    else:
+        pools = POOLS[cfg.strategy.universe](session, con, root, cfg, calendar, evenings, as_of)
 
     first = min(pools)
     pooled = frozenset().union(*pools.values())

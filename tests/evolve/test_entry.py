@@ -976,14 +976,19 @@ def test_gate_entry_prints_one_row_per_run_and_hold(
     assert result.exit_code == 0, result.output
     lines = [line for line in result.output.splitlines() if line.strip()]
     header, rows = lines[0].lower(), [line.split() for line in lines[1:]]
-    for column in ("run", "hold", "entries", "ci low", "ci high", "sd ratio", "p adj"):
+    for column in ("run", "hold", "pool", "entries", "ci low", "ci high", "sd ratio", "p adj"):
         assert column in header, column
-    assert lines[-1].split() == ["family:", f"{world.run_id}:7", f"{world.run_id}:11"]
+    # each cell names its null pool; the default call has the plain pool only
+    assert lines[-1].split() == [
+        "family:", f"{world.run_id}:7:plain", f"{world.run_id}:11:plain"
+    ]  # fmt: skip
     rows = rows[:-1]
     expected = run_entry(session, con, world, [world.run_id], (7, 11))
-    assert [(int(r[0]), int(r[1])) for r in rows] == [(world.run_id, 7), (world.run_id, 11)]
+    assert [(int(r[0]), int(r[1]), r[2]) for r in rows] == [
+        (world.run_id, 7, "plain"), (world.run_id, 11, "plain")
+    ]  # fmt: skip
     for row, e in zip(rows, expected, strict=True):
-        assert int(row[2]) == e.result.trades
+        assert int(row[3]) == e.result.trades
         assert f"{e.result.p_adjusted:.4f}" in row
         assert (int(row[-2]), int(row[-1])) == (e.beyond_window, e.unpriced)
 
