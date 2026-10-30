@@ -702,7 +702,8 @@ function renderOverview() {
     `fully invested, SPY made ${fmtPct(full(S.runs.S1).total, 0)} over S1's window and ${fmtPct(full(T).total, 0)} over take-all's. The B-Xtrender replays book no dividends; ` +
     `they ran before the fund-table fix described below, so they never saw Facebook. S2 needs three years of monthly bars and trades from 2023-01: −5.3% against SPY's +66.3%. ` +
     `Take-all did beat SPY at its own invested share over these dates, but its real test is random stocks from the same candidate pool on the same nights: there it shows no edge (+0.69% a leg, p = 0.11), ` +
-    `so the gain came from a watchlist picked today and the market, not from the gap; S1 shows none either (−0.56% against +0.35%). Take-all is cut here at 2025-06; the full replay, its holdout dates and the LLM judge are further down.` Next to SPY the timing rule on the seven looks far better (Sharpe ${curveStats(D.funnel.mag7.strategy).sharpe.toFixed(2)} against ${curveStats(spyTR(F.dates)).sharpe.toFixed(2)}); next to the same seven held, it is level.`;
+    `so the gain came from a watchlist picked today and the market, not from the gap; S1 shows none either (−0.56% against +0.35%). Take-all is cut here at 2025-06; the full replay, its holdout dates and the LLM judge are further down. ` +
+    `Next to SPY the timing rule on the seven looks far better (Sharpe ${curveStats(D.funnel.mag7.strategy).sharpe.toFixed(2)} against ${curveStats(spyTR(F.dates)).sharpe.toFixed(2)}); next to the same seven held, it is level.`;
 }
 
 /* ---------- timing rule ---------- */

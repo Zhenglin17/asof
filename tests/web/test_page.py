@@ -4,6 +4,8 @@ keys whose number format differs from the one the page builds ("1.0", never "1")
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 from asof.demo.build import CONVICTIONS, RISKS, TRAILS, grid, run_key
@@ -89,3 +91,17 @@ def test_findings_curves_line_up() -> None:
     assert days.index(take_all["dates"][0]) >= 1
     assert len(take_all["equity"]) == len(take_all["dates"])
     assert set(take_all["dates"]) <= set(days) and max(take_all["dates"]) < sealed
+
+
+def test_page_script_parses() -> None:
+    # A syntax error stops the whole script: every chart and table stays empty, unseen by
+    # the other tests.
+    node = shutil.which("node")
+    if node is None:
+        import pytest
+
+        pytest.skip("node is not installed")
+    script = PAGE.split("<script>")[-1].split("</script>")[0]
+    check = "new Function(require('fs').readFileSync(0, 'utf8'))"
+    result = subprocess.run([node, "-e", check], input=script, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
